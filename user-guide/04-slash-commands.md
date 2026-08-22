@@ -17,7 +17,8 @@ Every command below works identically in the TUI and the plain REPL.
 | `/resume [prefix]` | resume a saved session; no argument picks the most recent, or shows a list |
 | `/del <id>` | delete a saved session |
 | `/tag <text>` | label the current session so it is recognizable in `/list` |
-| `/strip <id>` | trim a saved session's oldest turns to reclaim space |
+| `/rename <name>` | change the name later saves use; what is already on disk keeps its old name |
+| `/strip <id>` | drop a saved session's KV payload to reclaim disk; the transcript survives and a later resume re-prefills it |
 | `/history` | reprint recent turns |
 | `/quit`, `/exit` | leave (the session is saved) |
 
@@ -54,6 +55,7 @@ See [Context](07-context.md).
 | `/templates` | your `{{var}}` prompt templates |
 | `/agent` | named subagents you can delegate to, and which engine each runs on |
 | `/hooks` | which hooks are configured and on what events |
+| `/plugins` | loaded plugins, where each came from, what it contributes, and any warnings |
 | `/tasks` | the model's task list |
 
 See [Extending plank](09-extending.md).
@@ -86,6 +88,8 @@ See [Extending plank](09-extending.md).
 | Command | What it does |
 |---|---|
 | `/export [md\|html] [path]` | write the transcript to a shareable file (markdown by default, auto-named; HTML is standalone) |
+| `/kvcache` | browse the KV cache as a tree: what each snapshot is, what it was built on, its size, how often it has been used, and when it expires |
+| `/kvcache gc\|pin\|unpin\|rm` | sweep expired entries now, or pin, unpin or delete one by fingerprint prefix |
 | `/insights [fast]` | a usage report computed from every saved session, written to `~/.plank/usage-data/report.html` (`fast` skips the model-written prose) |
 | `/repro [note]` | dump the exact engine input and runtime knobs to `~/.plank/repro/` for a bug report |
 
@@ -93,14 +97,24 @@ See [Extending plank](09-extending.md).
 
 `/insights` computes **every number in code** and uses the model only for prose it cannot replace — a failed or skipped model call costs the report its narrative, never its statistics.
 
+## Editing a file
+
+| Command | What it does |
+|---|---|
+| `/open [path]` | edit an existing file in the built-in editor; with no path, reopens the last file a tool call edited this session |
+
+`/open` hands the terminal to the same editor `Ctrl-G` uses, with the file loaded: `Ctrl-S` saves, `Esc` discards. It is the fast way to fix up an edit the model just made — bare `/open` needs no path at all — or to look at a file without spending a turn on it.
+
+It edits, and only edits. A path that does not exist is refused rather than created, so a typo cannot leave an empty file behind, and so are directories, binary files, and anything over 32 MB. An untouched `Ctrl-S` writes nothing. Saving follows a symlink to the file it points at instead of replacing the link. TUI only; in the plain REPL the command is not available.
+
 ## Remote control
 
 | Command | Status |
 |---|---|
 | `/remote` | recognized as a command |
-| `/grant` | recognized; approves a remote client's control request |
+| `/grant [session]` | approves a remote client's control request |
 
-Both are part of the remote-control surface described in [Remote and hosted engines](10-remote-and-providers.md). The local `/grant` handler is not wired into the UI yet, so today a remote client that needs to take control should be started against a server run with `--control-allow`.
+Both are part of the remote-control surface described in [Remote and hosted engines](10-remote-and-providers.md). `/grant` matters only when the bridge was started with `/rc ask`, which withholds control from attaching clients until you approve each request; plain `/rc` grants it up front and leaves `/grant` with nothing to answer.
 
 ## Not in `/help`
 

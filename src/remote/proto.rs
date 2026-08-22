@@ -216,10 +216,19 @@ pub struct GenerateRequest {
     /// Opaque per-turn id; the server uses it to route a `DELETE /generate/{id}`
     /// cancel. The client generates a fresh id per `generate` call.
     pub session_id: String,
-    /// The full rendered transcript (verbatim `render_transcript` bytes).
+    /// The full rendered transcript (verbatim `render_transcript` bytes). On
+    /// `/warm` this is the system tier's text — what `warm_reset` takes.
     pub transcript: String,
     /// Generation options.
     pub opts: WireOptions,
+    /// `/warm` only: the text of every tier below the system one, in order, one
+    /// entry per `warm_append`. Framing matters — the server replays them as
+    /// separate appends, so each tier stays its own chat-template message and a
+    /// tier boundary remains a reproducible token prefix. Absent on `/generate`
+    /// and from pre-v2 clients, which is why it defaults rather than being
+    /// required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warm_appends: Vec<String>,
 }
 
 /// Request body for `POST /tokenize`.
@@ -259,9 +268,15 @@ impl From<WireStats> for GenerationStats {
         Self {
             generated: s.generated,
             tps: s.tps,
+            // The wire carries the pass rate only; a remote decode is not
+            // this machine's throughput to report as a peak.
+            steady_tps: 0.0,
             ctx_used: s.ctx_used,
             interrupted: s.interrupted,
             usage: None,
+            // The wire carries no speculative counters; see
+            // `WireEvent::from_engine_event`.
+            spec: crate::engine::SpecStats::default(),
         }
     }
 }
@@ -282,10 +297,16 @@ pub enum WireEvent {
 }
 
 impl WireEvent {
-    /// Maps a streaming [`EngineEvent`] onto its wire frame.
+    /// Maps a streaming [`EngineEvent`] onto its wire frame, or `None` for an
+    /// event the protocol does not carry.
+    ///
+    /// [`EngineEvent::Spec`] is the only such event: speculative counters are a
+    /// local-decode detail, and adding a frame for them would change the wire
+    /// format for every peer. A remote client therefore shows no dspark stats,
+    /// which is honest — the speculation is not happening on its machine.
     #[must_use]
-    pub fn from_engine_event(ev: &EngineEvent) -> Self {
-        match ev {
+    pub fn from_engine_event(ev: &EngineEvent) -> Option<Self> {
+        Some(match ev {
             EngineEvent::Prefill(p) => Self::Prefill {
                 done: p.done,
                 total: p.total,
@@ -295,7 +316,8 @@ impl WireEvent {
             // checkpoint=None, so a Notice never actually reaches the wire; if
             // that changes, surfacing it as text is a reasonable fallback.
             EngineEvent::Text(s) | EngineEvent::Notice(s) => Self::Text { s: s.clone() },
-        }
+            EngineEvent::Spec(_) => return None,
+        })
     }
 
     /// Converts a streaming frame into an [`EngineEvent`]. Returns `None` for
@@ -351,7 +373,7 @@ mod tests {
     #[test]
     fn engine_event_mapping_is_lossless() {
         let text = EngineEvent::Text("abc".to_string());
-        let wire = WireEvent::from_engine_event(&text);
+        let wire = WireEvent::from_engine_event(&text).expect("text maps to a frame");
         match wire.to_engine_event() {
             Some(EngineEvent::Text(s)) => assert_eq!(s, "abc"),
             other => panic!("unexpected: {other:?}"),

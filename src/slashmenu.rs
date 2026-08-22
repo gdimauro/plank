@@ -26,9 +26,23 @@ pub enum Source {
     Skill,
     /// A prompt template discovered under `.plank/templates`.
     Template,
+    /// A slash command contributed by a WASM component.
+    Wasm,
 }
 
 impl Source {
+    /// True when the entry came from a plugin rather than from plank.
+    ///
+    /// The menu colours these differently, because "what is this command going
+    /// to run" has a different answer for a WASM component than for a built-in:
+    /// third-party code, under a trust decision the user made once. A tag at the
+    /// end of the line says the same thing, but the tag is the part that gets
+    /// elided first on a narrow terminal.
+    #[must_use]
+    pub fn is_plugin(self) -> bool {
+        matches!(self, Self::Wasm)
+    }
+
     /// The right-hand tag shown after the description; empty for built-ins,
     /// which are the unremarkable case.
     #[must_use]
@@ -37,6 +51,7 @@ impl Source {
             Self::Builtin => "",
             Self::Skill => "skill",
             Self::Template => "template",
+            Self::Wasm => "wasm",
         }
     }
 }
@@ -77,6 +92,7 @@ impl Entry {
 pub fn catalog(
     skills: &[crate::skills::Skill],
     templates: &[crate::templates::Template],
+    wasm: &[(&str, &crate::wasmreg::CommandSpec)],
 ) -> Vec<Entry> {
     let mut out: Vec<Entry> = crate::config::SLASH_COMMANDS
         .iter()
@@ -117,6 +133,19 @@ pub fn catalog(
             &mut out,
         );
     }
+    // Last, so a WASM component can never shadow a built-in, a skill or a
+    // template — the same rule every other contributed registry follows, and
+    // the reason a plugin cannot silently take over `/compact`.
+    //
+    // Both spellings are offered, exactly as `plugins::reconcile` does for
+    // every other contributed entry: `<plugin>:<name>` always, since it can
+    // never collide, and the bare name only if `push` finds it free. A
+    // component offering several frames is therefore reachable as
+    // `/arcade:matrix` even while the built-in `/matrix` still exists.
+    for (_, c) in wasm {
+        push(&c.alias, &c.args, &c.desc, Source::Wasm, &mut out);
+        push(&c.name, &c.args, &c.desc, Source::Wasm, &mut out);
+    }
     out
 }
 
@@ -148,13 +177,26 @@ pub fn detect_slash_token(left: &str) -> Option<SlashToken> {
 ///
 /// Scored on the name without its slash, so typing `/comp` scores against
 /// `compact`. Ties break toward the shorter name and then alphabetically, so
-/// the order never depends on the catalog's internal ordering — except for the
-/// empty query, which keeps the catalog order deliberately (built-ins first, in
-/// the curated order they are declared in).
+/// the order never depends on the catalog's internal ordering.
+///
+/// The empty query — the whole menu, on a bare `/` — is sorted alphabetically.
+/// It previously kept the catalog's own order, built-ins first in the order they
+/// are declared, which is a curation nobody can see: with contributed skills,
+/// templates and plugin commands appended after it, "the order they are
+/// declared in" reads as no order at all. Alphabetical is the one a user can
+/// predict, which is what matters for a list you scan rather than read.
+///
+/// Score order still wins the moment anything is typed. Sorting those
+/// alphabetically would put `/agent` above `/compact` for the query `comp`,
+/// which is worse than useless in a fuzzy completer.
 #[must_use]
 pub fn rank(query: &str, entries: &[Entry]) -> Vec<usize> {
     if query.is_empty() {
-        return (0..entries.len()).collect();
+        let mut all: Vec<usize> = (0..entries.len()).collect();
+        // By name rather than by label: the label carries the argument hint,
+        // which would sort `/agent <name>` away from `/agent`.
+        all.sort_by(|a, b| entries[*a].name.cmp(&entries[*b].name));
+        return all;
     }
     let mut matcher = Matcher::new(Config::DEFAULT);
     let needle = query.to_lowercase();
@@ -320,6 +362,68 @@ impl SlashMenu {
 
 #[cfg(test)]
 mod tests {
+
+    /// A plugin command reaches the menu under both spellings, and is
+    /// distinguishable from a built-in — the menu colours it yellow on that
+    /// answer, so getting it wrong would mislead about what a command runs.
+    #[test]
+    fn plugin_commands_are_offered_and_marked_as_plugin() {
+        let spec = crate::wasmreg::CommandSpec {
+            name: "starfield".to_string(),
+            alias: "screensavers:starfield".to_string(),
+            args: String::new(),
+            desc: "a perspective starfield".to_string(),
+        };
+        let entries = catalog(&[], &[], &[("dev.plank.screensavers", &spec)]);
+
+        // Qualified always; bare too, because nothing else claims it.
+        let qualified = entries
+            .iter()
+            .find(|e| e.name == "/screensavers:starfield")
+            .expect("the qualified spelling is always offered");
+        let bare = entries
+            .iter()
+            .find(|e| e.name == "/starfield")
+            .expect("the bare spelling is free here");
+        assert!(qualified.source.is_plugin());
+        assert!(bare.source.is_plugin());
+        assert_eq!(qualified.source.tag(), "wasm");
+
+        // A built-in is not marked, or the colour would mean nothing.
+        let builtin = entries
+            .iter()
+            .find(|e| e.name == "/help")
+            .expect("built-ins are still there");
+        assert!(!builtin.source.is_plugin());
+        assert_eq!(builtin.source.tag(), "");
+    }
+
+    /// A component cannot capture a built-in's name, so a yellow row can never
+    /// be the thing a user meant when they typed a plank command.
+    #[test]
+    fn a_plugin_cannot_shadow_a_builtin_in_the_menu() {
+        let spec = crate::wasmreg::CommandSpec {
+            name: "compact".to_string(),
+            alias: "evil:compact".to_string(),
+            args: String::new(),
+            desc: "not the real one".to_string(),
+        };
+        let entries = catalog(&[], &[], &[("dev.evil", &spec)]);
+        let compact = entries
+            .iter()
+            .find(|e| e.name == "/compact")
+            .expect("/compact exists");
+        assert!(
+            !compact.source.is_plugin(),
+            "a component captured a built-in name"
+        );
+        // Its own qualified spelling is still offered, and still marked.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "/evil:compact" && e.source.is_plugin())
+        );
+    }
     use super::*;
     use ratatui::crossterm::event::KeyModifiers;
 
@@ -358,10 +462,33 @@ mod tests {
         assert!(detect_slash_token("/compact ").is_none());
     }
 
+    /// The whole menu, on a bare `/`, is alphabetical: the catalog's own order
+    /// is builtins-as-declared followed by whatever was contributed, which
+    /// reads as no order at all once a session has plugins in it.
     #[test]
-    fn an_empty_query_keeps_the_catalog_order() {
+    fn an_empty_query_sorts_alphabetically() {
         let e = entries();
-        assert_eq!(rank("", &e), vec![0, 1, 2, 3]);
+        let names: Vec<&str> = rank("", &e)
+            .into_iter()
+            .map(|i| e[i].name.as_str())
+            .collect();
+        let mut expected: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+        // Every entry is still offered — sorting must not filter.
+        assert_eq!(rank("", &e).len(), e.len());
+    }
+
+    /// ...but a typed query is ranked by score, not alphabetically. Sorting
+    /// these would put `/agent` above `/compact` for `comp`.
+    #[test]
+    fn a_typed_query_still_ranks_by_score() {
+        let e = entries();
+        let ranked = rank("comp", &e);
+        assert_eq!(
+            e[ranked[0]].name, "/compact",
+            "alphabetical order must not win here"
+        );
     }
 
     #[test]
@@ -477,7 +604,7 @@ mod tests {
             body: String::new(),
             path: std::path::PathBuf::new(),
         };
-        let cat = catalog(&[skill, shadow], &[tpl]);
+        let cat = catalog(&[skill, shadow], &[tpl], &[]);
         let find = |n: &str| cat.iter().find(|e| e.name == n).expect("entry").clone();
         assert_eq!(find("/review").source, Source::Skill);
         assert_eq!(find("/review").desc, "review the diff");
@@ -488,10 +615,21 @@ mod tests {
 
     #[test]
     fn the_label_folds_the_argument_hint_in() {
-        let e = &catalog(&[], &[])
+        let e = &catalog(&[], &[], &[])
             .into_iter()
             .find(|e| e.name == "/compact")
             .expect("compact");
         assert_eq!(e.label(), "/compact [instructions]");
+    }
+
+    #[test]
+    fn goal_is_a_known_command_with_an_argument_label() {
+        assert!(crate::config::slash_command_known("/goal"));
+        let cat = catalog(&[], &[], &[]);
+        let e = cat
+            .iter()
+            .find(|e| e.name == "/goal")
+            .expect("/goal is in the catalogue");
+        assert_eq!(e.label(), "/goal [--max n] <objective>");
     }
 }

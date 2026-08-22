@@ -100,6 +100,12 @@ pub struct ToolContext {
     pub recent_reads: Vec<PathBuf>,
     /// Command hooks (PreToolUse/PostToolUse/Stop) from hooks.json configs.
     pub hooks: crate::hooks::Hooks,
+    /// Plugins activated for this session, contributing skills, agents and
+    /// templates alongside the local ones.
+    pub plugins: crate::plugins::PluginSet,
+    /// WASM components admitted this session, and the runtime they run in.
+    /// Lives beside `plugins` because a component *is* a plugin contribution.
+    pub wasm: crate::wasmreg::Session,
     /// Seatbelt sandbox policy for model-initiated bash commands.
     pub sandbox: crate::sandbox::Sandbox,
     /// User-only warnings from non-blocking hook failures, drained by the UI
@@ -200,6 +206,8 @@ impl ToolContext {
             mcp: Vec::new(),
             recent_reads: Vec::new(),
             hooks: crate::hooks::Hooks::default(),
+            plugins: crate::plugins::PluginSet::default(),
+            wasm: crate::wasmreg::Session::default(),
             sandbox: crate::sandbox::Sandbox::default(),
             hook_warnings: Vec::new(),
             skills: Vec::new(),
@@ -289,6 +297,27 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             ));
         }
     }
+    // pre_tool_use for WASM subscribers, after the shell hooks and before the
+    // plan-mode gate: a component sees the same call a hook would have seen,
+    // and a block reaches the model in the same shape.
+    {
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::PreToolUse,
+            vec![
+                ("name", call.name.clone()),
+                ("args", mcp::args_to_json(call)),
+            ],
+        );
+        let wasm = &mut ctx.wasm;
+        let out = wasm.registry.dispatch(&mut *wasm.host, &event);
+        ctx.hook_warnings.extend(out.printed);
+        ctx.hook_warnings.extend(out.warnings);
+        if let Some((id, reason)) = out.blocked {
+            return ToolResult::from_output(format!(
+                "Tool error: blocked by wasm component {id}: {reason}\n"
+            ));
+        }
+    }
     // Plan mode (issue #50): while the read-only gate is active, refuse any
     // workspace-mutating tool so the model researches and proposes before it
     // edits. The gate itself is entered/exited by dedicated tools below.
@@ -316,6 +345,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "google_search" => web::tool_google_search(ctx, call),
         "visit_page" => web::tool_visit_page(ctx, call),
         "mcp_describe" => mcp::tool_mcp_describe(&ctx.mcp, call),
+        "mcp_call" => mcp::tool_mcp_invoke(&mut ctx.mcp, call),
         "mcp_list_resources" => mcp::tool_mcp_list_resources(&ctx.mcp, call),
         "mcp_read_resource" => mcp::tool_mcp_read_resource(&mut ctx.mcp, call),
         "skill" => crate::skills::tool_skill(
@@ -327,6 +357,17 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "task" => crate::tasks::tool_task(&mut ctx.tasks, &mut ctx.task_completions, call),
         "ask" => ask::tool_ask(ctx.asker.as_mut(), call),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
+        // A WASM component's tool. Checked before the unknown-tool fallthrough
+        // and after every built-in, so a component can extend the table and
+        // never shadow it.
+        name if ctx.wasm.registry.tools().iter().any(|t| t.exposed == name) => {
+            let args = mcp::args_to_json(call);
+            let wasm = &mut ctx.wasm;
+            match wasm.registry.run_tool(&mut *wasm.host, name, &args) {
+                Ok(output) => output,
+                Err(e) => format!("Tool error: {e}\n"),
+            }
+        }
         other => format!("Tool error: unknown tool: {other}\n"),
     };
     // PostToolUse hooks: exit 2 appends stderr to the model's observation.
@@ -356,6 +397,32 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
                 output.push('\n');
             }
             let _ = writeln!(output, "[PostToolUse hook] {msg}");
+        }
+    }
+    // post_tool_use for WASM subscribers. Transform: a replacement becomes the
+    // observation the model sees, which is the whole point of the event — a
+    // redactor or a summarizer has nowhere else to stand.
+    {
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::PostToolUse,
+            vec![
+                ("name", call.name.clone()),
+                ("args", mcp::args_to_json(call)),
+                ("output", output.clone()),
+            ],
+        );
+        let wasm = &mut ctx.wasm;
+        let out = wasm.registry.dispatch(&mut *wasm.host, &event);
+        ctx.hook_warnings.extend(out.printed);
+        ctx.hook_warnings.extend(out.warnings);
+        if let Some(replaced) = out.replaced {
+            output = replaced;
+        }
+        if let Some((id, reason)) = out.blocked {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            let _ = writeln!(output, "[wasm {id}] {reason}");
         }
     }
     // PostToolUseFailure hooks: fire only when the tool failed (the C

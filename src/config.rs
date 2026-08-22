@@ -48,8 +48,16 @@ pub struct AgentConfig {
     pub worktree_pr: Option<u32>,
     /// MCP server config supplied with `--mcp-config`; `None` = `./.mcp.json`.
     pub mcp_config_path: Option<PathBuf>,
+    /// Directories named by `--plugin-dir`, loaded as session-only plugins.
+    pub plugin_dirs: Vec<PathBuf>,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
+    /// True when `--minimal-prompt` was given: start with the smallest prompt
+    /// this build can produce — no MCP servers, skills, templates, plugin
+    /// agents, WASM components, or session-start context. For measuring
+    /// throughput against a bare `llama-cli`-style prompt, where a full
+    /// session's tool schemas and context dominate prefill.
+    pub minimal_prompt: bool,
     /// Loopback port for `--ui-remote` TUI remote control; `Some(0)` asks for
     /// an ephemeral port. `None` (the default) leaves the feature off entirely.
     pub ui_remote: Option<u16>,
@@ -190,6 +198,26 @@ pub struct EngineTuning {
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
+    /// Use a `DSpark` draft model, from `--dspark`.
+    ///
+    /// The support GGUF comes from `--mtp` when given; otherwise it is
+    /// resolved to `~/.plank/ds4flash.dspark.gguf` at startup and downloaded
+    /// if absent (`download::ensure_dspark_support`).
+    ///
+    /// `DSpark` is `DeepSeek`'s auxiliary draft checkpoint for V4 Flash; it
+    /// replaces the legacy one-stage MTP path. `--dspark-confidence` and
+    /// `--dspark-strict` also imply it, mirroring the C CLI.
+    pub dspark: bool,
+    /// Load `DSpark` support but keep target-only decode, from `--dspark-strict`.
+    pub dspark_strict: bool,
+    /// Confidence-pruning threshold from `--dspark-confidence F`, `0..=1`.
+    ///
+    /// `None` leaves the engine's own default in force, which is
+    /// backend-dependent (Metal 0.6, CUDA/ROCm 0.7) and has changed with
+    /// tuning — so plank does not keep a copy of the number to go stale.
+    /// The engine is told explicitly whether the flag was set, because `0`
+    /// means "fixed five-token blocks", not "unset".
+    pub dspark_confidence: Option<f32>,
     /// Prefill chunk size in tokens, fixed at [`DEFAULT_PREFILL_CHUNK`]. Chunked
     /// so Ctrl-C is observed at chunk boundaries instead of only after the whole
     /// prompt is prefilled. Not user-configurable (no CLI flag).
@@ -225,6 +253,9 @@ impl Default for EngineTuning {
             mtp_path: None,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
+            dspark: false,
+            dspark_strict: false,
+            dspark_confidence: None,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             quality: false,
             warm_weights: false,
@@ -269,7 +300,9 @@ impl Default for AgentConfig {
             worktree: None,
             worktree_pr: None,
             mcp_config_path: None,
+            plugin_dirs: Vec::new(),
             non_interactive: false,
+            minimal_prompt: false,
             ui_remote: None,
             show_help: false,
             help_topic: None,
@@ -364,6 +397,12 @@ Options:
       --mtp PATH           multi-token-prediction draft model (GGUF)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
+      --dspark             DSpark speculative decoding; downloads the support model
+                           to ~/.plank/ds4flash.dspark.gguf unless --mtp names one
+                           (defaults --temp to 0 unless --temp is given)
+      --dspark-confidence F  DSpark confidence pruning threshold 0..1
+                           (engine default: Metal 0.6, CUDA/ROCm 0.7; 0 = fixed blocks)
+      --dspark-strict      load DSpark support but keep target-only decode
       --quality            enable quality mode
       --warm-weights       touch all weights at load
       --ssd-streaming      stream experts from SSD instead of loading resident
@@ -407,10 +446,17 @@ Options:
   /export [md|html] [path] write the current transcript to a shareable file
                            (default: markdown, auto-named in the working
                            directory); HTML output is standalone
+  /open [path]             edit a file in the built-in editor; with no path,
+                           reopens the last file a tool call edited or plank
+                           generated (e.g. a /repro dump)
   /insights [fast]         report on how you have been using plank, from every
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
       --non-interactive    disable the interactive UI
+      --minimal-prompt     start with the smallest prompt this build can make:
+                           no MCP servers, skills, templates, plugin agents,
+                           WASM components or session-start context. For
+                           measuring throughput against a bare prompt.
       --ui-remote[=PORT]   accept TUI remote control on 127.0.0.1:PORT
                            (omit PORT for an ephemeral one, printed to stderr)
   -sys, --system TEXT      override the system prompt
@@ -430,6 +476,7 @@ Options:
       --worktree-pr N      base that worktree on pull request N (implies --worktree)
       --mcp-config FILE    local MCP server config (default: ./.mcp.json);
                            overlays the global ~/.plank/.mcp.json by name
+      --plugin-dir PATH    load a plugin directory for this session (repeatable)
       --sandbox            run model bash commands under sandbox-exec
                            (writes limited to cwd/temp; see sandbox.json).
                            On by default on macOS
@@ -603,6 +650,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "save the current session to ~/.plank",
     },
     SlashCommand {
+        name: "/rename",
+        args: "<name>",
+        desc: "rename this session (the saved copy keeps its old name)",
+    },
+    SlashCommand {
         name: "/list",
         args: "",
         desc: "list saved sessions",
@@ -610,17 +662,22 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/resume",
         args: "[prefix]",
-        desc: "resume a saved session (sha prefix or list number)",
+        desc: "resume a saved session (name or list number)",
     },
     SlashCommand {
         name: "/switch",
-        args: "<prefix>",
-        desc: "switch to another saved session by id",
+        args: "<name>",
+        desc: "switch to another saved session by name",
     },
     SlashCommand {
         name: "/del",
         args: "<prefix>",
         desc: "delete a saved session",
+    },
+    SlashCommand {
+        name: "/retitle",
+        args: "",
+        desc: "re-derive every saved session's title from its transcript",
     },
     SlashCommand {
         name: "/tag",
@@ -678,9 +735,24 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "show the model's task list for this session",
     },
     SlashCommand {
+        name: "/goal",
+        args: "[--max n] <objective>",
+        desc: "work autonomously until the objective is settled",
+    },
+    SlashCommand {
         name: "/skills",
         args: "",
         desc: "list the skills loaded from SKILL.md files",
+    },
+    SlashCommand {
+        name: "/plugins",
+        args: "[install <dir|url>|remove|trust|info|disable|enable|publisher]",
+        desc: "list, install, remove, inspect, disable, approve, or trust a key",
+    },
+    SlashCommand {
+        name: "/frame",
+        args: "[id]",
+        desc: "open a wasm frame component, or list the openable ones",
     },
     SlashCommand {
         name: "/templates",
@@ -728,9 +800,19 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "toggle stripping thinking blocks from the transcript",
     },
     SlashCommand {
+        name: "/kvcache",
+        args: "[gc|pin|unpin|rm]",
+        desc: "show the KV cache tree; pin, delete or sweep entries",
+    },
+    SlashCommand {
         name: "/export",
         args: "[md|html] [path]",
         desc: "write the transcript to a shareable file",
+    },
+    SlashCommand {
+        name: "/open",
+        args: "[path]",
+        desc: "edit a file in the built-in editor (default: last edited)",
     },
     SlashCommand {
         name: "/insights",
@@ -744,12 +826,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/remote-control",
-        args: "",
+        args: "[on|ask|off]",
         desc: "show the TUI remote-control endpoint",
     },
     SlashCommand {
         name: "/rc",
-        args: "",
+        args: "[on|ask|off]",
         desc: "alias for /remote-control",
     },
     SlashCommand {
@@ -759,8 +841,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/grant",
-        args: "",
-        desc: "review and grant pending tool permissions",
+        args: "[session]",
+        desc: "hand remote control to a waiting client",
     },
     SlashCommand {
         name: "/version",
@@ -804,6 +886,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         "/help"
             | "/save"
             | "/list"
+            | "/retitle"
             | "/quit"
             | "/exit"
             | "/new"
@@ -813,6 +896,8 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/usage"
             | "/init"
             | "/skills"
+            | "/plugins"
+            | "/frame"
             | "/templates"
             | "/tasks"
             | "/agent"
@@ -852,20 +937,59 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/repro")
         || slash_command_with_args(cmd, "/export")
+        || slash_command_with_args(cmd, "/open")
         || slash_command_with_args(cmd, "/insights")
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
+        || slash_command_with_args(cmd, "/rename")
         || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/think")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
         || slash_command_with_args(cmd, "/strip")
+        || slash_command_with_args(cmd, "/kvcache")
         || slash_command_with_args(cmd, "/history")
         || slash_command_with_args(cmd, "/checkpoint")
         || slash_command_with_args(cmd, "/rollback")
         || slash_command_with_args(cmd, "/notify")
+        || slash_command_with_args(cmd, "/goal")
         || slash_command_with_args(cmd, "/remote-control")
         || slash_command_with_args(cmd, "/rc")
+        // `/grant` takes an optional session id (`/grant 3`) as well as the bare
+        // form that answers the oldest waiting request.
+        || slash_command_with_args(cmd, "/grant")
+}
+
+/// Why a slash command cannot be run from a remote client, or `None` if it can.
+///
+/// A remote `command` frame is queued for the same dispatcher the local user
+/// types into, so most commands work unchanged. Two families do not, and
+/// queueing them silently is worse than refusing them: commands that take over
+/// the *local* terminal (the operator sees a pane open with nobody driving it),
+/// and commands that would saw off the branch the client is sitting on.
+///
+/// Pane commands are refused only in their bare, interactive form —
+/// `/kvcache gc` and `/resume 3` are ordinary non-interactive commands and stay
+/// available. `line` is the whole command line, leading slash included.
+#[must_use]
+pub fn slash_command_remote_refusal(line: &str) -> Option<&'static str> {
+    let mut it = line.split_whitespace();
+    let cmd = it.next().unwrap_or("");
+    let bare = it.next().is_none();
+    match cmd {
+        "/grant" => Some(
+            "/grant answers a remote request and is local-only — asking for it from the client that wants control would be self-granting",
+        ),
+        "/remote-control" | "/rc" => {
+            Some("toggling remote control would disconnect this client; run it locally")
+        }
+        "/open" => Some("/open takes over the local terminal with the built-in editor"),
+        "/quit" | "/exit" => Some("quitting is local-only; use the local terminal to stop plank"),
+        "/kvcache" | "/resume" if bare => {
+            Some("opens an interactive local pane; pass an argument for the non-interactive form")
+        }
+        _ => None,
+    }
 }
 
 /// Parses one engine-tuning option that takes a value (already extracted as
@@ -881,6 +1005,12 @@ fn parse_engine_option(
         "--mtp" => e.mtp_path = Some(PathBuf::from(v)),
         "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
         "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
+        // The C turns DSpark on for any of its three flags, so the threshold
+        // flag alone is enough to select the DSpark runtime.
+        "--dspark-confidence" => {
+            e.dspark = true;
+            e.dspark_confidence = Some(parse_float_range(v, arg, 0.0, 1.0)?);
+        }
         "--ssd-streaming-cache-experts" => {
             let (experts, bytes) = parse_streaming_cache_experts_arg(v)
                 .ok_or_else(|| format!("{arg} must be a positive count or <number>GB: {v}"))?;
@@ -936,6 +1066,7 @@ pub fn parse_options_with(
     // Tracks whether a steering scale was given explicitly; a steering file
     // without one defaults the FFN scale to 1.0, like the C.
     let mut steering_scale_set = false;
+    let mut temp_set = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -1017,6 +1148,7 @@ pub fn parse_options_with(
                 };
             }
             "--non-interactive" => c.non_interactive = true,
+            "--minimal-prompt" => c.minimal_prompt = true,
             // Bare `--ui-remote` means an ephemeral port. A following bare
             // number is almost certainly someone meaning to pin one, so
             // reject it rather than silently binding an ephemeral port and
@@ -1046,6 +1178,7 @@ pub fn parse_options_with(
             "-n" | "--tokens" => c.generation.n_predict = parse_int(need_arg(&mut i)?, arg)?,
             "--temp" => {
                 c.generation.temperature = parse_float_range(need_arg(&mut i)?, arg, 0.0, 100.0)?;
+                temp_set = true;
             }
             "--top-p" => c.generation.top_p = parse_float_range(need_arg(&mut i)?, arg, 0.0, 1.0)?,
             "--min-p" => c.generation.min_p = parse_float_range(need_arg(&mut i)?, arg, 0.0, 1.0)?,
@@ -1065,6 +1198,7 @@ pub fn parse_options_with(
                 c.worktree_pr = Some(n);
             }
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
+            "--plugin-dir" => c.plugin_dirs.push(PathBuf::from(need_arg(&mut i)?)),
             "--sandbox" => c.sandbox_override = Some(true),
             "--no-sandbox" => c.sandbox_override = Some(false),
             "--btw-suspend" => c.btw.suspend = true,
@@ -1073,9 +1207,15 @@ pub fn parse_options_with(
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
+            "--dspark" => c.engine.dspark = true,
+            "--dspark-strict" => {
+                c.engine.dspark = true;
+                c.engine.dspark_strict = true;
+            }
             "--mtp"
             | "--mtp-draft"
             | "--mtp-margin"
+            | "--dspark-confidence"
             | "--ssd-streaming-cache-experts"
             | "--ssd-streaming-preload-experts"
             | "--simulate-used-memory"
@@ -1093,14 +1233,22 @@ pub fn parse_options_with(
         }
         i += 1;
     }
-    finalize(&mut c, steering_scale_set)?;
+    finalize(&mut c, steering_scale_set, temp_set)?;
     Ok(c)
 }
 
-/// Post-parse fixups: the steering-scale default and `--remote` validation.
-fn finalize(c: &mut AgentConfig, steering_scale_set: bool) -> Result<(), String> {
+/// Post-parse fixups: the steering-scale default, the `--dspark` temperature
+/// default, and `--remote` validation.
+fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
+    }
+    // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
+    // draft gate), so asking for DSpark defaults the temperature to 0. Done
+    // here rather than at the flag because `--temp` may follow it; an explicit
+    // `--temp` in either order still wins.
+    if c.engine.dspark && !temp_set {
+        c.generation.temperature = 0.0;
     }
     // The same context floor `/think max` enforces, applied to `--think-max`.
     // Checked here rather than at the flag because `--ctx` may follow it.
@@ -1240,6 +1388,16 @@ mod tests {
         };
         assert_eq!(parse_options_with(&s, &[]).unwrap().backend, None);
         assert!(parse_options(&args(&["--backend", "quantum"])).is_err());
+    }
+
+    #[test]
+    fn plugin_dir_is_repeatable() {
+        let c =
+            parse_options(&args(&["--plugin-dir", "/a", "--plugin-dir", "/b"])).expect("parses");
+        assert_eq!(
+            c.plugin_dirs,
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]
@@ -1510,6 +1668,26 @@ mod tests {
     }
 
     #[test]
+    fn minimal_prompt_flag() {
+        let c = parse_options(&args(&["--minimal-prompt"])).unwrap();
+        assert!(c.minimal_prompt);
+        // Off unless asked: every other run must keep MCP, skills and context.
+        let d = parse_options(&args(&[])).unwrap();
+        assert!(!d.minimal_prompt);
+        // Composes with the flags a benchmark actually uses.
+        let e = parse_options(&args(&[
+            "--minimal-prompt",
+            "--non-interactive",
+            "--provider",
+            "openai",
+            "--model",
+            "m",
+        ]))
+        .unwrap();
+        assert!(e.minimal_prompt && e.non_interactive);
+    }
+
+    #[test]
     fn help_flag_and_topic() {
         let c = parse_options(&args(&["--help", "sampling"])).unwrap();
         assert!(c.show_help);
@@ -1539,6 +1717,66 @@ mod tests {
         assert!(err.contains("invalid value for --seed"));
         let err = parse_options(&args(&["--temp", "nan"])).unwrap_err();
         assert!(err.contains("invalid value for --temp"));
+    }
+
+    #[test]
+    fn dspark_flags_select_the_runtime() {
+        let c = parse_options(&args(&["--dspark"])).unwrap();
+        assert!(c.engine.dspark);
+        assert!(!c.engine.dspark_strict);
+        // Left unset, so the engine keeps its own default rather than 0.
+        assert_eq!(c.engine.dspark_confidence, None);
+
+        // Either of the other two flags implies --dspark, like the C CLI.
+        let c = parse_options(&args(&["--dspark-strict"])).unwrap();
+        assert!(c.engine.dspark);
+        assert!(c.engine.dspark_strict);
+
+        let c = parse_options(&args(&["--dspark-confidence", "0.35"])).unwrap();
+        assert!(c.engine.dspark);
+        assert!((c.engine.dspark_confidence.unwrap() - 0.35).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dspark_confidence_zero_is_set_not_absent() {
+        // 0 means "fixed draft length", which is why the C carries a separate
+        // `_set` bool; it must not be confused with the flag being omitted.
+        let c = parse_options(&args(&["--dspark-confidence", "0"])).unwrap();
+        assert_eq!(c.engine.dspark_confidence, Some(0.0));
+    }
+
+    #[test]
+    fn dspark_confidence_is_bounded_to_a_probability() {
+        let err = parse_options(&args(&["--dspark-confidence", "1.5"])).unwrap_err();
+        assert!(err.contains("--dspark-confidence"));
+    }
+
+    #[test]
+    fn dspark_defaults_the_temperature_to_zero() {
+        let c = parse_options(&args(&["--dspark"])).unwrap();
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+
+        // The implying flags carry the same default.
+        let c = parse_options(&args(&["--dspark-strict"])).unwrap();
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+        let c = parse_options(&args(&["--dspark-confidence", "0.3"])).unwrap();
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_explicit_temp_beats_the_dspark_default_in_either_order() {
+        let c = parse_options(&args(&["--dspark", "--temp", "0.9"])).unwrap();
+        assert!((c.generation.temperature - 0.9).abs() < 1e-6);
+        let c = parse_options(&args(&["--temp", "0.9", "--dspark"])).unwrap();
+        assert!((c.generation.temperature - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dspark_is_off_by_default() {
+        let c = parse_options(&args(&[])).unwrap();
+        assert!(!c.engine.dspark);
+        assert!(!c.engine.dspark_strict);
+        assert_eq!(c.engine.dspark_confidence, None);
     }
 
     #[test]
@@ -1728,6 +1966,11 @@ mod tests {
     }
 
     #[test]
+    fn plugins_is_a_known_slash_command() {
+        assert!(slash_command_known("/plugins"));
+    }
+
+    #[test]
     fn the_menu_catalog_has_no_duplicate_commands() {
         let mut names: Vec<&str> = SLASH_COMMANDS.iter().map(|c| c.name).collect();
         names.sort_unstable();
@@ -1760,6 +2003,9 @@ mod tests {
         assert!(slash_command_known("/switch 2"));
         assert!(slash_command_known("/del 1"));
         assert!(slash_command_known("/strip"));
+        assert!(slash_command_known("/kvcache"));
+        assert!(slash_command_known("/kvcache gc"));
+        assert!(!slash_command_known("/kvcaches"));
         assert!(slash_command_known("/history 10"));
         assert!(slash_command_known("/repro"));
         assert!(slash_command_known("/repro looping bug"));
@@ -1769,6 +2015,9 @@ mod tests {
         assert!(slash_command_known("/insights"));
         assert!(slash_command_known("/insights fast"));
         assert!(!slash_command_known("/insightsx"));
+        assert!(slash_command_known("/open"));
+        assert!(slash_command_known("/open src/ui.rs"));
+        assert!(!slash_command_known("/opened"));
         assert!(!slash_command_known("/exports"));
         assert!(!slash_command_known("/powerful"));
         assert!(!slash_command_known("/unknown"));
@@ -1799,6 +2048,52 @@ mod tests {
     fn remote_slash_commands() {
         assert!(slash_command_known("/remote"));
         assert!(slash_command_known("/grant"));
+        // `/grant 3` names the waiting session explicitly.
+        assert!(slash_command_known("/grant 3"));
+    }
+
+    #[test]
+    fn ordinary_commands_and_prompts_are_remote_safe() {
+        for line in ["/help", "/context", "/compact focus on the parser", "hello"] {
+            assert_eq!(slash_command_remote_refusal(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn commands_needing_the_local_terminal_are_refused_remotely() {
+        for line in [
+            "/grant",
+            "/grant 3",
+            "/rc",
+            "/rc off",
+            "/remote-control",
+            "/open",
+            "/open src/ui.rs",
+            "/quit",
+            "/exit",
+        ] {
+            assert!(
+                slash_command_remote_refusal(line).is_some(),
+                "{line} should be refused"
+            );
+        }
+    }
+
+    /// A pane command is refused only in its interactive form; the same command
+    /// with an argument does its work without a terminal and stays available.
+    #[test]
+    fn pane_commands_are_refused_bare_but_allowed_with_an_argument() {
+        assert!(slash_command_remote_refusal("/kvcache").is_some());
+        assert_eq!(slash_command_remote_refusal("/kvcache gc"), None);
+        assert!(slash_command_remote_refusal("/resume").is_some());
+        assert_eq!(slash_command_remote_refusal("/resume 3"), None);
+    }
+
+    /// Surrounding whitespace must not smuggle a refused command past the gate.
+    #[test]
+    fn the_remote_gate_ignores_surrounding_whitespace() {
+        assert!(slash_command_remote_refusal("  /quit  ").is_some());
+        assert!(slash_command_remote_refusal("/kvcache   ").is_some());
     }
 
     #[test]

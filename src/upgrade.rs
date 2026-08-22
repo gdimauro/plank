@@ -3,27 +3,31 @@
 
 //! Version-transition maintenance for the `~/.plank` cache directory.
 //!
-//! Plank persists rebuildable state under `~/.plank`: the system-prompt KV
-//! checkpoint (`kvcache/sysprompt.kv`), the per-session KV payload sidecars
-//! (`kvcache/*.payload`), and the pasted-image cache (`image-cache/`).
+//! Plank persists rebuildable state under `~/.plank`: the KV blob bodies
+//! (`kvcache/*.kv_raw`, covering the Tier 1 system-prompt checkpoints, the
+//! Tier 2 per-project ones, and the per-session KV payloads) with their
+//! advisory `kvcache/*.json` metadata sidecars, and the pasted-image cache
+//! (`image-cache/`).
 //!
 //! The **KV caches are never dropped on a version change.** Their validity is
 //! self-describing, independent of the plank version:
 //!
-//! - *Content* — both the sysprompt checkpoint and the payload sidecars are
-//!   prefixed with a textual fingerprint (`model ‖ system [‖ transcript]`); a
-//!   changed prompt misses and rebuilds on its own.
+//! - *Content* — every blob body is prefixed with a textual fingerprint
+//!   (`model ‖ system [‖ transcript]`); a changed prompt misses and rebuilds on
+//!   its own.
 //! - *Format* — the serialized snapshot carries its own
 //!   `DS4_SESSION_PAYLOAD_MAGIC`/`DS4_SESSION_PAYLOAD_VERSION` plus layout
 //!   invariants (context size, DS4 layout, ring/graph chunk shape). Loading an
 //!   incompatible snapshot returns a graceful error ("unsupported session
-//!   payload version"), so the warm-up rebuilds rather than trusting it.
+//!   payload version"), so the warm-up rebuilds rather than trusting it. The
+//!   metadata sidecars carry no trust weight at all, so they cannot make a
+//!   version decision necessary either.
 //!
 //! Tying the KV cache to the plank version was actively harmful: two
 //! co-installed versions (e.g. a homebrew build and a dev build) sharing one
-//! `~/.plank/kvcache` mutually deleted `sysprompt.kv` on every switch, forcing
-//! a ~130 MB cold rebuild even though the prompt was byte-identical. The
-//! fingerprint and the payload format-version already provide every guarantee
+//! `~/.plank/kvcache` mutually deleted the Tier 1 checkpoint on every switch,
+//! forcing a ~130 MB cold rebuild even though the prompt was byte-identical. The
+//! fingerprint and the blob format-version already provide every guarantee
 //! the version delta was standing in for.
 //!
 //! Only the image cache remains version-gated, since it has no such
@@ -130,9 +134,10 @@ pub fn run_startup_maintenance(plank_dir: &Path, current: &str) -> Transition {
     }
     let previous = std::fs::read_to_string(&marker).ok();
     let transition = classify(previous.as_deref(), current);
-    // The KV caches (sysprompt.kv, *.payload) self-validate by fingerprint and
-    // snapshot format-version, so no version transition touches them. Only the
-    // image cache, which has no such guard, is dropped on a major transition.
+    // The KV caches (*.kv_raw and their *.json sidecars) self-validate by
+    // fingerprint and snapshot format-version, so no version transition touches
+    // them. Only the image cache, which has no such guard, is dropped on a major
+    // transition.
     if transition == Transition::Major {
         let _ = std::fs::remove_dir_all(plank_dir.join("image-cache"));
     }
@@ -365,6 +370,10 @@ mod tests {
     fn setup(dir: &Path, prev: &str) {
         std::fs::create_dir_all(dir.join("kvcache")).unwrap();
         std::fs::create_dir_all(dir.join("image-cache")).unwrap();
+        // Deliberately the *legacy* blob names. The claim under test is that no
+        // version transition unlinks anything in `kvcache/`, and it has to hold
+        // for files an older plank left behind just as much as for `.kv_raw`
+        // bodies this one writes.
         std::fs::write(dir.join("kvcache").join("sysprompt.kv"), b"kv").unwrap();
         std::fs::write(dir.join("kvcache").join("abc.session"), b"s").unwrap();
         std::fs::write(dir.join("kvcache").join("abc.payload"), b"p").unwrap();
@@ -385,6 +394,46 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join(MARKER_FILE)).unwrap(),
             "1.0.0"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A brand-new install must classify as a fresh install, and that depends on
+    /// nothing having created `~/.plank` before this runs.
+    ///
+    /// The one-shot `.kv_raw` migration in `main` opens a `SessionStore`, whose
+    /// `create_dir_all` created `~/.plank` as a side effect. This function then
+    /// found a directory with no version marker, which `classify(None, _)` reads
+    /// as [`Transition::Major`] — so a first launch announced "major version
+    /// change detected; cleared the image cache". The migration is now gated on
+    /// `~/.plank/kvcache` already being a directory. This test holds both halves
+    /// of that coupling in place: the absent-directory case is `None`, and the
+    /// present-but-unmarked case really is `Major`, which is why the gate is
+    /// load-bearing rather than merely tidy.
+    #[test]
+    fn a_fresh_install_is_not_a_major_transition() {
+        let dir = tmp("fresh-no-kvcache");
+        assert!(!dir.exists(), "nothing has created ~/.plank yet");
+        assert!(!dir.join("kvcache").is_dir(), "and no cache dir to migrate");
+        assert_eq!(
+            run_startup_maintenance(&dir, "2.9.3"),
+            Transition::None,
+            "a fresh install is not a version change"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(MARKER_FILE)).unwrap(),
+            "2.9.3"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The regression this guards against, made explicit: had anything created
+        // the directory first, the very same launch would have been Major.
+        let dir = tmp("fresh-precreated");
+        std::fs::create_dir_all(dir.join("kvcache")).unwrap();
+        assert_eq!(
+            run_startup_maintenance(&dir, "2.9.3"),
+            Transition::Major,
+            "an unmarked ~/.plank is indistinguishable from a downgrade"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

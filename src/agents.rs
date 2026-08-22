@@ -407,9 +407,12 @@ pub fn render_list(defs: &[AgentDef]) -> String {
             .to_string();
     }
     let mut out = String::from("Agents (dispatch with /subagent:<name> <task>):\n");
-    for d in defs {
+    // An uncontested plugin definition holds both its bare name and its
+    // `<plugin>:<name>` alias; `listing` shows it once and names the plugin.
+    for listed in crate::plugins::listing(defs) {
+        let d = listed.entry;
         out.push_str("  ");
-        out.push_str(&d.name);
+        out.push_str(listed.name);
         if !d.description.is_empty() {
             out.push_str(" — ");
             out.push_str(&d.description);
@@ -429,6 +432,9 @@ pub fn render_list(defs: &[AgentDef]) -> String {
                 }
             }
             None => {}
+        }
+        if let Some(plugin) = listed.plugin {
+            let _ = write!(out, " [plugin {plugin}]");
         }
         out.push('\n');
     }
@@ -456,6 +462,11 @@ pub fn task_message(instructions: Option<&str>, task: &str) -> String {
          main conversation. Complete the task using your tools, then end with \
          a final report of your results — only that report is carried back \
          into the main conversation; everything else is discarded.\n\
+         Write that report as the plain answer, stated once: what you found, \
+         and nothing else. Do not narrate how you got there, do not weigh \
+         alternatives you have already ruled out, and do not hedge or revisit \
+         your conclusion — the reader cannot see your reasoning and will treat \
+         a report that argues with itself as unreliable and redo the work.\n\
          </system-reminder>\n\n",
     );
     if let Some(instructions) = instructions {
@@ -518,6 +529,11 @@ mod tests {
         assert!(task.starts_with("<system-reminder>\n"));
         assert!(task.ends_with("Task: count the tests"));
         assert!(!task.contains("Instructions:"));
+        // The report is the answer, not a transcript of getting there: a
+        // sub-agent that narrates its reasoning produces a report the parent
+        // distrusts and re-verifies by hand.
+        assert!(task.contains("plain answer, stated once"), "{task}");
+        assert!(task.contains("Do not narrate how you got there"), "{task}");
         let report = report_message("count the tests", "There are 42.\n");
         assert!(report.contains("completed the delegated task: count the tests"));
         assert!(report.ends_with("Subagent report:\nThere are 42."));

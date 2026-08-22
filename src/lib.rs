@@ -37,15 +37,20 @@ pub mod errlog;
 pub mod export;
 #[cfg(ds4_engine)]
 pub mod ffi;
+pub mod goal;
 pub mod hooks;
 pub mod host;
 pub mod imagepaste;
 pub mod insights;
 pub mod interrupt;
 pub mod kvcache;
+pub mod kvgc;
+pub mod kvmeta;
+pub mod kvpane;
 /// Volatility-tiered KV cache planning (issues #60, #64). FFI-free and always
 /// compiled so the tier walk is CI-tested; the gated `ds4engine` executes it.
 pub mod kvtier;
+pub mod kvtree;
 pub mod logo;
 pub mod memory;
 #[cfg(feature = "builtin_editor")]
@@ -54,9 +59,12 @@ pub mod names;
 pub mod notify;
 #[cfg(feature = "use_obscura")]
 pub mod obscura_web;
+pub mod openfile;
+pub mod plugins;
 pub mod remote;
 pub mod render;
 pub mod repro;
+pub mod resumepane;
 pub mod sandbox;
 pub mod serve;
 pub mod session;
@@ -68,6 +76,7 @@ pub mod slashmenu;
 /// hostless counterpart to `EngineHost`'s scheduler, for fanning out forks.
 pub mod slice;
 pub mod snapshot;
+pub mod speeds;
 pub mod status;
 pub mod statusbar;
 pub mod stderrline;
@@ -83,5 +92,11 @@ pub mod uiremote;
 pub mod upgrade;
 pub mod viz;
 pub mod warp;
+pub mod wasmcaps;
+pub mod wasmevents;
+pub mod wasmglyph;
+pub mod wasmhost;
+pub mod wasmreg;
+pub mod wasmsig;
 pub mod worker;
 pub mod worktree;

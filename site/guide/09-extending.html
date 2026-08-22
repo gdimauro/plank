@@ -121,6 +121,7 @@
     <div class="bar">
       <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
       <div class="navlinks">
+        <a class="ghost" href="/whats-new">What's new</a>
         <a class="ghost" href="/guide/">Guide</a>
         <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
@@ -235,6 +236,16 @@ does not, so a typo shows up before you press Enter.</p>
 <p>The model can delegate on its own with the <code>agent</code> tool.
 Delegation is bounded at one level — a subagent cannot itself delegate —
 which keeps a runaway from spawning a tree.</p>
+<p>What comes back is the answer, not the deliberation: the report is
+stripped of the subagent's thinking before it enters your transcript,
+and the subagent is asked to state its conclusion once with the reason
+attached. Its reasoning is still there to read in the roster while it
+works.</p>
+<p>While agents are running, the TUI lists them in a roster below the
+status bar — one row each, with the task, the clock and the token spend,
+and <code>←</code> then <code>Enter</code> to read any agent's output in
+full. See <a href="03-the-interface.html#the-agent-roster">The agent
+roster</a>.</p>
 <p>When the subagent reports back, plank runs a turn on that report:
 delegated work comes back into the conversation and gets acted on,
 rather than sitting in the transcript until you type again.</p>
@@ -443,6 +454,54 @@ what was my last published article on medium?</code></pre>
 that misses the response deadline is dropped along with all of its
 tools, so check <code>mcp.timeoutSecs</code> if one is slow to
 start.</p>
+<h3 id="reading-images-with-ocr-mcp">Reading images with ocr-mcp</h3>
+<p>plank can attach a screenshot, but the ds4 engine is text-only, so
+the model receives a path rather than pixels. <a
+href="https://github.com/aovestdipaperino/ocr-mcp"><code>ocr-mcp</code></a>
+closes that gap: it is a small MCP server that runs a local GLM-OCR
+model and exposes one tool, <code>transcribe_image</code>. Paste a
+screenshot of a stack trace, ask what it says, and the model calls the
+tool on the path and reads the answer back. Nothing leaves the machine
+and there is no API key.</p>
+<p>Install it, along with the <code>llama-server</code> binary that does
+the inference:</p>
+<pre class="sh"><code>brew install llama.cpp
+cargo install ocr-mcp</code></pre>
+<p>Then register it like any other server, in
+<code>~/.plank/.mcp.json</code> to have it everywhere or
+<code>./.mcp.json</code> for one project:</p>
+<pre class="json"><code>{
+  &quot;mcpServers&quot;: {
+    &quot;ocr&quot;: {
+      &quot;command&quot;: &quot;ocr-mcp&quot;,
+      &quot;env&quot;: {
+        &quot;OCR_MCP_MODEL_DIR&quot;: &quot;~/.cache/ocr-mcp&quot;,
+        &quot;OCR_MCP_AUTO_DOWNLOAD&quot;: &quot;1&quot;
+      }
+    }
+  }
+}</code></pre>
+<p><strong>Getting the weights.</strong> Two files are needed, the model
+and its matching projector, about 1.34 GiB together. With
+<code>OCR_MCP_AUTO_DOWNLOAD</code> set they are fetched the first time
+you actually ask for a transcription, not at startup, so plank's
+handshake is never held up and only that first call is slow. Leave the
+variable out and nothing is ever downloaded: the first transcription
+instead returns an error naming the two files and where they go. To
+fetch them by hand:</p>
+<pre class="sh"><code>mkdir -p ~/.cache/ocr-mcp &amp;&amp; cd ~/.cache/ocr-mcp
+BASE=https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main
+curl -L &quot;$BASE/GLM-OCR-Q8_0.gguf&quot;        -o glm-ocr.gguf
+curl -L &quot;$BASE/mmproj-GLM-OCR-Q8_0.gguf&quot; -o glm-ocr-mmproj.gguf</code></pre>
+<p>The server spawns <code>llama-server</code> on the first call, keeps
+it warm, and kills it after five idle minutes so the memory goes back to
+ds4. That last part is not incidental on a machine where ds4 already
+occupies 81 GB: set <code>OCR_MCP_IDLE_SECS</code> lower if you want the
+window shorter.</p>
+<p>It is an OCR model, not a general vision model. It reads text well
+and it will answer confidently and wrongly if you ask it whether a user
+interface looks right. <code>/mcp</code> will show it connected once
+plank restarts.</p>
 <h3 id="when-a-global-server-fails-to-start">When a global server fails
 to start</h3>
 <p>plank does <strong>not</strong> simply drop it from the prompt. A
@@ -460,6 +519,79 @@ substituted advertisement.</p>
 <p>This applies to global servers only. Project-local servers are cheap
 to rebuild, so they get no cached record — a dead project server simply
 is not advertised.</p>
+<h2 id="plugins">Plugins</h2>
+<p>A plugin is a directory that bundles several of the extension points
+above and contributes them to a session as one unit, instead of asking
+you to drop a skill here, an agent there and a hook file somewhere
+else.</p>
+<pre><code>my-plugin/
+  .plank-plugin/plugin.json     name, description, version, author
+  skills/release/SKILL.md
+  agents/reviewer.md
+  templates/review.md
+  hooks.json
+  .mcp.json
+  settings.json</code></pre>
+<p>Every part is optional; a directory with a manifest and one component
+is a plugin. Both spellings are accepted, plank's and Claude Code's: the
+manifest may be <code>.plank-plugin/plugin.json</code> or
+<code>.claude-plugin/plugin.json</code>, templates may live in
+<code>templates/</code> or <code>commands/</code>, hooks in
+<code>hooks.json</code> or <code>hooks/hooks.json</code>. Where both are
+present the plank spelling wins and the shadowing is reported. A
+directory with no manifest at all but with recognizable components still
+loads, named after the directory it sits in.</p>
+<h3 id="activating-one">Activating one</h3>
+<p>Plugins are loaded from three places, in order:
+<code>~/.plank/plugins/dev/*</code> for ones you want everywhere,
+<code>&lt;cwd&gt;/.plank/plugins/*</code> for ones that belong to a
+project, and each <code>--plugin-dir &lt;path&gt;</code> on the command
+line, which is repeatable and lasts only for that session. A later
+source shadows an earlier plugin of the same name, so a
+<code>--plugin-dir</code> copy is the natural way to try a change to a
+plugin you already have installed.</p>
+<p><code>/plugins</code> lists what loaded, where each one came from,
+what it contributes, and every warning raised along the way. Nothing
+about a bad plugin is fatal: a broken manifest or an unreadable
+component demotes that one plugin, or just that one component, and the
+session continues.</p>
+<h3 id="naming">Naming</h3>
+<p>One rule covers skills, agents and templates: a plugin contribution
+is always addressable as <code>&lt;plugin&gt;:&lt;name&gt;</code>, and
+it keeps the bare <code>&lt;name&gt;</code> only when nothing else
+claims it. Your own skills and agents always win the bare name, and when
+two plugins offer the same name neither keeps it — both stay reachable
+only in their namespaced form. <code>/skills</code>, <code>/agent</code>
+and <code>/templates</code> show the contributing plugin beside each
+entry.</p>
+<p>MCP servers are the exception: the separator is <code>-</code>, so a
+disambiguated server is <code>&lt;plugin&gt;-&lt;server&gt;</code>.
+Server names are embedded in the tool name
+<code>mcp__&lt;server&gt;__&lt;tool&gt;</code> and split at the first
+<code>__</code>, which is also why a plugin server name containing
+<code>__</code> is rejected outright.</p>
+<p>Hooks have no names to collide, so they are simply additive and all
+of them run: <code>~/.plank/hooks.json</code> first, then each plugin's
+hook file in load order, then the project's
+<code>./.plank/hooks.json</code>.</p>
+<h3 id="where-plugin-settings-sit">Where plugin settings sit</h3>
+<p>A plugin's <code>settings.json</code> becomes a new precedence level
+directly above the built-in defaults, and below everything of yours:</p>
+<pre><code>defaults &lt; plugin &lt; ~/.plank/settings.json &lt; ./.plank/settings.json &lt; env &lt; CLI</code></pre>
+<p>Several plugins merge in load order, later winning. By construction a
+plugin can never override a setting you set yourself. The sharp edge is
+the key you did <em>not</em> set: a plugin that writes a
+<code>safety.*</code> key still beats the built-in default, so a plugin
+can, for instance, turn the bash sandbox off if you have never set it
+explicitly. plank warns at startup and in <code>/plugins</code> whenever
+a plugin's settings touch a <code>safety.*</code> key — that warning is
+worth reading. See <a href="08-configuration.html">Configuration</a>.</p>
+<h3 id="what-is-not-here-yet">What is not here yet</h3>
+<p>This release makes hand-placed plugin directories work, and nothing
+more. There is no installer, no marketplace, no dependency resolution,
+no version handling and no policy controls. You place a plugin directory
+yourself, or pass it with <code>--plugin-dir</code>. Manifest fields
+that later work will need are tolerated and ignored today.</p>
 <hr />
 <p>Next: <a href="10-remote-and-providers.html">Remote and hosted engines
 →</a></p>

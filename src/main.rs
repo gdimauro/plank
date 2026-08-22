@@ -48,10 +48,59 @@ fn main() -> ExitCode {
         return run_remote_client(&args[1..]);
     }
 
-    // Settings seed the config; every CLI flag then overrides them. Read from
-    // the launch directory: `--chdir` is parsed here and so cannot yet be
-    // known, which is a documented limitation of project-scoped settings.
-    let settings = plank::settings::Settings::load();
+    // The plugin set has to be built before settings are read, so that a
+    // plugin's `settings.json` can be layered in below the user file — but
+    // building it needs `--plugin-dir`, which only the parsed config carries.
+    // A throwaway provisional parse (base settings, no plugin layer) breaks
+    // that cycle: only its `plugin_dirs` and `chdir_path` are used (both pure
+    // CLI flags, unaffected by settings layering, so they agree with the real
+    // parse below), and the real parse re-derives everything else with the
+    // enriched settings.
+    let provisional =
+        plank::config::parse_options_with(&plank::settings::Settings::default(), &args)
+            .unwrap_or_else(|_| {
+                plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
+            });
+    // `--help` is answered from the provisional parse, before `--chdir` and
+    // before the plugin scan. Both of those can fail or print warnings, and
+    // `plank --chdir /nonexistent --help` printing a chdir error instead of the
+    // usage text — or prefixing the usage with plugin warnings — is a
+    // regression against every other CLI. `show_help` is a pure flag, so the
+    // provisional parse resolves it identically to the real one; a provisional
+    // parse that failed leaves it false and falls through to the real parse,
+    // which reports the argument error.
+    if provisional.show_help {
+        print!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
+    // `--chdir` has to happen before the plugin scan (and therefore before
+    // project settings, which are also cwd-scoped) rather than after, or the
+    // plugin set built here would reflect the launch directory instead of the
+    // directory the session actually runs in — the eager local-engine preload
+    // in `wants_local_subagent` and the worktree's `hooks.json` discovery both
+    // consult this same set, so a mismatch here means a plugin declared under
+    // `<chdir>/.plank/plugins` silently never loads.
+    if let Some(dir) = &provisional.chdir_path
+        && let Err(e) = std::env::set_current_dir(dir)
+    {
+        eprintln!("plank: chdir {}: {e}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    // This set is deliberately the PRE-worktree one: it is scanned against the
+    // post-`--chdir` cwd but before `enter_startup_worktree` moves us again.
+    // That ordering is forced, not accidental — `enter_startup_worktree` needs
+    // `hooks_with_plugins(&cwd, plugins)` to decide whether to create the
+    // worktree at all, so the set has to exist first. Rebuilding it after the
+    // worktree move would mean a second full plugin scan (and a second round of
+    // warnings) purely to observe a directory that is a checkout of the same
+    // repo, so the pre-worktree set is reused for the rest of startup.
+    let plugins = plank::plugins::load_default(&cwd, &provisional.plugin_dirs);
+    for w in plugins.all_warnings() {
+        eprintln!("plugin warning: {w}");
+    }
+    let settings =
+        plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
     plank::settings::install(settings.clone());
     let cfg = match plank::config::parse_options_with(&settings, &args) {
         Ok(cfg) => cfg,
@@ -60,6 +109,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Backstop: the provisional parse above answers `--help` in practice, but
+    // it falls back to defaults when the argument list does not parse, and the
+    // real parse is the one that decides with the layered settings in hand.
     if cfg.show_help {
         print!("{}", usage());
         return ExitCode::SUCCESS;
@@ -69,17 +121,33 @@ fn main() -> ExitCode {
     if let Some(note) = plank::settings::startup_note(&settings, &cfg) {
         eprintln!("{note}");
     }
-    if let Some(dir) = &cfg.chdir_path
-        && let Err(e) = std::env::set_current_dir(dir)
+    // One-shot wipe of pre-`.kv_raw` KV blobs, before any terminal setup so
+    // the note prints as a plain line on every front end (TUI, plain REPL,
+    // and `--non-interactive` all funnel through here). Best-effort: a store
+    // that fails to open is skipped silently, and the next launch retries.
+    //
+    // Gated on the cache directory already existing, and deliberately not
+    // moved below `run_startup_maintenance`: `SessionStore::open` does a
+    // `create_dir_all`, which creates `~/.plank` as a side effect, and a
+    // `~/.plank` that exists with no version marker is what
+    // `upgrade::classify` reads as a major version change — so a brand-new
+    // install announced "cleared the image cache" on its very first launch.
+    // The migration has to stay above every terminal setup (running it inside
+    // the live alternate screen garbled the warm-progress frame), so the gate
+    // is the fix rather than a reorder. Nothing to migrate exists before the
+    // directory does, so skipping is exact rather than merely cheap.
+    let kv_dir = plank::session::SessionStore::default_dir();
+    if let Some(bytes) = plank::session::SessionStore::migrate_kvcache_if_present(&kv_dir)
+        && bytes > 0
     {
-        eprintln!("plank: chdir {}: {e}", dir.display());
-        return ExitCode::FAILURE;
+        #[allow(clippy::cast_precision_loss)] // GB display only; loses no meaningful precision
+        let gb = bytes as f64 / 1_073_741_824.0;
+        eprintln!("kvcache: migrated to the .kv_raw format, reclaimed {gb:.1} GB");
     }
-
     // `--worktree` runs before anything reads the working directory, because
     // the whole session — its hooks, agent definitions, and every tool's cwd —
     // is meant to live inside the worktree rather than the original checkout.
-    if let Err(e) = enter_startup_worktree(&cfg, &settings) {
+    if let Err(e) = enter_startup_worktree(&cfg, &settings, &plugins) {
         eprintln!("plank: {e}");
         return ExitCode::FAILURE;
     }
@@ -102,14 +170,14 @@ fn main() -> ExitCode {
     }
 
     plank::interrupt::install();
-    let engine = match make_engine(&cfg) {
+    let engine = match make_engine(&cfg, &plugins) {
         Ok(engine) => engine,
         Err(e) => {
             eprintln!("plank: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match run(engine.main, engine.local, &cfg) {
+    match run(engine.main, engine.local, &cfg, plugins) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("plank: {e}");
@@ -132,6 +200,7 @@ fn main() -> ExitCode {
 fn enter_startup_worktree(
     cfg: &AgentConfig,
     settings: &plank::settings::Settings,
+    plugins: &plank::plugins::PluginSet,
 ) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     if let Some(root) = plank::worktree::canonical_git_root(&cwd) {
@@ -152,7 +221,7 @@ fn enter_startup_worktree(
         sparse_paths: settings.worktree.sparse_paths.clone(),
         symlink_dirs: settings.worktree.symlink_directories.clone(),
     };
-    let hooks = plank::hooks::load_default(&cwd);
+    let hooks = plank::plugins::hooks_with_plugins(&cwd, plugins);
     let session = plank::worktree::create_for_session(&cwd, &name, &hooks, &opts)
         .map_err(|e| format!("worktree '{name}': {e}"))?;
     std::env::set_current_dir(&session.path)
@@ -256,16 +325,17 @@ struct Engines {
 /// Whether any sub-agent definition visible from `cwd` asks for the local
 /// engine explicitly (`provider: local`). Omitting `provider:` does *not* count:
 /// that means "the parent's engine", whatever it happens to be.
-fn wants_local_subagent() -> bool {
+fn wants_local_subagent(plugins: &plank::plugins::PluginSet) -> bool {
     let Ok(cwd) = std::env::current_dir() else {
         return false;
     };
-    plank::agents::load_default(&cwd)
+    plank::plugins::agents_with_plugins(&cwd, plugins)
+        .0
         .iter()
         .any(|d| matches!(d.engine, Some(plank::agents::AgentEngine::Local)))
 }
 
-fn make_engine(cfg: &AgentConfig) -> Result<Engines, String> {
+fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result<Engines, String> {
     // Remote engine (flavor a, issue #26) is available on every platform and
     // takes precedence over the local selectors when `--remote` is given.
     if let Some(url) = &cfg.remote_url {
@@ -332,7 +402,7 @@ fn make_engine(cfg: &AgentConfig) -> Result<Engines, String> {
         // load it alongside the provider — otherwise such a sidechain would have
         // nothing to run on. Costly and deliberate: only an explicit definition
         // triggers it, and it fails here rather than mid-turn.
-        let local = if wants_local_subagent() {
+        let local = if wants_local_subagent(plugins) {
             eprintln!(
                 "plank: a sub-agent definition asks for the local engine; loading it alongside the provider..."
             );
@@ -385,6 +455,11 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             .clone()
             .unwrap_or_else(plank::download::default_model_path);
         plank::download::ensure_model(&model)?;
+        // `--dspark` without `--mtp` resolves to the default support model,
+        // fetched on demand. Kept local rather than written back into `cfg`:
+        // only the engine open needs it.
+        let mut tuning = cfg.engine.clone();
+        plank::download::ensure_dspark_support(&mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -401,7 +476,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             cfg.generation.ctx_size,
             cfg.n_threads,
             cfg.power_percent,
-            &cfg.engine,
+            &tuning,
         )
         .map_err(|e| e.to_string())?;
         drop(replacer);
@@ -496,7 +571,22 @@ fn run_serve(args: &[String]) -> ExitCode {
             }
         }
     }
-    let settings = plank::settings::Settings::load();
+    // See the `main` provisional-parse comment: the plugin set must be built
+    // from `--plugin-dir` before settings are read, but `--plugin-dir` is
+    // only known once parsed, so a throwaway base-settings parse breaks the
+    // cycle.
+    let provisional =
+        plank::config::parse_options_with(&plank::settings::Settings::default(), &passthrough)
+            .unwrap_or_else(|_| {
+                plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
+            });
+    let launch_cwd = std::env::current_dir().unwrap_or_default();
+    let plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
+    for w in plugins.all_warnings() {
+        eprintln!("plugin warning: {w}");
+    }
+    let settings =
+        plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
     plank::settings::install(settings.clone());
     let cfg = match plank::config::parse_options_with(&settings, &passthrough) {
         Ok(cfg) => cfg,
@@ -527,7 +617,7 @@ fn run_serve(args: &[String]) -> ExitCode {
         };
     }
 
-    let engine = match make_engine(&cfg) {
+    let engine = match make_engine(&cfg, &plugins) {
         Ok(engine) => engine,
         Err(e) => {
             eprintln!("plank serve: {e}");
@@ -574,6 +664,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
             .clone()
             .unwrap_or_else(plank::download::default_model_path);
         plank::download::ensure_model(&model_path)?;
+        // See the local-engine path: resolved into a local copy, not `cfg`.
+        let mut tuning = cfg.engine.clone();
+        plank::download::ensure_dspark_support(&mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
@@ -587,7 +680,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
             cfg.generation.ctx_size,
             cfg.n_threads,
             cfg.power_percent,
-            &cfg.engine,
+            &tuning,
             &cfg.system,
         )
         .map_err(|e| e.to_string())?;
@@ -613,10 +706,11 @@ fn run(
     engine: Box<dyn Engine>,
     local_engine: Option<Box<dyn Engine>>,
     cfg: &AgentConfig,
+    plugins: plank::plugins::PluginSet,
 ) -> Result<(), String> {
     let color = std::io::stdout().is_terminal();
     if cfg.non_interactive {
-        return plank::ui::run_non_interactive(engine, cfg, local_engine);
+        return plank::ui::run_non_interactive(engine, cfg, local_engine, plugins);
     }
     plank::title::set(plank::title::State::Loading);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
@@ -639,5 +733,5 @@ fn run(
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    plank::ui::run_interactive(engine, cfg, local_engine)
+    plank::ui::run_interactive(engine, cfg, local_engine, plugins)
 }

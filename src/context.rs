@@ -38,17 +38,39 @@ pub struct ContextContent {
 }
 
 impl ContextContent {
-    /// Collects all context content at session start.
+    /// Collects all context content at session start, deriving the roster from
+    /// the plugin-free `~/.plank`+`./.plank` definitions.
+    ///
+    /// Prefer [`Self::new_with_agents`] anywhere the caller already holds the
+    /// merged (plugin-inclusive) definition list: this constructor cannot see
+    /// plugin-contributed agents, so the roster it builds would advertise less
+    /// than `/agent` and `set_roster` do. It stays for tests and for callers
+    /// with no merged list at hand.
     #[must_use]
     pub fn new() -> Self {
+        let defs = std::env::current_dir()
+            .ok()
+            .map(|cwd| crate::agents::load_default(&cwd))
+            .unwrap_or_default();
+        Self::new_with_agents(&defs)
+    }
+
+    /// Collects all context content at session start, advertising exactly the
+    /// definitions `defs` holds.
+    ///
+    /// The roster the model sees has to be the same roster `set_roster`
+    /// publishes and `/agent` lists — otherwise a plugin-contributed agent is
+    /// dispatchable by the user but invisible to the model, and a
+    /// `provider: local` one makes plank pay the local-engine load for a
+    /// definition it can never auto-route to.
+    #[must_use]
+    pub fn new_with_agents(defs: &[crate::agents::AgentDef]) -> Self {
         let git_content = fetch_git_context();
         let agents_md_content = discover_agents_md_files();
         let memory_content = std::env::current_dir()
             .ok()
             .and_then(|cwd| crate::memory::load_default(&cwd));
-        let agents_content = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| agent_roster_context(&crate::agents::load_default(&cwd)));
+        let agents_content = agent_roster_context(defs);
         let date_content = date_context_line();
 
         Self {
@@ -436,9 +458,71 @@ pub fn date_context_line() -> String {
     format!("Today's date is {}.", current_local_iso_date())
 }
 
+/// Opening lines of every block [`ContextContent`] can inject, in the order the
+/// two context units can start with them. Each is the first thing its block
+/// writes, so a transcript message starting with one is scaffolding rather than
+/// something a human typed.
+const CONTEXT_MARKERS: [&str; 5] = [
+    "Agent instructions:\n",
+    "Persistent memory (durable notes from past sessions",
+    "Configured sub-agents, selectable by passing",
+    "This is the git status at the start of the conversation.",
+    "Today's date is ",
+];
+
+/// True when `text` is one of the session-start context blocks plank injects
+/// into the transcript ([`push_session_context`](crate::ui)).
+///
+/// Recognized by the block's own opening line rather than by position: the
+/// stable unit starts with whichever of its parts exists, and both units are
+/// stored as ordinary user turns, so there is nothing else to key on. Used to
+/// keep the scaffolding out of replayed history — it is context for the model,
+/// not conversation to show back to the user.
+#[must_use]
+pub fn is_session_context(text: &str) -> bool {
+    let text = text.trim_start();
+    CONTEXT_MARKERS.iter().any(|m| text.starts_with(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every block a real `ContextContent` can produce has to be recognizable,
+    /// or it leaks into replayed history the moment that part exists.
+    #[test]
+    fn every_injected_context_block_is_recognized() {
+        let content = ContextContent {
+            git_content: Some(fetch_git_context().unwrap_or_else(|| {
+                "This is the git status at the start of the conversation.\n\nx".to_owned()
+            })),
+            agents_md_content: Some("# CLAUDE.md\nbe careful".to_owned()),
+            memory_content: crate::memory::load_default(std::path::Path::new(".")).or_else(|| {
+                Some("Persistent memory (durable notes from past sessions):\n\nx".to_owned())
+            }),
+            agents_content: Some(
+                "Configured sub-agents, selectable by passing `name` to the `agent` tool:\n  a\n"
+                    .to_owned(),
+            ),
+            date_content: date_context_line(),
+        };
+        assert!(is_session_context(&content.stable_context()));
+        assert!(is_session_context(&content.volatile_context()));
+        // Each part alone leads its unit in some configuration.
+        assert!(is_session_context(&content.date_content));
+        assert!(is_session_context(content.git_content.as_deref().unwrap()));
+        assert!(is_session_context(
+            content.memory_content.as_deref().unwrap()
+        ));
+        assert!(is_session_context(
+            content.agents_content.as_deref().unwrap()
+        ));
+        // What a user actually types is not scaffolding.
+        assert!(!is_session_context("fix the resume replay"));
+        assert!(!is_session_context(
+            "what does 'Agent instructions:' mean here?"
+        ));
+    }
 
     #[test]
     fn date_context_line_has_expected_prefix() {
@@ -663,5 +747,30 @@ mod tests {
             "autoRoute off withholds everything"
         );
         crate::settings::install_for_test(crate::settings::Settings::default());
+    }
+
+    /// The roster the model sees is built from the definitions it is handed,
+    /// so a plugin-contributed agent reaches it. Before this, `new()` reloaded
+    /// the plugin-free set and the model could never auto-route to one.
+    #[test]
+    fn the_roster_advertises_the_definitions_it_is_handed() {
+        use crate::agents::AgentDef;
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let from_plugin = AgentDef {
+            name: "demo:scout".to_string(),
+            description: "scouts ahead".to_string(),
+            body: String::new(),
+            path: std::path::PathBuf::from("/tmp/demo/agents/scout.md"),
+            engine: None,
+            auto: true,
+            isolate: false,
+        };
+        let content = ContextContent::new_with_agents(std::slice::from_ref(&from_plugin));
+        let roster = content.agents_content.clone().expect("roster built");
+        assert!(
+            roster.contains("demo:scout"),
+            "plugin agent missing from the model-visible roster: {roster}"
+        );
+        assert!(content.stable_context().contains("demo:scout"));
     }
 }

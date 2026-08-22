@@ -101,7 +101,19 @@ pub struct Status {
     pub think: crate::engine::ThinkMode,
     /// Error text for the `Error` state.
     pub error: String,
+    /// Speculative-decoding counters (`--dspark`). Rendered only when
+    /// [`active`](crate::engine::SpecStats::active); a run without a support
+    /// model never shows the segment.
+    pub spec: crate::engine::SpecStats,
 }
+
+/// Marks the speculative-decoding segment, mirroring how `THINK_MARK` labels
+/// the reasoning level.
+///
+/// Deliberately not `⚡`: the power suffix already owns that glyph (`local
+/// ⚡100%`), and two different meanings for one mark in a single footer is
+/// exactly the sort of thing nobody notices until they misread it.
+const SPEC_MARK: &str = "⏩";
 
 /// Returns the input prompt text.
 #[must_use]
@@ -192,6 +204,105 @@ pub fn set_engine_origin(label: &str) {
 static LOCAL_POWER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Records the local engine's GPU power cap, from startup config or `/power`.
+/// Status-bar cells contributed by WASM `segment` components, already
+/// rendered.
+///
+/// Published rather than pulled for the same reason the roster and the power
+/// share are: [`build_status_text`] is a pure function called from a dozen
+/// places that have no access to a session, and threading one through all of
+/// them to reach a plugin registry would be a far larger change than the
+/// feature is worth. The registry re-renders on its own cadence and drops the
+/// text here; the bar only ever reads it.
+/// Each cell is `(text, priority)`: the priority is what `segment_render`
+/// returned, kept so the bar can *elide* rather than truncate when the line
+/// overflows. Dropping a whole cell by priority is what a component asked for
+/// by returning one; chopping the line at the right edge instead removes the
+/// power suffix, which is the bar's own anchor.
+static WASM_SEGMENTS: std::sync::RwLock<Vec<Cell>> = std::sync::RwLock::new(Vec::new());
+
+/// One contributed status-bar cell as the bar needs it.
+#[derive(Debug, Clone, Default)]
+pub struct Cell {
+    /// Rendered text, already one line.
+    pub text: String,
+    /// Elision order: higher survives longer.
+    pub priority: u8,
+    /// Foreground, when the component asked for one.
+    pub fg: Option<(u8, u8, u8)>,
+    /// Background, when the component asked for one.
+    pub bg: Option<(u8, u8, u8)>,
+}
+
+/// Replaces the contributed cells, highest priority first.
+pub fn set_wasm_segments(segments: Vec<Cell>) {
+    if let Ok(mut slot) = WASM_SEGMENTS.write() {
+        *slot = segments;
+    }
+}
+
+/// The contributed cells, joined for the bar. Empty when there are none, so
+/// the common case adds not one byte to the line.
+#[must_use]
+/// The contributed cells, dropping the lowest-priority ones until at most
+/// `keep` of them remain.
+///
+/// `usize::MAX` keeps them all, which is the ordinary path: elision only
+/// happens when [`build_status_text_within`] has established the line does not
+/// fit.
+fn wasm_segment_text_keeping(keep: usize, color: bool) -> String {
+    let Ok(slot) = WASM_SEGMENTS.read() else {
+        return String::new();
+    };
+    elide_cells_styled(&slot, keep, color)
+}
+
+/// Joins the highest-priority `keep` cells, prefixed for the bar.
+///
+/// Pure, and takes the cells rather than reading the global, so it is testable
+/// without a shared mutable static that parallel tests would fight over.
+/// Joins the highest-priority `keep` cells, optionally painting each cell's
+/// requested colours.
+///
+/// Pure, and takes the cells rather than reading the published global, so it is
+/// testable without a shared mutable static that parallel tests would fight
+/// over — the first version of its test set that static and broke an unrelated
+/// one.
+///
+/// A cell's colour is closed by returning to the bar's own style rather than by
+/// a full reset, exactly as the theme accent does: a reset here would drop the
+/// status bar's background for the rest of the line.
+fn elide_cells_styled(cells: &[Cell], keep: usize, color: bool) -> String {
+    if cells.is_empty() || keep == 0 {
+        return String::new();
+    }
+    // Already highest-priority-first, so keeping a prefix drops the lowest.
+    let kept: Vec<String> = cells
+        .iter()
+        .take(keep)
+        .map(|cell| {
+            if !color || (cell.fg.is_none() && cell.bg.is_none()) {
+                return cell.text.clone();
+            }
+            let mut out = String::new();
+            if let Some((r, g, b)) = cell.fg {
+                let _ =
+                    std::fmt::Write::write_fmt(&mut out, format_args!("\x1b[38;2;{r};{g};{b}m"));
+            }
+            if let Some((r, g, b)) = cell.bg {
+                let _ =
+                    std::fmt::Write::write_fmt(&mut out, format_args!("\x1b[48;2;{r};{g};{b}m"));
+            }
+            out.push_str(&cell.text);
+            out.push_str(STATUS_STYLE_START);
+            out
+        })
+        .collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!(" | {}", kept.join(" | "))
+}
+
 pub fn set_local_power(percent: i32) {
     LOCAL_POWER.store(percent, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1122,6 +1233,19 @@ pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
 /// prefill/generating footers (the TUI renders it in the output area instead).
 #[must_use]
 pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> String {
+    build_status_text_with_cells(st, color, progress_in_bar, usize::MAX)
+}
+
+/// [`build_status_text`] keeping at most `cells` contributed segments.
+///
+/// The elision knob for [`build_status_text_within`]. Private: callers ask for
+/// a width, not for a cell count.
+fn build_status_text_with_cells(
+    st: &Status,
+    color: bool,
+    progress_in_bar: bool,
+    cells: usize,
+) -> String {
     // Context usage shown as a bare percentage of the window (the ctx gauge).
     let ctx = if st.ctx_size > 0 {
         format!(
@@ -1163,6 +1287,16 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
         format!("{} | {origin}", theme(&cwd))
     };
     let ctx = format!("{think}{ctx}");
+    // The dspark segment sits with the ctx gauge rather than in the state word:
+    // it describes the whole turn, and keeping it left of the state keeps the
+    // power suffix anchored on the right.
+    let ctx = match spec_segment(st) {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
+    // Contributed cells ride between the state word and the power suffix: the
+    // suffix is the line's right anchor and must stay last.
+    let power = format!("{}{power}", wasm_segment_text_keeping(cells, color));
     let body = match st.state {
         WorkerState::Prefill | WorkerState::Generating => {
             match progress_segment(st, color).filter(|_| progress_in_bar) {
@@ -1188,6 +1322,81 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
         WorkerState::Idle => format!("{ctx} | idle{power}"),
     };
     format!("{dir}{body}")
+}
+
+/// The `--dspark` segment: mean tokens committed per speculative step, then the
+/// share of the offered draft capacity that survived verification.
+///
+/// `None` when the pass never speculated, so a plain run's footer is unchanged.
+///
+/// Rendered `1.5t/step`, never `1.5x`: it is a per-step token count, not a
+/// wall-clock speedup, and the two diverge badly. See
+/// [`SpecStats::tokens_per_step`](crate::engine::SpecStats::tokens_per_step).
+#[must_use]
+pub fn spec_segment(st: &Status) -> Option<String> {
+    if !st.spec.active() {
+        return None;
+    }
+    Some(format!(
+        "{SPEC_MARK}{:.1}t/step {:.0}%",
+        st.spec.tokens_per_step(),
+        100.0 * st.spec.block_fill()
+    ))
+}
+
+/// [`build_status_text`] fitted into `cols` columns.
+///
+/// When the line overflows, contributed cells are dropped lowest-priority
+/// first until it fits, and only then is the result truncated. Plain
+/// truncation alone cuts the *right* edge, which is where the power suffix
+/// lives — the one segment documented as the line's anchor — so a plugin cell
+/// could push the bar's own status off the screen.
+///
+/// The built-in segments are never elided: they are not competing for space on
+/// a plugin's behalf, and a user who cannot see the context gauge because a
+/// component had something to say is worse off than one who cannot see the
+/// component.
+#[must_use]
+pub fn build_status_text_within(
+    st: &Status,
+    color: bool,
+    progress_in_bar: bool,
+    cols: usize,
+) -> String {
+    let full = build_status_text(st, color, progress_in_bar);
+    if visible_width(&full) <= cols {
+        return full;
+    }
+    let total = WASM_SEGMENTS.read().map_or(0, |s| s.len());
+    // Drop one cell at a time rather than computing a budget: the cells are
+    // already ordered, and the number of them is single digits.
+    for keep in (0..total).rev() {
+        let candidate = build_status_text_with_cells(st, color, progress_in_bar, keep);
+        if visible_width(&candidate) <= cols {
+            return candidate;
+        }
+    }
+    build_status_text_with_cells(st, color, progress_in_bar, 0)
+}
+
+/// Visible width, ignoring ANSI escapes so a coloured line is not judged by
+/// the length of its escape sequences.
+fn visible_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for c in text.chars() {
+        if in_escape {
+            // A CSI sequence ends at its final byte, which is alphabetic.
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if c == '\u{1b}' {
+            in_escape = true;
+        } else {
+            width += 1;
+        }
+    }
+    width
 }
 
 /// Formats the echoed user prompt line (`* <text>` with bold styling on TTYs).
@@ -1265,6 +1474,80 @@ pub fn no_model_lines() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Elision drops the lowest-priority cells first and keeps the order.
+    ///
+    /// Pure: it takes the cells rather than reaching for the published global,
+    /// which parallel tests would otherwise fight over — the first version of
+    /// this test set that static and broke an unrelated one.
+    #[test]
+    fn cells_are_elided_lowest_priority_first() {
+        // As published: highest priority first.
+        let cell = |text: &str, priority: u8| Cell {
+            text: text.to_string(),
+            priority,
+            fg: None,
+            bg: None,
+        };
+        let cells = vec![
+            cell("IMPORTANT", 200),
+            cell("middling", 128),
+            cell("chatty", 10),
+        ];
+        assert_eq!(
+            elide_cells_styled(&cells, usize::MAX, false),
+            " | IMPORTANT | middling | chatty"
+        );
+        assert_eq!(
+            elide_cells_styled(&cells, 2, false),
+            " | IMPORTANT | middling"
+        );
+        assert_eq!(elide_cells_styled(&cells, 1, false), " | IMPORTANT");
+        // Nothing kept is the empty string, not a dangling separator that
+        // would leave the bar ending in " | ".
+        assert_eq!(elide_cells_styled(&cells, 0, false), "");
+        assert_eq!(elide_cells_styled(&[], usize::MAX, false), "");
+    }
+
+    /// A cell's requested colours are painted, and closed by returning to the
+    /// bar's own style rather than by a reset — a reset would drop the status
+    /// bar's background for the rest of the line.
+    #[test]
+    fn a_cells_colours_are_painted_and_closed_to_the_bar_style() {
+        let coloured = vec![Cell {
+            text: "BUSY".to_string(),
+            priority: 200,
+            fg: Some((255, 0, 0)),
+            bg: Some((0, 0, 128)),
+        }];
+        // Without colour the escapes must not appear at all: a piped run gets
+        // plain text.
+        assert_eq!(elide_cells_styled(&coloured, 1, false), " | BUSY");
+        let painted = elide_cells_styled(&coloured, 1, true);
+        assert!(painted.contains("\x1b[38;2;255;0;0m"), "{painted:?}");
+        assert!(painted.contains("\x1b[48;2;0;0;128m"), "{painted:?}");
+        assert!(painted.ends_with(STATUS_STYLE_START), "{painted:?}");
+        // Colour must not change how wide the bar thinks the cell is.
+        assert_eq!(visible_width(&painted), " | BUSY".len());
+
+        // A cell with no opinion stays untouched even in colour mode.
+        let plain = vec![Cell {
+            text: "quiet".to_string(),
+            priority: 1,
+            fg: None,
+            bg: None,
+        }];
+        assert_eq!(elide_cells_styled(&plain, 1, true), " | quiet");
+    }
+
+    /// Widths are measured in visible columns, so a coloured line is not judged
+    /// by the length of its escape sequences.
+    #[test]
+    fn visible_width_ignores_ansi() {
+        assert_eq!(visible_width("plain"), 5);
+        assert_eq!(visible_width("\x1b[1;31mred\x1b[0m"), 3);
+        assert_eq!(visible_width("\x1b[38;5;120mgreen\x1b[0m!"), 6);
+    }
     use super::*;
 
     #[test]
@@ -1301,6 +1584,55 @@ mod tests {
             "{}",
             build_status_text(&st, false, true)
         );
+    }
+
+    #[test]
+    fn dspark_segment_appears_only_when_a_pass_speculated() {
+        // A run without a support model must look exactly as it did before.
+        let plain = Status {
+            ctx_used: 1000,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        let line = build_status_text(&plain, false, true);
+        assert!(line.ends_with("ctx 12% | idle"), "{line}");
+        assert!(!line.contains(SPEC_MARK), "{line}");
+
+        // 10 steps of a 4-token block, 30 committed: 3.0 per step, 50% fill.
+        let spark = Status {
+            spec: crate::engine::SpecStats {
+                steps: 10,
+                committed: 30,
+                drafted: 40,
+            },
+            ..plain
+        };
+        let line = build_status_text(&spark, false, true);
+        assert!(
+            line.ends_with("ctx 12% | \u{23e9}3.0t/step 50% | idle"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn dspark_segment_survives_into_the_idle_footer() {
+        // The figures are only readable after the answer lands, so an idle
+        // footer carrying them is the point of the feature, not an artefact.
+        let st = Status {
+            state: WorkerState::Idle,
+            ctx_used: 10,
+            ctx_size: 100,
+            spec: crate::engine::SpecStats {
+                steps: 4,
+                committed: 4,
+                drafted: 16,
+            },
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        // Every draft rejected: 1.0 per step and 0%, still shown — "speculation is on
+        // and buying nothing" is exactly what a user needs to see.
+        assert!(line.contains("\u{23e9}1.0t/step 0%"), "{line}");
     }
 
     #[test]

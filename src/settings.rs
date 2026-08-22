@@ -131,6 +131,14 @@ pub struct UiSettings {
     /// Which ambient screen the screensaver puts up: the matrix rain, the
     /// starfield, the minions, or a fresh draw each time.
     pub screensaver_face: crate::arcade::ScreensaverFace,
+    /// A plugin face pinned by name, as `<plugin>:<face>`.
+    ///
+    /// Kept beside the built-in enum rather than folded into it. The enum is
+    /// `Copy` and exhaustively matched in half a dozen places; widening it to
+    /// carry a `String` would touch all of them to express something only the
+    /// screensaver opener cares about. `None` means the built-in field decides,
+    /// which is every session with no screensaver plugin installed.
+    pub screensaver_face_plugin: Option<String>,
     /// Whether the arcade easter eggs (`/pelota`, …) exist. On by
     /// default. Turned off they are not merely hidden — they stop being known
     /// commands, so the line goes to the model like any other unrecognized
@@ -159,6 +167,7 @@ impl Default for UiSettings {
             reduced_motion: false,
             screensaver: crate::arcade::ScreensaverDelay::default(),
             screensaver_face: crate::arcade::ScreensaverFace::default(),
+            screensaver_face_plugin: None,
             easter_eggs: true,
             builtin_editor: true,
         }
@@ -267,6 +276,17 @@ pub struct Settings {
     pub agents: AgentSettings,
     /// Git-worktree isolation tuning.
     pub worktree: WorktreeSettings,
+    /// KV-cache retention.
+    pub kvcache: KvCacheSettings,
+    /// Values set for plugin-declared `config` options, keyed
+    /// `<component-id>.<option>`.
+    ///
+    /// A flat map rather than a nested block because the keys are component
+    /// ids the user's plugins happen to have, not a schema plank knows at
+    /// compile time. Values are strings for the same reason: a component
+    /// declares the type, and `ConfigOption::accepts` validates against that
+    /// declaration rather than against anything settings.rs believes.
+    pub plugin_config: std::collections::BTreeMap<String, String>,
 }
 
 /// `worktree` block: how [`crate::worktree`] builds a new working copy.
@@ -282,6 +302,35 @@ pub struct WorktreeSettings {
     /// cannot overwrite each other's edits. Off by default: it costs a checkout
     /// per agent, and the agent's work then has to be merged back.
     pub isolate_agents: bool,
+}
+
+/// `kvcache` block: retention for persisted KV blobs.
+///
+/// Ages are in days and measured from a blob's `last_used`. A pinned blob and a
+/// blob with a surviving child both outlive their TTL — see [`crate::kvgc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvCacheSettings {
+    /// Days a session KV payload survives after its last use.
+    pub ttl_session_days: u64,
+    /// Days a system-prompt or project-stable checkpoint survives after its
+    /// last use.
+    pub ttl_tier_days: u64,
+    /// Hard size ceiling in bytes, enforced after the TTL sweep: survivors are
+    /// evicted least-recently-used first until the total fits. `0` disables the
+    /// ceiling — it means unbounded, never "evict everything". Pinned, active
+    /// and parent-of-a-survivor nodes are spared even when that leaves the
+    /// total over budget.
+    pub max_bytes: u64,
+}
+
+impl Default for KvCacheSettings {
+    fn default() -> Self {
+        Self {
+            ttl_session_days: 14,
+            ttl_tier_days: 30,
+            max_bytes: 21_474_836_480,
+        }
+    }
 }
 
 /// Reads a positive integer member, ignoring absent, non-numeric, and
@@ -390,10 +439,18 @@ impl Settings {
         {
             self.ui.screensaver = d;
         }
-        if let Some(v) = string(ui, "screensaverFace")
-            && let Some(f) = crate::arcade::ScreensaverFace::parse(&v)
-        {
-            self.ui.screensaver_face = f;
+        // A face is either one plank ships or one a plugin contributes. The
+        // built-in spellings win, so a plugin cannot capture the word "matrix"
+        // by naming a face that; anything containing `:` is a plugin address
+        // and is kept verbatim for the opener to resolve, because the plugin
+        // set is not known at settings-parse time.
+        if let Some(v) = string(ui, "screensaverFace") {
+            if let Some(f) = crate::arcade::ScreensaverFace::parse(&v) {
+                self.ui.screensaver_face = f;
+                self.ui.screensaver_face_plugin = None;
+            } else if v.contains(':') {
+                self.ui.screensaver_face_plugin = Some(v);
+            }
         }
         // `notifications` accepts a mode string (always/unfocused/never) or
         // the legacy booleans (true=always, false=never).
@@ -470,30 +527,89 @@ impl Settings {
         if let Some(v) = boolean(worktree, "isolateAgents") {
             self.worktree.isolate_agents = v;
         }
+
+        let kvcache = root.get("kvcache");
+        if let Some(v) = num::<u64>(kvcache, "ttlSessionDays") {
+            self.kvcache.ttl_session_days = v;
+        }
+        if let Some(v) = num::<u64>(kvcache, "ttlTierDays") {
+            self.kvcache.ttl_tier_days = v;
+        }
+        if let Some(v) = num::<u64>(kvcache, "maxBytes") {
+            self.kvcache.max_bytes = v;
+        }
+
+        // Merged key by key rather than replaced wholesale: a project file that
+        // sets one plugin option must not silently drop the user's settings for
+        // every other one, which is what assigning the map would do.
+        if let Some(Json::Obj(entries)) = root.get("pluginConfig") {
+            for (key, value) in entries {
+                if let Json::Str(v) = value {
+                    self.plugin_config.insert(key.clone(), v.clone());
+                }
+            }
+        }
     }
 
-    /// Loads `~/.plank/settings.json` then `<cwd>/.plank/settings.json`.
+    /// Overlays `low` files then `high` files, in that order, on the
+    /// built-in defaults. Exists so plugin settings can sit strictly below
+    /// the user and project files.
     #[must_use]
-    pub fn load() -> Self {
+    pub fn load_from_paths(low: &[PathBuf], high: &[PathBuf]) -> Self {
         let mut s = Self::default();
-        for p in Self::paths() {
-            if let Ok(text) = std::fs::read_to_string(&p) {
+        for p in low.iter().chain(high.iter()) {
+            if let Ok(text) = std::fs::read_to_string(p) {
                 s.overlay(&text);
             }
         }
         s
     }
 
+    /// [`load`](Self::load) with plugin-contributed settings applied first, so
+    /// `defaults < plugins < ~/.plank < ./.plank`.
+    #[must_use]
+    pub fn load_with_plugins(plugin_paths: &[PathBuf]) -> Self {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let cwd = std::env::current_dir().unwrap_or_default();
+        Self::load_with_plugins_in(home.as_deref(), &cwd, plugin_paths)
+    }
+
+    /// Hermetic seam for [`load_with_plugins`](Self::load_with_plugins): takes
+    /// `home`/`cwd` explicitly instead of reading the environment, so tests can
+    /// exercise the real precedence composition without touching `HOME`.
+    #[must_use]
+    pub fn load_with_plugins_in(home: Option<&Path>, cwd: &Path, plugin_paths: &[PathBuf]) -> Self {
+        Self::load_from_paths(plugin_paths, &Self::paths_in(home, cwd))
+    }
+
+    /// Loads `~/.plank/settings.json` then `<cwd>/.plank/settings.json`.
+    #[must_use]
+    pub fn load() -> Self {
+        Self::load_from_paths(&[], &Self::paths())
+    }
+
     /// The files [`load`](Self::load) consults, in increasing precedence.
     #[must_use]
     pub fn paths() -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        match std::env::current_dir() {
+            Ok(cwd) => Self::paths_in(home.as_deref(), &cwd),
+            Err(_) => home
+                .map(|home| home.join(".plank").join("settings.json"))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Hermetic seam for [`paths`](Self::paths): takes `home`/`cwd` explicitly
+    /// instead of reading the environment.
+    #[must_use]
+    pub fn paths_in(home: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            paths.push(PathBuf::from(home).join(".plank").join("settings.json"));
+        if let Some(home) = home {
+            paths.push(home.join(".plank").join("settings.json"));
         }
-        if let Ok(cwd) = std::env::current_dir() {
-            paths.push(cwd.join(".plank").join("settings.json"));
-        }
+        paths.push(cwd.join(".plank").join("settings.json"));
         paths
     }
 
@@ -933,6 +1049,37 @@ mod tests {
     }
 
     #[test]
+    fn the_kvcache_budget_defaults_to_twenty_gigabytes() {
+        // A real ceiling, not a warning: the TTL sweep alone puts no upper
+        // bound on the cache.
+        assert_eq!(Settings::default().kvcache.max_bytes, 21_474_836_480);
+    }
+
+    #[test]
+    fn kvcache_block_overlays_and_defaults() {
+        let mut s = Settings::default();
+        assert_eq!(s.kvcache.ttl_session_days, 14);
+        assert_eq!(s.kvcache.ttl_tier_days, 30);
+        assert_eq!(s.kvcache.max_bytes, 21_474_836_480, "20 GB by default");
+
+        s.overlay(r#"{"kvcache":{"ttlSessionDays":7,"ttlTierDays":60,"maxBytes":21474836480}}"#);
+        assert_eq!(s.kvcache.ttl_session_days, 7);
+        assert_eq!(s.kvcache.ttl_tier_days, 60);
+        assert_eq!(s.kvcache.max_bytes, 21_474_836_480);
+    }
+
+    #[test]
+    fn a_bad_kvcache_value_does_not_discard_its_siblings() {
+        let mut s = Settings::default();
+        s.overlay(r#"{"kvcache":{"ttlSessionDays":"soon","ttlTierDays":60}}"#);
+        assert_eq!(
+            s.kvcache.ttl_session_days, 14,
+            "bad value keeps the default"
+        );
+        assert_eq!(s.kvcache.ttl_tier_days, 60, "sibling still applies");
+    }
+
+    #[test]
     fn reads_every_group() {
         let s = from_json(
             r#"{"engine":{"threads":8,"backend":"cpu","power":80,"ctx":262144},
@@ -1000,9 +1147,6 @@ mod tests {
         for (text, want) in [
             ("matrix", ScreensaverFace::Matrix),
             ("rain", ScreensaverFace::Matrix),
-            ("starfield", ScreensaverFace::Starfield),
-            ("stars", ScreensaverFace::Starfield),
-            ("minions", ScreensaverFace::Minions),
             ("random", ScreensaverFace::Random),
             ("either", ScreensaverFace::Random),
             ("  MATRIX  ", ScreensaverFace::Matrix),
@@ -1010,7 +1154,20 @@ mod tests {
             let mut s = Settings::default();
             s.overlay(&format!("{{\"ui\":{{\"screensaverFace\":\"{text}\"}}}}"));
             assert_eq!(s.ui.screensaver_face, want, "parsing {text:?}");
+            assert_eq!(s.ui.screensaver_face_plugin, None, "parsing {text:?}");
         }
+
+        // A plugin face is kept verbatim for the opener to resolve: the
+        // installed components are not known at settings-parse time.
+        let mut s = Settings::default();
+        s.overlay("{\"ui\":{\"screensaverFace\":\"screensavers:starfield\"}}");
+        assert_eq!(
+            s.ui.screensaver_face_plugin.as_deref(),
+            Some("screensavers:starfield")
+        );
+        // And selecting a built-in again clears it.
+        s.overlay("{\"ui\":{\"screensaverFace\":\"matrix\"}}");
+        assert_eq!(s.ui.screensaver_face_plugin, None);
 
         // An unusable value leaves the default in place rather than breaking
         // the rest of the file, like every other key here.
@@ -1384,5 +1541,87 @@ mod tests {
         let mut s2 = Settings::default();
         s2.overlay(r#"{"engine":{"thinkingToolCalls":"nope"}}"#);
         assert!(!s2.engine.thinking_tool_calls);
+    }
+
+    #[test]
+    fn load_from_paths_lets_high_win_over_low() {
+        // This covers the primitive only: later slice wins. It does not by
+        // itself prove real-world plugin/user precedence — that guarantee
+        // lives in `load_with_plugins_in_never_lets_a_plugin_beat_the_user`.
+        let dir = std::env::temp_dir().join(format!("plank-settings-prim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let low = dir.join("low.json");
+        std::fs::write(&low, r#"{"kvcache":{"maxBytes":111}}"#).expect("write");
+
+        let s = Settings::load_from_paths(std::slice::from_ref(&low), &[]);
+        assert_eq!(s.kvcache.max_bytes, 111);
+
+        let high = dir.join("high.json");
+        std::fs::write(&high, r#"{"kvcache":{"maxBytes":222}}"#).expect("write");
+        let s = Settings::load_from_paths(&[low], &[high]);
+        assert_eq!(s.kvcache.max_bytes, 222);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_with_plugins_in_never_lets_a_plugin_beat_the_user() {
+        // Exercises the composed loader `load_with_plugins_in`, not the raw
+        // `load_from_paths` primitive. A real user settings file lives under
+        // `home/.plank/settings.json`; a plugin settings file sets the same
+        // key to a different value. If the two arguments to `load_from_paths`
+        // inside `load_with_plugins_in` were ever swapped (i.e. it called
+        // `load_from_paths(&Self::paths_in(...), plugin_paths)` instead of
+        // `load_from_paths(plugin_paths, &Self::paths_in(...))`), the plugin
+        // path would land in the `high` slot and this assertion would flip to
+        // seeing the plugin's value (111) instead of the user's (222) — so
+        // this test fails under that swap.
+        let dir = std::env::temp_dir().join(format!("plank-settings-comp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(home.join(".plank")).expect("mkdir home");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+
+        let user = home.join(".plank").join("settings.json");
+        std::fs::write(&user, r#"{"kvcache":{"maxBytes":222}}"#).expect("write user");
+
+        let plugin = dir.join("plugin-settings.json");
+        std::fs::write(&plugin, r#"{"kvcache":{"maxBytes":111}}"#).expect("write plugin");
+
+        let s = Settings::load_with_plugins_in(Some(&home), &cwd, &[plugin]);
+        assert_eq!(
+            s.kvcache.max_bytes, 222,
+            "the user's ~/.plank/settings.json must win over a plugin's setting"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_with_plugins_in_lets_the_later_plugin_win() {
+        // "plugin settings, in plugin load order, later winning" — two
+        // plugin-contributed files disagreeing on the same key, no user file
+        // in play at all.
+        let dir = std::env::temp_dir().join(format!("plank-settings-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+
+        let plugin_a = dir.join("plugin-a-settings.json");
+        std::fs::write(&plugin_a, r#"{"kvcache":{"maxBytes":111}}"#).expect("write a");
+        let plugin_b = dir.join("plugin-b-settings.json");
+        std::fs::write(&plugin_b, r#"{"kvcache":{"maxBytes":333}}"#).expect("write b");
+
+        let s = Settings::load_with_plugins_in(Some(&home), &cwd, &[plugin_a, plugin_b]);
+        assert_eq!(
+            s.kvcache.max_bytes, 333,
+            "the later plugin in load order must win over an earlier one"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

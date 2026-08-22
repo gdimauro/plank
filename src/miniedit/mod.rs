@@ -37,7 +37,37 @@ pub fn init() -> io::Result<()> {
 pub mod draw;
 pub mod state;
 
-pub use state::{Outcome, Search, State};
+pub use state::{Mode, Outcome, Search, State};
+
+/// Applies the one normalization file mode performs on the text it is seeded
+/// with: appending a trailing newline when the text lacks one.
+///
+/// File mode sets `insert_final_newline(true)`, but `write_raw` (the raw
+/// insert path `State::build` uses for a file, to avoid `write_canon`'s
+/// per-line indentation re-derivation) does not apply that setting itself —
+/// so `State::build` pre-computes the seed here before handing it to
+/// `write_raw`. Whether the *result* looks like an edit is no longer decided
+/// by comparing against this seed anywhere: `State::is_modified` reads the
+/// buffer's own post-write text back into `original` at construction, so it
+/// already reflects this and every other normalization the buffer applies.
+///
+/// An empty file must not gain a newline: there is no line to terminate.
+#[must_use]
+pub(crate) fn file_seed_text(initial: &str) -> String {
+    if initial.is_empty() || initial.ends_with('\n') {
+        initial.to_string()
+    } else {
+        // Match the newline convention `State::build` sets via `set_crlf`:
+        // a CRLF file gets a CRLF appended, not a bare LF that would make
+        // an untouched accept look edited.
+        let newline = if initial.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        format!("{initial}{newline}")
+    }
+}
 
 use edit::input;
 use edit::sys;
@@ -58,6 +88,28 @@ use stdext::arena::scratch_arena;
 /// Returns an error when the scratch arena or the text buffer cannot be
 /// allocated, or when the terminal cannot be switched to raw mode.
 pub fn edit_text(initial: &str) -> io::Result<Option<String>> {
+    run(initial, Mode::Prompt, None)
+}
+
+/// Opens the built-in editor on a file's contents.
+///
+/// `title` is the display path shown in the status bar; `initial` is the file's
+/// text. Returns the edited text on accept and `None` on cancel — this function
+/// does no file I/O of its own, so miniedit stays a string-in/string-out
+/// editor and `crate::openfile` owns reading and writing.
+///
+/// The same terminal-ownership and thread rules as [`edit_text`] apply.
+///
+/// # Errors
+/// Returns an error when the scratch arena or the text buffer cannot be
+/// allocated, or when the terminal cannot be switched to raw mode.
+pub fn edit_file(title: &str, initial: &str) -> io::Result<Option<String>> {
+    run(initial, Mode::File, Some(title))
+}
+
+/// The editor session: takes the terminal, pumps input until the user accepts
+/// or cancels, and puts the terminal back.
+fn run(initial: &str, mode: Mode, title: Option<&str>) -> io::Result<Option<String>> {
     debug_log("--- session start");
     init()?;
 
@@ -74,7 +126,10 @@ pub fn edit_text(initial: &str) -> io::Result<Option<String>> {
     let mut tui = Tui::new()?;
     sys::inject_window_size_into_stdin();
 
-    let mut state = State::new(initial, tui.size().width)?;
+    let mut state = match (mode, title) {
+        (Mode::File, Some(title)) => State::new_for_file(initial, tui.size().width, title)?,
+        _ => State::new(initial, tui.size().width)?,
+    };
 
     loop {
         {
@@ -93,10 +148,10 @@ pub fn edit_text(initial: &str) -> io::Result<Option<String>> {
             let mut input_iter = input_parser.parse(vt_iter);
             while {
                 let input = input_iter.next();
-                let more = input.is_some();
+                let has_more_input = input.is_some();
                 let mut ctx = tui.create_context(input);
                 draw::draw(&mut ctx, &mut state);
-                more
+                has_more_input
             } {}
         }
 
@@ -110,7 +165,7 @@ pub fn edit_text(initial: &str) -> io::Result<Option<String>> {
         match state.outcome {
             Outcome::Accept => {
                 debug_log("session end: accept");
-                return Ok(Some(state.text()));
+                return Ok(state.accepted_text());
             }
             Outcome::Cancel => {
                 debug_log("session end: cancel");
@@ -171,6 +226,26 @@ impl Drop for RestoreModes {
 mod tests {
     use super::*;
     use edit::buffer::TextBuffer;
+
+    #[test]
+    fn file_seed_text_appends_a_missing_trailing_newline() {
+        assert_eq!(file_seed_text("hello"), "hello\n");
+    }
+
+    #[test]
+    fn file_seed_text_leaves_an_already_newline_terminated_file_alone() {
+        assert_eq!(file_seed_text("hello\n"), "hello\n");
+    }
+
+    #[test]
+    fn file_seed_text_does_not_invent_a_newline_for_an_empty_file() {
+        assert_eq!(file_seed_text(""), "");
+    }
+
+    #[test]
+    fn file_seed_text_matches_the_crlf_convention() {
+        assert_eq!(file_seed_text("a\r\nb"), "a\r\nb\r\n");
+    }
 
     /// The dependency is wired up and usable headlessly: text in, text out,
     /// through the same round-trip the editor session will use.

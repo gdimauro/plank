@@ -7,7 +7,7 @@
 //! and "Session Listing, History Rendering, And Completion". The C agent
 //! persists engine KV state plus a rendered token transcript in one file;
 //! plank persists the text transcript as the session file and keeps the
-//! engine KV state in a fingerprinted `<name>.payload` sidecar (a
+//! engine KV state in a fingerprinted `<name>.kv_raw` sidecar (a
 //! [`crate::kvcache::KVCache`] keyed by [`KvKey::Session`]), while keeping the
 //! same user-visible behavior: sessions
 //! live under `~/.plank/kvcache` as `<name>.kv` files. A session id is a
@@ -85,16 +85,29 @@ const HISTORY_TOOL_MAX_BYTES: usize = 3000;
 
 const MAGIC: &str = "plank-session 1";
 const FILE_EXT: &str = ".kv";
-/// Extension of the engine KV payload sidecar written next to a transcript.
+/// Extension of the engine KV payload written beside a transcript.
 ///
 /// The C agent stores the engine payload inside the same `.kv` file as the
 /// rendered text; plank's v1 transcript format predates payloads and must
-/// keep loading, so the payload lives in a sidecar (`<sha>.payload`) instead.
-/// The sidecar is a rebuildable cache: its signature is a fingerprint tying
-/// it to the exact model, system prompt, and rendered transcript, and a
-/// mismatch means the payload is ignored and rebuilt by prefill — never
-/// trusted (see [`payload_fingerprint`] and [`SessionStore::kv_load`]).
-const PAYLOAD_EXT: &str = ".payload";
+/// keep loading, so the payload lives in a sidecar instead. The sidecar is a
+/// rebuildable cache: its signature is a fingerprint tying it to the exact
+/// model, system prompt, and rendered transcript, and a mismatch means the
+/// payload is ignored and rebuilt by prefill — never trusted (see
+/// [`payload_fingerprint`] and [`SessionStore::kv_load`]).
+///
+/// It shares one extension with the Tier 1 and Tier 2 checkpoints, distinct
+/// from the transcripts' [`FILE_EXT`]: every KV body in the cache is a
+/// `.kv_raw`, so one scan finds them all and no glob confuses a checkpoint for
+/// a transcript.
+const PAYLOAD_EXT: &str = crate::kvmeta::BLOB_EXT;
+
+/// Extension the engine KV payload used before the `.kv_raw` unification.
+/// Referenced only by [`SessionStore::migrate_legacy_blobs`].
+const LEGACY_PAYLOAD_EXT: &str = ".payload";
+
+/// Marker recording that [`SessionStore::migrate_legacy_blobs`] has run. Its
+/// presence, not its contents, is the signal.
+const MIGRATION_MARKER: &str = ".kvformat-2";
 
 /// Error raised by session store operations.
 ///
@@ -212,6 +225,14 @@ impl Message {
         t.starts_with("<tool_result>") || t.starts_with("Tool:") || t.starts_with("Tool result")
     }
 
+    /// True for the session-start context blocks plank injects itself (agent
+    /// instructions, persistent memory, the sub-agent roster, git status, the
+    /// date). They are user turns as far as the model is concerned, but nobody
+    /// typed them, so replaying a session must not show them back.
+    pub(crate) fn is_session_context(&self) -> bool {
+        self.role == Role::User && crate::context::is_session_context(&self.text)
+    }
+
     /// Strips a `<tool_result>` wrapper, returning the inner payload.
     pub(crate) fn tool_result_payload(&self) -> &str {
         let t = self.text.trim();
@@ -229,8 +250,10 @@ impl Message {
 /// resaving keeps the same file name while the transcript evolves.
 #[derive(Debug, Clone)]
 pub struct Session {
-    /// Memorable `adjective-celebrity` id (or a legacy 40-hex id); empty
-    /// until the first save.
+    /// Memorable `adjective-celebrity` id (or a legacy 40-hex id). Minted when
+    /// the session starts (see [`SessionStore::mint_id`]) so the name can be
+    /// shown while the conversation is still in flight; empty only for a
+    /// session built without a store.
     pub id: String,
     /// Title derived from the first user prompt (or set explicitly).
     pub title: String,
@@ -273,6 +296,15 @@ impl Session {
             tasks: crate::tasks::TaskList::new(),
             dirty: false,
         }
+    }
+
+    /// True once the session exists on disk — either saved at least once or
+    /// loaded from a file. `created_at` is the marker: [`SessionStore::save`]
+    /// stamps it and a load carries it in, while the id alone says nothing
+    /// (it is minted at session start, before anything is written).
+    #[must_use]
+    pub fn is_persisted(&self) -> bool {
+        self.created_at != 0
     }
 
     /// Appends a message and marks the session dirty.
@@ -359,11 +391,11 @@ pub struct SessionEntry {
 /// not share a file, and GC sweeps per project directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvKey {
-    /// Tier 1: model + system prompt. `sysprompt-<fp>.kv`, shared across projects.
+    /// Tier 1: model + system prompt. `sysprompt-<fp>.kv_raw`, shared across projects.
     System { fp: String },
-    /// Tier 2: project-stable context. `<project-key>/project-<fp>.kv`.
+    /// Tier 2: project-stable context. `<project-key>/project-<fp>.kv_raw`.
     Project { dir: PathBuf, fp: String },
-    /// A saved conversation's KV payload. `<id>.payload`.
+    /// A saved conversation's KV payload. `<id>.kv_raw`.
     ///
     /// Path and signature differ here: the file is named after the session id
     /// (stable across resaves), but it is only trusted when its stored
@@ -418,7 +450,10 @@ impl SessionStore {
         &self.dir
     }
 
-    fn path_for_id(&self, id: &str) -> PathBuf {
+    /// Path a session with this id is (or would be) written to. Callers use it
+    /// to ask whether a name is taken — `/rename` before it reassigns one.
+    #[must_use]
+    pub fn path_for_id(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}{FILE_EXT}"))
     }
 
@@ -434,100 +469,251 @@ impl SessionStore {
         fs::metadata(self.payload_path(id)).map_or(0, |m| m.len())
     }
 
+    /// Every KV blob in the cache, with its metadata.
+    ///
+    /// Scans the cache root and one level of per-project subdirectories for
+    /// `*.kv_raw` bodies. A body with no readable sidecar yields
+    /// [`crate::kvmeta::KvMeta::synthesized`] from its size and mtime, so an
+    /// externally dropped or partially migrated file still shows in `/kvcache`
+    /// and can still be deleted from there.
+    #[must_use]
+    pub fn kv_nodes(&self) -> Vec<crate::kvmeta::KvMeta> {
+        self.kv_blob_nodes()
+            .into_iter()
+            .map(|(_, meta)| meta)
+            .collect()
+    }
+
+    /// Every KV blob body in the cache paired with its metadata, in one walk.
+    ///
+    /// The single scan every caller shares, so index *i* of the returned vector
+    /// always names path *i*. That pairing is the only sound way to identify a
+    /// blob: a fingerprint does not identify a file. Two bodies may carry the
+    /// same fingerprint (a root `sysprompt-X.kv_raw` beside a
+    /// `<proj>/project-X.kv_raw`), and a [`KvKey::Session`] sidecar records the
+    /// *payload* fingerprint, which never equals the `<id>` in its file name.
+    /// Round-tripping a node through its fingerprint to find its path therefore
+    /// either fails or, worse, finds a different body.
+    #[must_use]
+    pub fn kv_blob_nodes(&self) -> Vec<(PathBuf, crate::kvmeta::KvMeta)> {
+        self.kv_blob_paths()
+            .into_iter()
+            .map(|(path, fp)| {
+                let meta = Self::kv_node_at(&path, &fp);
+                (path, meta)
+            })
+            .collect()
+    }
+
+    /// The node for one blob body: its sidecar when readable, else one
+    /// synthesized from the file name, size and mtime.
+    fn kv_node_at(path: &Path, fp: &str) -> crate::kvmeta::KvMeta {
+        crate::kvmeta::load(path).unwrap_or_else(|| {
+            let md = fs::metadata(path).ok();
+            let bytes = md.as_ref().map_or(0, std::fs::Metadata::len);
+            let mtime = md
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            let name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default();
+            let role = if name.starts_with(SYSPROMPT_PREFIX) {
+                crate::kvmeta::KvRole::System
+            } else if name.starts_with(&format!("{PROJECT_STEM}-")) {
+                crate::kvmeta::KvRole::Project
+            } else {
+                crate::kvmeta::KvRole::Session
+            };
+            crate::kvmeta::KvMeta::synthesized(role, fp, bytes, mtime)
+        })
+    }
+
+    /// Every KV blob body in the cache, as `(path, fingerprint)`.
+    ///
+    /// The scan behind [`kv_nodes`](Self::kv_nodes), kept separate because a
+    /// sweep needs the path it must unlink alongside the fingerprint the plan
+    /// names. Covers the cache root and one level of per-project
+    /// subdirectories — never deeper.
+    ///
+    /// **Sorted by path.** `read_dir` yields filesystem-hash order, which made
+    /// `/kvcache`'s row order and the phase-2 budget tie-break reproducible only
+    /// by accident; sorting makes both deterministic. Callers still must not
+    /// treat an index as a durable handle across two scans — a concurrent unlink
+    /// shifts every later position, which is why a mutation carries the expected
+    /// fingerprint and re-checks it.
+    #[must_use]
+    pub fn kv_blob_paths(&self) -> Vec<(PathBuf, String)> {
+        fn scan(dir: &Path, out: &mut Vec<(PathBuf, String)>, recurse: bool) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    if recurse {
+                        scan(&path, out, false);
+                    }
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(stem) = name.strip_suffix(PAYLOAD_EXT) else {
+                    continue;
+                };
+                let fp = stem
+                    .strip_prefix(SYSPROMPT_PREFIX)
+                    .or_else(|| stem.strip_prefix(&format!("{PROJECT_STEM}-")))
+                    .unwrap_or(stem);
+                out.push((path, fp.to_owned()));
+            }
+        }
+        let mut out = Vec::new();
+        scan(&self.dir, &mut out, true);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Project-scope subdirectory for Tier 2+ checkpoints: `<dir>/<project-key>/`
-    /// (issue #60). Callers create it lazily before writing a `project.kv`.
+    /// (issue #60). Callers create it lazily before writing a project checkpoint.
     #[must_use]
     pub fn project_dir(&self, project: &Path) -> PathBuf {
         self.dir.join(project_key(project))
     }
 
     /// Path of the Tier 2 project-stable KV checkpoint for `project` at the
-    /// chained fingerprint `fp2`: `<dir>/<project-key>/project-<fp2>.kv`. Shared
+    /// chained fingerprint `fp2`: `<dir>/<project-key>/project-<fp2>.kv_raw`. Shared
     /// by all sessions of the project and read by every new session (issue #60).
     #[must_use]
     pub fn project_checkpoint_path(&self, project: &Path, fp2: &str) -> PathBuf {
         self.project_dir(project).join(project_checkpoint_name(fp2))
     }
 
-    /// Deletes every Tier 2 checkpoint of `project` except the one keyed `keep`,
-    /// returning how many files were removed (issue #64).
+    /// Deletes every blob [`crate::kvgc::plan_sweep`] condemns, returning the
+    /// bytes reclaimed.
     ///
-    /// A `project-<fp2>.kv` is only ever readable at one `AGENTS.md`/local-MCP
-    /// revision, so the moment a new `fp2` is written the old ones are dead
-    /// weight — and these snapshots are large. GC is by fingerprint, not by
-    /// mtime: the file is shared by every session of the project, so it must
-    /// survive session deletion, and the current revision is the only one any
-    /// future launch can hit. Best-effort; a failed unlink is ignored (the next
-    /// launch retries).
+    /// Best-effort: a failed unlink is skipped and its bytes are not counted,
+    /// and the next launch retries. Both the body and its sidecar go.
+    ///
+    /// Each verdict is re-checked against the disk immediately before the
+    /// unlink, so a body a sibling process rewrote while this sweep was
+    /// planning is left alone rather than deleted under a sidecar that has
+    /// since been replaced.
+    ///
+    /// `active` is the set of fingerprints this launch is using, across *every*
+    /// engine it holds: a provider main agent beside a `provider: local`
+    /// sub-agent has two Tier 1 fingerprints, and passing only one of them is
+    /// what used to delete the other's checkpoint on every launch.
     #[must_use]
-    pub fn gc_project_checkpoints(&self, project: &Path, keep: &str) -> usize {
-        let dir = self.project_dir(project);
-        let keep_name = project_checkpoint_name(keep);
-        let Ok(entries) = fs::read_dir(&dir) else {
-            return 0;
-        };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name.starts_with(PROJECT_STEM) || !name.ends_with(FILE_EXT) || name == keep_name {
+    pub fn sweep(&self, active: &[&str], policy: &crate::kvgc::SweepPolicy, now: u64) -> u64 {
+        let mut freed = self.sweep_orphan_temps(now);
+        // One paired walk: node `i` is the metadata of path `i`, so a verdict
+        // names exactly one file. Matching on fingerprints instead would delete
+        // a kept body that merely shares a doomed one's fingerprint — a root
+        // `sysprompt-X` and a `<proj>/project-X`, say.
+        let scan = self.kv_blob_nodes();
+        let nodes: Vec<crate::kvmeta::KvMeta> = scan.iter().map(|(_, m)| m.clone()).collect();
+        let plan = crate::kvgc::plan_sweep(&nodes, active, policy, now);
+        for i in plan.doomed {
+            let Some((path, seen)) = scan.get(i) else {
+                continue;
+            };
+            // A sibling process persisting a multi-hundred-megabyte body spans
+            // the whole window between the scan above and this unlink, so the
+            // file under an expired sidecar may already have been replaced by a
+            // fresh one. Re-read the node and skip anything that moved: the
+            // verdict was computed about bytes that are no longer there. The
+            // fingerprint is part of that identity check too — a replacement
+            // blob at the same path with an identical size, `last_used` and
+            // `pinned` flag but a different fingerprint is a different body,
+            // not the one the verdict was about.
+            let fp = seen.fingerprint.as_str();
+            let fresh = Self::kv_node_at(path, fp);
+            if fresh.last_used != seen.last_used
+                || fresh.bytes != seen.bytes
+                || fresh.pinned != seen.pinned
+                || fresh.fingerprint != seen.fingerprint
+            {
                 continue;
             }
-            if fs::remove_file(entry.path()).is_ok() {
-                removed += 1;
+            let size = fs::metadata(path).map_or(0, |m| m.len());
+            if fs::remove_file(path).is_ok() {
+                freed = freed.saturating_add(size);
+                // The sidecar must go with the body, or the next scan reports a
+                // phantom node.
+                let _ = fs::remove_file(crate::kvmeta::sidecar_path(path));
             }
         }
-        removed
+        freed
     }
 
-    /// Deletes every Tier 1 system-prompt checkpoint except the one keyed
-    /// `keep_fp`, returning how many files were removed (issue #64).
+    /// Deletes `*.tmp.<pid>` staging files no live write can still be using,
+    /// returning the bytes reclaimed.
     ///
-    /// A `sysprompt-<fp1>.kv` is only ever readable at one (model, system
-    /// prompt) revision, so a plank upgrade, a global MCP server added or
-    /// removed, or a model switch orphans the previous one permanently — and
-    /// these snapshots run to hundreds of megabytes. GC is by fingerprint, not
-    /// by mtime: the current revision is the only one any future launch can
-    /// hit. The legacy bare `sysprompt.kv` (overwritten in place before the
-    /// checkpoint became content-keyed) goes too — nothing writes that name
-    /// any more, so it can never be read again. Best-effort; a failed unlink
-    /// is ignored (the next launch retries).
+    /// Every durable write in the cache stages into `<final>.tmp.<pid>` and
+    /// renames. A crash (or a kill) between the two leaves the staging file
+    /// behind, and nothing ever came back for it: the scans all filter these
+    /// names out — deliberately, since a temp file is not a blob — so they were
+    /// invisible to the sweep while still costing the disk a full session
+    /// payload each, which runs to hundreds of megabytes.
     ///
-    /// `keep` is a *set* because a session can hold more than one engine, and
-    /// each has its own Tier 1 fingerprint — a provider main agent beside a
-    /// `provider: local` sub-agent has two. Passing only the main engine's
-    /// deletes the other's checkpoint on every launch, and under a provider it
-    /// deletes every checkpoint in the directory: the provider's own
-    /// fingerprint never has a file, so nothing at all matches `keep`.
-    #[must_use]
-    pub fn gc_system_checkpoints(&self, keep: &[&str]) -> usize {
-        let keep_names: Vec<String> = keep
-            .iter()
-            .map(|fp| sysprompt_checkpoint_name(fp))
-            .collect();
-        let legacy_name = format!("{SYSPROMPT_STEM}{FILE_EXT}");
-        let Ok(entries) = fs::read_dir(&self.dir) else {
-            return 0;
-        };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            // `sysprompt-*.kv` only: the same directory holds `<id>.payload`
-            // sidecars, `<id>.kv` session files, per-project subdirectories,
-            // and `<name>.kv.tmp.<pid>` writes still in flight.
-            let collect = name == legacy_name
-                || (name.starts_with(SYSPROMPT_PREFIX)
-                    && name.ends_with(FILE_EXT)
-                    && !keep_names.iter().any(|k| k == name));
-            if !collect || !entry.file_type().is_ok_and(|t| t.is_file()) {
-                continue;
-            }
-            if fs::remove_file(entry.path()).is_ok() {
-                removed += 1;
+    /// Two guards keep this from eating a *live* write. The current process's
+    /// own staging files are never touched, and neither is anything younger
+    /// than [`TEMP_ORPHAN_TTL`] — a sibling plank persisting a large blob holds
+    /// its temp file open for seconds, and a pid is not enough to tell that
+    /// sibling from a dead process whose pid has since been recycled. Age is
+    /// the honest signal; a slow write simply survives to the next launch.
+    fn sweep_orphan_temps(&self, now: u64) -> u64 {
+        fn scan(dir: &Path, out: &mut Vec<PathBuf>, recurse: bool) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    if recurse {
+                        scan(&path, out, false);
+                    }
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                // `<something>.tmp.<digits>`, and only that shape: a user file
+                // that merely contains ".tmp." is not ours to delete.
+                let Some((_, pid)) = name.rsplit_once(".tmp.") else {
+                    continue;
+                };
+                let Ok(pid) = pid.parse::<u32>() else {
+                    continue;
+                };
+                if pid == std::process::id() {
+                    continue;
+                }
+                out.push(path);
             }
         }
-        removed
+        let mut temps = Vec::new();
+        scan(&self.dir, &mut temps, true);
+        let mut freed = 0u64;
+        for path in temps {
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let age = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| now.saturating_sub(d.as_secs()));
+            if age < TEMP_ORPHAN_TTL {
+                continue;
+            }
+            let size = meta.len();
+            if fs::remove_file(&path).is_ok() {
+                freed = freed.saturating_add(size);
+            }
+        }
+        freed
     }
 
     /// The system-prompt text the last Tier 1 checkpoint was built from, or
@@ -564,19 +750,165 @@ impl SessionStore {
 
     /// Loads the cache stored under `key`, or `None` on any miss — absent,
     /// stale, corrupt, or written by an older format version.
+    ///
+    /// A hit bumps the sidecar's `hits` and `last_used`, which is what the TTL
+    /// sweep and `/kvcache` read. That refresh is best-effort and strictly
+    /// downstream of the load decision: the signature inside the body is still
+    /// the only thing that decides whether these bytes may be used.
     #[must_use]
     pub fn kv_load(&self, key: &KvKey) -> Option<crate::kvcache::KVCache> {
-        crate::kvcache::KVCache::from_file(&self.kv_path(key), key.signature())
+        let path = self.kv_path(key);
+        let cache = crate::kvcache::KVCache::from_file(&path, key.signature())?;
+        if let Some(mut meta) = crate::kvmeta::load(&path) {
+            meta.hits = meta.hits.saturating_add(1);
+            meta.last_used = crate::kvmeta::now_secs();
+            let _ = crate::kvmeta::store(&path, &meta);
+        }
+        Some(cache)
     }
 
-    /// Persists `cache` under `key`, creating parent directories as needed.
+    /// Persists `cache` under `key` with no lineage or label recorded.
+    ///
+    /// Prefer [`kv_store_labeled`](Self::kv_store_labeled): a blob stored this
+    /// way shows in `/kvcache` as an unattributed root. This form exists for
+    /// callers that genuinely have nothing to say about the blob.
     ///
     /// # Errors
     /// Returns the underlying [`io::Error`] when the write fails. Callers treat
     /// a failure as best-effort: the live session is correct either way and
     /// only the next launch pays.
     pub fn kv_store(&self, key: &KvKey, cache: &crate::kvcache::KVCache) -> io::Result<()> {
-        cache.persist(&self.kv_path(key), key.signature())
+        self.kv_store_labeled(key, cache, None, "", &crate::kvmeta::KvLabel::Unknown)
+    }
+
+    /// Persists `cache` under `key` and records its lineage and display label.
+    ///
+    /// `parent` is the fingerprint of the blob this one extends — `None` only
+    /// for a Tier 1 system checkpoint. An existing sidecar's `created` and
+    /// `pinned` survive a rewrite: re-persisting the same fingerprint is a
+    /// refresh, not a new blob, and silently unpinning one would be a nasty
+    /// surprise.
+    ///
+    /// # Errors
+    /// Returns the underlying [`io::Error`] when the body write fails. A failed
+    /// *sidecar* write is swallowed: metadata is advisory and must never turn a
+    /// good store into an error.
+    pub fn kv_store_labeled(
+        &self,
+        key: &KvKey,
+        cache: &crate::kvcache::KVCache,
+        parent: Option<&str>,
+        model: &str,
+        label: &crate::kvmeta::KvLabel,
+    ) -> io::Result<()> {
+        let path = self.kv_path(key);
+        cache.persist(&path, key.signature())?;
+        let now = crate::kvmeta::now_secs();
+        let prior = crate::kvmeta::load(&path);
+        let meta = crate::kvmeta::KvMeta {
+            version: crate::kvmeta::META_VERSION,
+            role: kv_role(key),
+            fingerprint: key.signature().to_owned(),
+            parent: parent.map(ToOwned::to_owned),
+            model: model.to_owned(),
+            created: prior.as_ref().map_or(now, |p| p.created),
+            last_used: now,
+            hits: prior.as_ref().map_or(0, |p| p.hits),
+            bytes: fs::metadata(&path).map_or(0, |m| m.len()),
+            pinned: prior.as_ref().is_some_and(|p| p.pinned),
+            label: label.clone(),
+        };
+        let _ = crate::kvmeta::store(&path, &meta);
+        Ok(())
+    }
+
+    /// Deletes every pre-`.kv_raw` KV body once, returning the bytes reclaimed.
+    ///
+    /// Returns `None` when the marker file shows migration already ran, so the
+    /// caller knows to stay silent. The old format carried no lineage and no
+    /// usage history, and synthesizing either would produce a `/kvcache` tree
+    /// that looks authoritative while being invented — so the blobs go and the
+    /// tiers rebuild on demand.
+    ///
+    /// **Transcripts are never touched.** Only `<id>.payload`,
+    /// `sysprompt-*.kv`, the legacy bare `sysprompt.kv`, `<proj>/project-*.kv`,
+    /// and the diagnostic prompt note are removed; every `<id>.kv` survives, so
+    /// resuming a session works and pays a single re-prefill.
+    ///
+    /// Best-effort throughout: an unlink that fails is skipped and its bytes
+    /// are not counted, and the marker is still written — a second sweep would
+    /// find the same undeletable file.
+    ///
+    /// The returned tally means "cache bytes reclaimed": the diagnostic
+    /// prompt note is deleted too, but its bytes are deliberately excluded
+    /// from the count.
+    #[must_use]
+    pub fn migrate_legacy_blobs(&self) -> Option<u64> {
+        let marker = self.dir.join(MIGRATION_MARKER);
+        if marker.exists() {
+            return None;
+        }
+        let mut reclaimed = 0u64;
+        let legacy_sysprompt = format!("{SYSPROMPT_STEM}{FILE_EXT}");
+        let mut sweep = |dir: &Path, stems: &[&str]| {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                if name == SYSPROMPT_NOTE_NAME {
+                    // Deleted but deliberately not counted: it's a tiny
+                    // diagnostic sidecar, not cache, and the tally means
+                    // cache bytes reclaimed.
+                    let _ = fs::remove_file(entry.path());
+                    continue;
+                }
+                let doomed = name == legacy_sysprompt
+                    || name.ends_with(LEGACY_PAYLOAD_EXT)
+                    || (name.ends_with(FILE_EXT) && stems.iter().any(|s| name.starts_with(s)));
+                if !doomed {
+                    continue;
+                }
+                let size = entry.metadata().map_or(0, |m| m.len());
+                if fs::remove_file(entry.path()).is_ok() {
+                    reclaimed = reclaimed.saturating_add(size);
+                }
+            }
+        };
+        sweep(&self.dir, &[SYSPROMPT_PREFIX]);
+        // Project checkpoints live one level down, one directory per project.
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    sweep(&entry.path(), &[PROJECT_STEM]);
+                }
+            }
+        }
+        let _ = fs::write(&marker, b"2\n");
+        Some(reclaimed)
+    }
+
+    /// Runs [`Self::migrate_legacy_blobs`] only when `dir` already exists,
+    /// returning the bytes reclaimed (`Some(0)` or more) or `None`.
+    ///
+    /// `SessionStore::open` does a `create_dir_all`, which would create the
+    /// cache directory as a side effect on a brand-new install — and a
+    /// freshly created directory with no version marker is exactly what
+    /// `upgrade::classify` reads as a major version change, so a first-ever
+    /// launch would wrongly announce "cleared the image cache". Gating on
+    /// the directory already existing keeps a fresh install a true no-op:
+    /// nothing is created, nothing is opened, nothing is migrated.
+    #[must_use]
+    pub fn migrate_kvcache_if_present(dir: &Path) -> Option<u64> {
+        if !dir.is_dir() {
+            return None;
+        }
+        let store = Self::open(dir).ok()?;
+        store.migrate_legacy_blobs()
     }
 
     /// Strips the engine KV payload from the session matching the hex
@@ -594,8 +926,25 @@ impl SessionStore {
         let had_payload = payload.exists();
         if had_payload {
             fs::remove_file(&payload)?;
+            let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
         }
         Ok((id, had_payload))
+    }
+
+    /// Mints a fresh memorable `adjective-celebrity` session name (e.g.
+    /// `deadly-einstein`), unused by any file in the store. On the rare
+    /// collision a short guid is appended.
+    ///
+    /// Called when a session starts, so its name can be shown in the UI long
+    /// before the transcript is written.
+    #[must_use]
+    pub fn mint_id(&self) -> String {
+        let base = crate::names::session_slug();
+        let mut id = base.clone();
+        while self.path_for_id(&id).exists() {
+            id = format!("{base}-{}", crate::names::guid8());
+        }
+        id
     }
 
     /// Saves the session, assigning title, creation time, and id if missing.
@@ -621,16 +970,11 @@ impl SessionStore {
         if session.created_at == 0 {
             session.created_at = now;
         }
-        // First save: mint a memorable `adjective-celebrity` name (e.g.
-        // `deadly-einstein`). On the rare filename collision, append a short
-        // guid. Re-saving an already-named session keeps its name (overwrite).
+        // Normally the name was already minted at session start; a session
+        // built without a store still gets one here, on its first save.
+        // Re-saving an already-named session keeps its name (overwrite).
         if session.id.is_empty() {
-            let base = crate::names::session_slug();
-            let mut id = base.clone();
-            while self.path_for_id(&id).exists() {
-                id = format!("{base}-{}", crate::names::guid8());
-            }
-            session.id = id;
+            session.id = self.mint_id();
         }
         let id = session.id.clone();
 
@@ -713,6 +1057,50 @@ impl SessionStore {
         Ok(id)
     }
 
+    /// Re-derives every saved session's title from its transcript, rewriting
+    /// only the ones whose stored title is now wrong.
+    ///
+    /// A one-shot repair for sessions titled before
+    /// [`title_from_transcript`] learned to skip the injected session-start
+    /// context — those all read `Agent instructions: …`, which names the
+    /// project rather than the conversation.
+    ///
+    /// The title record is spliced in place rather than going through
+    /// [`SessionStore::save`], which would stamp `used` with the current time
+    /// and flatten every session's age to "just now" — the very field the
+    /// picker sorts on.
+    ///
+    /// Returns each rewritten session as `(id, new title)`. Unreadable files
+    /// are skipped, not reported: a repair pass is no place to start failing
+    /// over a session that was already unloadable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be read.
+    pub fn retitle_all(&self) -> Result<Vec<(String, String)>> {
+        let mut changed = Vec::new();
+        for (id, path) in self.session_files()? {
+            let Ok(session) = read_session_file(&path) else {
+                continue;
+            };
+            let title = title_from_transcript(&session.transcript, 0);
+            let Ok(body) = fs::read(&path) else { continue };
+            let Some(spliced) = replace_title_record(&body, &title) else {
+                continue;
+            };
+            let tmp = self
+                .dir
+                .join(format!("{id}{FILE_EXT}.tmp.{}", std::process::id()));
+            fs::write(&tmp, &spliced)?;
+            if let Err(e) = fs::rename(&tmp, &path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            changed.push((id, title));
+        }
+        Ok(changed)
+    }
+
     /// Loads the session whose id matches the given hex prefix.
     ///
     /// # Errors
@@ -738,8 +1126,87 @@ impl SessionStore {
         let (id, path) = self.find(prefix.as_ref())?;
         fs::remove_file(&path)?;
         // The payload sidecar is a cache keyed to the transcript; it goes too.
-        let _ = fs::remove_file(self.payload_path(&id));
+        let payload = self.payload_path(&id);
+        let _ = fs::remove_file(&payload);
+        let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
         Ok(id)
+    }
+
+    /// Deletes every saved session, transcript and KV payload alike, and
+    /// returns how many went.
+    ///
+    /// Behind the `/resume` picker's two-press `Ctrl+W`. Deliberately not
+    /// touching anything else under the cache root: the shared system-prompt
+    /// and project checkpoints are not sessions, and rebuilding them would
+    /// cost a full prefill on the next launch for no reason.
+    ///
+    /// A session that will not delete stops the pass rather than being
+    /// skipped, so the count returned is never a lie about what is left.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be read, or if any
+    /// session file cannot be removed.
+    pub fn delete_all(&self) -> Result<usize> {
+        let mut gone = 0;
+        for (id, path) in self.session_files()? {
+            fs::remove_file(&path)?;
+            let payload = self.payload_path(&id);
+            let _ = fs::remove_file(&payload);
+            let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
+            gone += 1;
+        }
+        Ok(gone)
+    }
+
+    /// Renames a saved session, moving its transcript and KV payload sidecar.
+    ///
+    /// A session's identity *is* its filename ([`SessionStore::load`] takes
+    /// `id` from the stem), so this is a pure file move with no in-file
+    /// rewrite. The payload travels along: its embedded signature is over
+    /// model, system prompt and rendered transcript — never the id — so it
+    /// stays trustworthy under the new name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid, ambiguous or unmatched `prefix`, for a
+    /// `new_name` that [`validate_name`] rejects, for a name that already
+    /// names a different saved session (renaming would destroy it), or if the
+    /// move fails.
+    pub fn rename(&self, prefix: &str, new_name: &str) -> Result<String> {
+        // Ids are canonically lowercase: `session_files` lowercases every file
+        // stem when deriving an id, so `find`/`list`/`load` only ever report
+        // lowercase ids. Canonicalizing here means the same-name check, the
+        // destination path, and the returned value all agree with what the
+        // store will report on the very next lookup — otherwise a mixed-case
+        // `new_name` would hand the caller an id the store never produces
+        // again, and a case-only rename would false-collide with itself on
+        // case-insensitive filesystems (e.g. macOS APFS).
+        let name = validate_name(new_name)
+            .map_err(SessionError::new)?
+            .to_ascii_lowercase();
+        let (old, path) = self.find(prefix)?;
+        if name == old {
+            return Ok(old);
+        }
+        let dest = self.path_for_id(&name);
+        if dest.exists() {
+            return Err(SessionError::new(format!(
+                "a session named {name} is already saved"
+            )));
+        }
+        fs::rename(&path, &dest)?;
+        // Best-effort for the cache sidecars: a session with no saved payload is
+        // ordinary, and a payload left behind is only a wasted blob the GC
+        // sweeps, never a wrong answer — the signature check would reject it.
+        let old_payload = self.payload_path(&old);
+        let new_payload = self.payload_path(&name);
+        let _ = fs::rename(&old_payload, &new_payload);
+        let _ = fs::rename(
+            crate::kvmeta::sidecar_path(&old_payload),
+            crate::kvmeta::sidecar_path(&new_payload),
+        );
+        Ok(name)
     }
 
     /// Resolves a hex prefix to exactly one saved session id and path.
@@ -849,9 +1316,8 @@ impl SessionStore {
     }
 
     /// Enumerates `<name>.kv` session files: memorable `adjective-celebrity`
-    /// names, plus legacy `<40-hex>.kv` ids. The system prompt checkpoints
-    /// (`sysprompt-*.kv`, plus the legacy shared `sysprompt.kv`) and temp
-    /// files (`*.kv.tmp.*`, which don't end in `.kv`) are skipped.
+    /// names, plus legacy `<40-hex>.kv` ids. Temp files (`*.kv.tmp.*`, which
+    /// don't end in `.kv`) are skipped.
     fn session_files(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
@@ -861,6 +1327,10 @@ impl SessionStore {
             let Some(stem) = name.strip_suffix(FILE_EXT) else {
                 continue;
             };
+            // The `sysprompt` guard is belt-and-braces against a legacy file:
+            // no checkpoint ends in `.kv` any more (bodies are `.kv_raw`), and
+            // `migrate_legacy_blobs` unlinks the old ones on first launch, so
+            // this can only fire on a blob that survived the migration.
             if stem.starts_with(SYSPROMPT_STEM) || !is_valid_id_prefix(stem) {
                 continue;
             }
@@ -870,28 +1340,35 @@ impl SessionStore {
     }
 }
 
+/// How long a `*.tmp.<pid>` staging file must sit untouched before
+/// [`SessionStore::sweep`] treats it as crash debris rather than an in-flight
+/// write. An hour is far past the slowest real persist (a multi-hundred-megabyte
+/// KV blob) and far short of leaving the debris around for a second launch.
+const TEMP_ORPHAN_TTL: u64 = 3600;
+
 /// File-stem prefix of the system-prompt KV checkpoints, which share the
-/// cache dir with session files but are not sessions.
+/// cache dir with session files but are not sessions. Names the legacy bare
+/// `sysprompt.kv` that [`SessionStore::migrate_legacy_blobs`] removes.
 const SYSPROMPT_STEM: &str = "sysprompt";
 
 /// File-name prefix of a content-keyed system-prompt checkpoint,
-/// `sysprompt-<fp1>.kv`.
+/// `sysprompt-<fp1>.kv_raw`.
 const SYSPROMPT_PREFIX: &str = "sysprompt-";
 
 /// Sidecar holding the system-prompt text that the most recent Tier 1
 /// checkpoint was built from. Deliberately *not* keyed by `fp1` — a changed
 /// prompt yields a different key, so the point of this file is to be findable
 /// after the fingerprint has already moved. Its name ends in `.prompt`, not
-/// `.kv`, so [`SessionStore::gc_system_checkpoints`] leaves it alone.
+/// `.kv_raw`, so [`SessionStore::sweep`] never sees it as a blob.
 const SYSPROMPT_NOTE_NAME: &str = "sysprompt-last.prompt";
 
 /// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
-/// `project-<fp2>.kv`, living under the per-project subdirectory.
+/// `project-<fp2>.kv_raw`, living under the per-project subdirectory.
 const PROJECT_STEM: &str = "project";
 
 /// Project-scope subdirectory name under `kvcache/`: 12 hex of `sha1(project
 /// path)`. Tier 2+ checkpoints live under here so they are *project-scoped*,
-/// while Tier 1 (`sysprompt-*.kv`) stays model-global at the cache root and is
+/// while Tier 1 (`sysprompt-*.kv_raw`) stays model-global at the cache root and is
 /// shared across every project (issue #60).
 #[must_use]
 pub fn project_key(project_dir: &Path) -> String {
@@ -921,18 +1398,28 @@ pub fn tier_fingerprint(parent_fp: &str, material: &[u8]) -> String {
 }
 
 /// File name of a Tier 2 project-stable checkpoint keyed by its chained
-/// fingerprint `fp2`: `project-<fp2>.kv`. One file per (project, AGENTS.md
+/// fingerprint `fp2`: `project-<fp2>.kv_raw`. One file per (project, AGENTS.md
 /// revision); shared by every session of the project (issue #60).
 #[must_use]
 pub fn project_checkpoint_name(fp2: &str) -> String {
-    format!("{PROJECT_STEM}-{fp2}{FILE_EXT}")
+    format!("{PROJECT_STEM}-{fp2}{PAYLOAD_EXT}")
+}
+
+/// The metadata role a [`KvKey`] variant corresponds to.
+#[must_use]
+pub fn kv_role(key: &KvKey) -> crate::kvmeta::KvRole {
+    match key {
+        KvKey::System { .. } => crate::kvmeta::KvRole::System,
+        KvKey::Project { .. } => crate::kvmeta::KvRole::Project,
+        KvKey::Session { .. } => crate::kvmeta::KvRole::Session,
+    }
 }
 
 /// File name of the Tier 1 system-prompt checkpoint keyed by its fingerprint
-/// `fp1`: `sysprompt-<fp1>.kv`. Model-global, at the cache root.
+/// `fp1`: `sysprompt-<fp1>.kv_raw`. Model-global, at the cache root.
 #[must_use]
 pub fn sysprompt_checkpoint_name(fp1: &str) -> String {
-    format!("{SYSPROMPT_PREFIX}{fp1}{FILE_EXT}")
+    format!("{SYSPROMPT_PREFIX}{fp1}{PAYLOAD_EXT}")
 }
 
 /// Whether `s` is a valid session id (or lookup prefix): non-empty, at most 80
@@ -953,6 +1440,46 @@ pub fn display_id(id: &str) -> &str {
     } else {
         id
     }
+}
+
+/// Longest session name accepted from a user. Names are filenames (plus the
+/// `.kv`/`.kv_raw`/`.json` suffixes), and a name this long is already far past
+/// being readable in a listing.
+pub const NAME_MAX: usize = 64;
+
+/// Validates a user-supplied session name, returning it trimmed.
+///
+/// A name becomes a filename in the store, so it is held to what is safe there:
+/// ASCII letters, digits, `-`, `_` and `.`, not starting with a `.` (which would
+/// hide the file and could spell `..`), within [`NAME_MAX`] bytes. Everything
+/// else — path separators above all — is rejected rather than sanitized, so the
+/// name the user sees is exactly the name they typed.
+///
+/// # Errors
+///
+/// Returns a message suitable for showing the user.
+pub fn validate_name(name: &str) -> std::result::Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a session name cannot be empty".to_owned());
+    }
+    if name.len() > NAME_MAX {
+        return Err(format!(
+            "a session name cannot exceed {NAME_MAX} characters"
+        ));
+    }
+    if name.starts_with('.') {
+        return Err("a session name cannot start with '.'".to_owned());
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        return Err(format!(
+            "'{bad}' is not allowed in a session name (use letters, digits, '-', '_' or '.')"
+        ));
+    }
+    Ok(name)
 }
 
 /// Renders the session list the way the C agent prints `/sessions`.
@@ -1047,9 +1574,21 @@ pub fn format_age(when: u64, now: u64) -> String {
 /// Whitespace is collapsed, the result is clipped to `max_bytes` with a
 /// `...` suffix (0 means unlimited), and the placeholders
 /// "(no user prompt)" / "(empty user prompt)" match the C agent.
+///
+/// The session-start context blocks are stored as user turns but were typed by
+/// nobody, so they are skipped: titling every session after the injected
+/// agent-instructions block names the project, not the conversation, and made
+/// the `/resume` picker a wall of identical rows. Only when the transcript is
+/// nothing *but* scaffolding does the first block stand in, since a title of
+/// "(no user prompt)" would say even less.
 #[must_use]
 pub fn title_from_transcript(transcript: &[Message], max_bytes: usize) -> String {
-    let Some(first) = transcript.iter().find(|m| m.role == Role::User) else {
+    let mut users = transcript.iter().filter(|m| m.role == Role::User);
+    let Some(first) = users
+        .clone()
+        .find(|m| !crate::context::is_session_context(&m.text))
+        .or_else(|| users.next())
+    else {
         return "(no user prompt)".to_owned();
     };
     title_from_span(&first.text, max_bytes, "(empty user prompt)")
@@ -1160,16 +1699,19 @@ pub fn history_window(transcript: &[Message], user_turns: usize) -> Option<(usiz
     }
     let user_turns = user_turns.min(HISTORY_MAX_TURNS);
 
+    // Session-start context is not a turn anybody took, so it neither counts
+    // as a human turn nor anchors the window — otherwise a short session's
+    // whole replay is the git status and the agent instructions.
     let human_idx: Vec<usize> = transcript
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == Role::User && !m.is_tool_user())
+        .filter(|(_, m)| m.role == Role::User && !m.is_tool_user() && !m.is_session_context())
         .map(|(i, _)| i)
         .collect();
     let all_user_idx: Vec<usize> = transcript
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == Role::User)
+        .filter(|(_, m)| m.role == Role::User && !m.is_session_context())
         .map(|(i, _)| i)
         .collect();
 
@@ -1238,6 +1780,10 @@ pub fn render_history(transcript: &[Message], user_turns: usize, color: bool) ->
     }
 
     for m in &transcript[start..] {
+        // Never replayed: see `history_window`.
+        if m.is_session_context() {
+            continue;
+        }
         let text = m.text.trim();
         match m.role {
             Role::User if m.is_tool_user() => {
@@ -1393,6 +1939,53 @@ fn read_head_meta(path: &Path) -> Option<(u64, u64, String)> {
     let end = (offset + title_len).min(buf.len());
     let title = String::from_utf8_lossy(&buf[offset..end]).into_owned();
     Some((created, used, title))
+}
+
+/// Rewrites a session file's `title` record, leaving every other byte — the
+/// `created`/`used` stamps above it and the whole transcript below — alone.
+///
+/// Returns `None` when the header is not the four lines this format promises,
+/// or when the title is already the one asked for: the caller writes nothing in
+/// either case, so an unparseable file is left exactly as it was found.
+fn replace_title_record(body: &[u8], title: &str) -> Option<Vec<u8>> {
+    let mut lines = body.split(|&b| b == b'\n');
+    if lines.next().map(String::from_utf8_lossy).as_deref() != Some(MAGIC) {
+        return None;
+    }
+    lines.next()?; // created
+    lines.next()?; // used
+    let len: usize = String::from_utf8_lossy(lines.next()?)
+        .strip_prefix("title ")?
+        .trim()
+        .parse()
+        .ok()?;
+    // The four header lines, newlines included, are the offset of the title
+    // body; the record ends `len` bytes later, before its own newline.
+    let start: usize = body
+        .split_inclusive(|&b| b == b'\n')
+        .take(4)
+        .map(<[u8]>::len)
+        .sum();
+    let end = start.checked_add(len)?;
+    if end >= body.len() || body[end] != b'\n' {
+        return None;
+    }
+    if &body[start..end] == title.as_bytes() {
+        return None;
+    }
+    let head_end = start - (len_line(len).len() + 1);
+    let mut out = Vec::with_capacity(body.len() + title.len());
+    out.extend_from_slice(&body[..head_end]);
+    out.extend_from_slice(len_line(title.len()).as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(title.as_bytes());
+    out.extend_from_slice(&body[end..]);
+    Some(out)
+}
+
+/// The `title <len>` header line for a title of `len` bytes.
+fn len_line(len: usize) -> String {
+    format!("title {len}")
 }
 
 /// Renders the optional trailing timestamp of a `msg`/`node` header: a
@@ -1641,16 +2234,21 @@ fn parse_meta_at(buf: &[u8], at: usize) -> Option<(String, String)> {
     Some((tag, last))
 }
 
-/// Renders the `/resume` picker: the most recent sessions, numbered, with
-/// tag and last prompt. `entries` must already be sorted most recent first
-/// (as [`SessionStore::list`] returns them).
+/// Renders the `/resume` picker: the most recent sessions, numbered, each led by
+/// its name, then its title, tag, age and last prompt. `entries` must already be
+/// sorted most recent first (as [`SessionStore::list`] returns them).
+///
+/// The name leads because it is what the user types to pick the session (and,
+/// since it is minted at session start, what they were watching on the prompt
+/// rule all along); the number is a shorthand for the rows on screen right now.
 #[must_use]
 pub fn render_resume_list(entries: &[SessionEntry], now: u64, color: bool, limit: usize) -> String {
     if entries.is_empty() {
         return "no saved sessions to resume\n".to_owned();
     }
-    let (num_on, title_on, help_on, dim, reset) = if color {
+    let (num_on, name_on, title_on, help_on, dim, reset) = if color {
         (
+            "\x1b[1;96m",
             "\x1b[1;96m",
             "\x1b[1;97m",
             "\x1b[97m",
@@ -1658,7 +2256,7 @@ pub fn render_resume_list(entries: &[SessionEntry], now: u64, color: bool, limit
             "\x1b[0m",
         )
     } else {
-        ("", "", "", "", "")
+        ("", "", "", "", "", "")
     };
     let mut out = String::new();
     for (i, e) in entries.iter().take(limit).enumerate() {
@@ -1674,19 +2272,19 @@ pub fn render_resume_list(entries: &[SessionEntry], now: u64, color: bool, limit
         };
         let _ = writeln!(
             out,
-            "{num_on}{:>2}.{reset} {title_on}{}{reset}{tag} {dim}({}, {}){reset}",
+            "{num_on}{:>2}.{reset} {name_on}{}{reset}{tag} {dim}({}){reset}",
             i + 1,
-            e.title,
-            format_age(when, now),
-            display_id(&e.id)
+            display_id(&e.id),
+            format_age(when, now)
         );
+        let _ = writeln!(out, "     {title_on}{}{reset}", e.title);
         if !e.last_prompt.is_empty() {
             let _ = writeln!(out, "     {dim}last: {}{reset}", e.last_prompt);
         }
     }
     let _ = writeln!(
         out,
-        "{help_on}Use /resume <number> (or a sha prefix) to continue a session.{reset}"
+        "{help_on}Use /resume <name> (or a number from this list) to continue a session.{reset}"
     );
     out
 }
@@ -1710,10 +2308,16 @@ pub fn sha1_hex(data: &[u8]) -> String {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    // `as_chunks` rather than `chunks_exact`: the compiler knows the chunk is
+    // exactly 64 (or 4) bytes, so indexing inside needs no bounds check and
+    // `from_be_bytes` takes the array directly. Rust 1.98's
+    // `chunks_exact_to_as_chunks` lint asks for this.
+    let (blocks, _) = msg.as_chunks::<64>();
+    for block in blocks {
         let mut w = [0u32; 80];
-        for (i, word) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        let (words, _) = block.as_chunks::<4>();
+        for (i, word) in words.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -1761,6 +2365,217 @@ mod tests {
             std::env::temp_dir().join(format!("plank-session-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// The repair pass for sessions titled before the context blocks were
+    /// skipped. What it must *not* touch is the point: `used` drives the
+    /// picker's recency order, so a pass that re-stamped it would shuffle
+    /// every session to the top of the list.
+    #[test]
+    fn retitle_all_fixes_scaffolding_titles_without_disturbing_the_rest() {
+        let dir = temp_dir("retitle");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("Agent instructions:\n\nread CLAUDE.md"));
+        s.push(Message::user("fix the failing test"));
+        s.push(Message::assistant("done"));
+        s.tag = "wip".to_owned();
+        let id = store.save(&mut s).unwrap();
+        // Force the pre-fix title back onto the file, as an older build wrote it.
+        let path = store.path_for_id(&id);
+        let body = fs::read(&path).unwrap();
+        fs::write(
+            &path,
+            replace_title_record(&body, "Agent instructions: read CLAUDE.md").unwrap(),
+        )
+        .unwrap();
+        let before = store.list().unwrap().into_iter().next().unwrap();
+
+        let changed = store.retitle_all().unwrap();
+        assert_eq!(changed.len(), 1, "one session rewritten");
+        assert_eq!(changed[0].1, "fix the failing test");
+
+        let after = store.list().unwrap().into_iter().next().unwrap();
+        assert_eq!(after.title, "fix the failing test");
+        assert_eq!(after.created_at, before.created_at, "creation time kept");
+        assert_eq!(after.last_used, before.last_used, "recency kept");
+        assert_eq!(after.tag, "wip");
+        assert_eq!(after.last_prompt, before.last_prompt);
+        // The transcript itself round-trips, off-path records and all.
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.transcript.len(), 3);
+        assert_eq!(loaded.transcript[2].text, "done");
+
+        // Second pass: nothing left to do, and nothing rewritten.
+        assert!(store.retitle_all().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Behind the picker's `Ctrl+W`. What it must leave alone is the point:
+    /// the shared checkpoints are not sessions, and dropping them would cost a
+    /// full prefill on the next launch for nothing.
+    #[test]
+    fn delete_all_takes_the_sessions_and_leaves_the_checkpoints() {
+        let dir = temp_dir("wipe");
+        let store = SessionStore::open(&dir).unwrap();
+        for text in ["one", "two", "three"] {
+            let mut s = Session::new();
+            s.push(Message::user(text));
+            let id = store.save(&mut s).unwrap();
+            // A payload sidecar rides along with each and must go with it.
+            fs::write(store.payload_path(&id), vec![0u8; 16]).unwrap();
+        }
+        fs::write(dir.join("sysprompt-a19f.kv_raw"), vec![0u8; 8]).unwrap();
+        assert_eq!(store.list().unwrap().len(), 3);
+
+        assert_eq!(store.delete_all().unwrap(), 3);
+        assert!(store.list().unwrap().is_empty(), "every session gone");
+        assert!(
+            !dir.join("one.kv_raw").exists(),
+            "payload sidecars went with them"
+        );
+        assert!(
+            dir.join("sysprompt-a19f.kv_raw").exists(),
+            "the shared system-prompt checkpoint survives"
+        );
+        // A second wipe on an empty store is a no-op, not an error.
+        assert_eq!(store.delete_all().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kv_nodes_finds_blobs_in_the_root_and_in_project_dirs() {
+        let dir = std::env::temp_dir().join(format!("plank-kvnodes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let proj = dir.join("abc123def456");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(dir.join("sysprompt-a19f.kv_raw"), vec![0u8; 100]).unwrap();
+        std::fs::write(proj.join("project-7c02.kv_raw"), vec![0u8; 50]).unwrap();
+        std::fs::write(dir.join("cheeky-bell.kv_raw"), vec![0u8; 200]).unwrap();
+        // Neither a transcript nor an in-flight temp file is a node.
+        std::fs::write(dir.join("cheeky-bell.kv"), b"plank-session 1\n").unwrap();
+        std::fs::write(dir.join("cheeky-bell.kv_raw.tmp.99"), b"x").unwrap();
+
+        let mut nodes = store.kv_nodes();
+        nodes.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        let got: Vec<(&str, &str, u64)> = nodes
+            .iter()
+            .map(|m| (m.role.as_str(), m.fingerprint.as_str(), m.bytes))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("project", "7c02", 50),
+                ("system", "a19f", 100),
+                ("session", "cheeky-bell", 200),
+            ],
+            "one node per .kv_raw body, role and fingerprint inferred from the name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_wipes_old_blobs_and_keeps_every_transcript() {
+        let dir = std::env::temp_dir().join(format!("plank-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let proj = dir.join("abc123def456");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // The four old blob species, the note, and one transcript.
+        std::fs::write(dir.join("sysprompt-a19f.kv"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("sysprompt.kv"), vec![0u8; 10]).unwrap();
+        std::fs::write(dir.join("cheeky-bell.payload"), vec![0u8; 200]).unwrap();
+        std::fs::write(proj.join("project-7c02.kv"), vec![0u8; 50]).unwrap();
+        std::fs::write(dir.join("sysprompt-last.prompt"), b"old prompt").unwrap();
+        std::fs::write(dir.join("cheeky-bell.kv"), b"plank-session 1\n").unwrap();
+
+        // Nested one level below the project directory: the sweep must not
+        // recurse into it, so this legacy-named file must survive untouched.
+        let nested = proj.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("project-dead.kv"), vec![0u8; 999]).unwrap();
+
+        let reclaimed = store.migrate_legacy_blobs().expect("migration runs once");
+        assert_eq!(reclaimed, 360, "100 + 10 + 200 + 50");
+
+        assert!(!dir.join("sysprompt-a19f.kv").exists());
+        assert!(!dir.join("sysprompt.kv").exists());
+        assert!(!dir.join("cheeky-bell.payload").exists());
+        assert!(!proj.join("project-7c02.kv").exists());
+        assert!(!dir.join("sysprompt-last.prompt").exists());
+        assert!(
+            dir.join("cheeky-bell.kv").exists(),
+            "transcripts must survive: resuming pays one re-prefill, it does not lose the conversation"
+        );
+        assert!(
+            nested.join("project-dead.kv").exists(),
+            "the sweep descends exactly one directory level, never arbitrarily deep"
+        );
+
+        assert!(
+            store.migrate_legacy_blobs().is_none(),
+            "second run is a no-op"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_does_not_touch_new_format_blobs() {
+        let dir = std::env::temp_dir().join(format!("plank-migrate-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        std::fs::write(dir.join("sysprompt-a19f.kv_raw"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("sysprompt-a19f.json"), b"{}").unwrap();
+        assert_eq!(store.migrate_legacy_blobs(), Some(0));
+        assert!(dir.join("sysprompt-a19f.kv_raw").exists());
+        assert!(dir.join("sysprompt-a19f.json").exists());
+        assert!(
+            store.migrate_legacy_blobs().is_none(),
+            "marker is written even when nothing was deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_kvcache_if_present_is_a_true_no_op_on_a_fresh_install() {
+        let dir = std::env::temp_dir().join(format!("plank-migrate-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+        assert_eq!(SessionStore::migrate_kvcache_if_present(&dir), None);
+        assert!(
+            !dir.exists(),
+            "a fresh install must not have its cache directory created by the migration gate"
+        );
+    }
+
+    #[test]
+    fn blob_names_use_kv_raw_and_never_collide_with_transcripts() {
+        assert_eq!(sysprompt_checkpoint_name("a19f"), "sysprompt-a19f.kv_raw");
+        assert_eq!(project_checkpoint_name("7c02"), "project-7c02.kv_raw");
+        // The whole point of the split: no blob name ends in the transcript
+        // extension, so a `*.kv` glob can never sweep up a checkpoint.
+        for n in [
+            sysprompt_checkpoint_name("a19f"),
+            project_checkpoint_name("7c02"),
+        ] {
+            assert!(
+                !n.ends_with(FILE_EXT),
+                "{n} must not look like a transcript"
+            );
+        }
+        let store = SessionStore::open(
+            std::env::temp_dir().join(format!("plank-blobname-{}", std::process::id())),
+        )
+        .unwrap();
+        assert!(
+            store
+                .payload_path("cheeky-bell")
+                .to_string_lossy()
+                .ends_with("cheeky-bell.kv_raw")
+        );
+        let _ = std::fs::remove_dir_all(store.dir());
     }
 
     /// A session file exactly as plank wrote them before branching existed
@@ -1968,7 +2783,7 @@ hello\n";
         assert!(cp.starts_with(&pdir));
         assert_eq!(
             cp.file_name().unwrap().to_string_lossy(),
-            format!("project-{fp2}{FILE_EXT}")
+            format!("project-{fp2}{PAYLOAD_EXT}")
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1996,56 +2811,179 @@ hello\n";
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Orphaned staging files are the one thing the sweep collects that is not
+    /// a blob. Both guards are exercised: a live process's own temp file and a
+    /// young one are left alone, because neither is distinguishable from a
+    /// write still in flight.
     #[test]
-    fn gc_keeps_only_the_current_system_checkpoint() {
+    fn sweep_collects_abandoned_staging_files_but_spares_live_ones() {
+        let dir = temp_dir("tmp-orphans");
+        let store = SessionStore::open(&dir).unwrap();
+        let project = Path::new("/proj/tmp");
+        fs::create_dir_all(store.project_dir(project)).unwrap();
+
+        let now = crate::kvmeta::now_secs();
+        let orphan = dir.join("cheeky-bell.kv_raw.tmp.4242");
+        let nested = store
+            .project_dir(project)
+            .join("project-p1.kv_raw.tmp.4242");
+        let mine = dir.join(format!("mine.kv_raw.tmp.{}", std::process::id()));
+        let not_ours = dir.join("notes.tmp.txt");
+        for p in [&orphan, &nested, &mine, &not_ours] {
+            fs::write(p, b"12345").unwrap();
+        }
+
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 30 * 86_400,
+            max_bytes: 0,
+        };
+        // `now` an hour and a bit on: everything written just now reads as past
+        // the TTL, so only the pid guard can spare anything.
+        assert_eq!(
+            store.sweep(&[], &policy, now + TEMP_ORPHAN_TTL + 60),
+            10,
+            "both abandoned staging files, root and project dir"
+        );
+        assert!(!orphan.exists());
+        assert!(!nested.exists());
+        assert!(
+            mine.exists(),
+            "this process's own staging file is in flight"
+        );
+        assert!(not_ours.exists(), "`.tmp.<not-a-pid>` is not our debris");
+
+        // A second sweep at the true clock: this staging file is seconds old,
+        // so it is indistinguishable from a sibling plank mid-persist and
+        // survives.
+        let young = dir.join("young.kv_raw.tmp.4243");
+        fs::write(&young, b"12345").unwrap();
+        assert_eq!(store.sweep(&[], &policy, now), 0);
+        assert!(
+            young.exists(),
+            "a young staging file may still be in flight"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Ported from `gc_keeps_only_the_current_system_checkpoint`: the sweep
+    /// still collects a superseded Tier 1 checkpoint and still spares the live
+    /// one. What changed is *why* a checkpoint dies — expiry rather than
+    /// fingerprint inequality — so the clock is wound past the tier TTL to make
+    /// the superseded ones collectable.
+    #[test]
+    fn sweep_collects_superseded_system_checkpoints_and_spares_the_live_ones() {
         let dir = temp_dir("sys-gc");
         let store = SessionStore::open(&dir).unwrap();
 
         for fp in ["aaa", "bbb", "ccc"] {
             fs::write(dir.join(sysprompt_checkpoint_name(fp)), b"fp\nkv").unwrap();
         }
-        // The pre-content-keyed checkpoint: unreadable now, so it goes too.
-        fs::write(dir.join("sysprompt.kv"), b"legacy").unwrap();
-        // Neighbours in the same root that must survive: a payload sidecar, a
-        // session file, an in-flight temp write, and a project subdirectory.
+        // Neighbours in the same root that must survive: a session transcript
+        // and a non-blob file in a project subdir. The temp write below is the
+        // one exception — see the orphan tally.
         let mut s = Session::new();
         s.push(Message::user("hi"));
         store.save(&mut s).unwrap();
         let payload = store.payload_path(&s.id);
         fs::write(&payload, b"payload").unwrap();
+        // A *production-shaped* sidecar: a session node's fingerprint is its
+        // payload fingerprint, which never equals the `<id>` in its file name.
+        // Without this the node was synthesized from the path, its fingerprint
+        // coincided with the id, and the "payload is active" assertion below
+        // passed for the wrong reason.
+        let payload_fp = payload_fingerprint(
+            "model-a",
+            "sys",
+            "[user]\nhi\n",
+            crate::engine::ThinkMode::Medium,
+            0,
+        );
+        assert_ne!(payload_fp, s.id);
+        crate::kvmeta::store(
+            &payload,
+            &crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::Session, &payload_fp, 7, 0),
+        )
+        .unwrap();
         let tmp = dir.join(format!("{}.tmp.4242", sysprompt_checkpoint_name("ddd")));
         fs::write(&tmp, b"in flight").unwrap();
         let project = Path::new("/proj/sys");
         fs::create_dir_all(store.project_dir(project)).unwrap();
-        fs::write(store.project_checkpoint_path(project, "aaa"), b"fp\nkv").unwrap();
+        // A Tier 2 checkpoint under its own fingerprint, deliberately *not*
+        // "aaa": sharing a Tier 1 blob's fingerprint would leave its fate
+        // ambiguous between policy and a fingerprint collision.
+        let proj_cp = store.project_checkpoint_path(project, "p1");
+        fs::write(&proj_cp, b"fp\nkv").unwrap();
+        let stray = store.project_dir(project).join("notes.txt");
+        fs::write(&stray, b"keep me").unwrap();
 
-        // Two fingerprints kept: a session can hold two engines, each with its
-        // own Tier 1 — a provider main agent beside a `provider: local`
-        // sub-agent. Keeping only one deletes the other's every launch.
-        assert_eq!(store.gc_system_checkpoints(&["bbb", "ccc"]), 2);
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 30 * 86_400,
+            max_bytes: 0,
+        };
+        // Two Tier 1 fingerprints are live, not one: a session can hold two
+        // engines — a provider main agent beside a `provider: local` sub-agent —
+        // and each has its own. Keeping only one deleted the other's every
+        // launch. The current session's own payload is live too.
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        let active = ["bbb", "ccc", payload_fp.as_str()];
+        // Exactly the two expired, inactive bodies: `sysprompt-aaa` and the
+        // Tier 2 `project-p1`, five bytes of `"fp\nkv"` each — plus the nine
+        // bytes of the abandoned `.tmp.4242` staging file, which at 400 days
+        // old is crash debris by any reading. An exact tally also pins that
+        // nothing else was collected.
+        assert_eq!(store.sweep(&active, &policy, future), 10 + 9);
         assert!(dir.join(sysprompt_checkpoint_name("bbb")).exists());
         assert!(dir.join(sysprompt_checkpoint_name("ccc")).exists());
         assert!(!dir.join(sysprompt_checkpoint_name("aaa")).exists());
-        assert!(!dir.join("sysprompt.kv").exists());
-        assert!(payload.exists());
-        assert!(store.path_for_id(&s.id).exists());
-        assert!(tmp.exists());
-        assert!(store.project_checkpoint_path(project, "aaa").exists());
+        // New policy, stated explicitly: one sweep now covers project
+        // directories too, and this checkpoint is decided by rule 4 — not
+        // pinned, not active, no surviving child, and 400 days past the 30-day
+        // tier TTL — so it is collected.
+        assert!(
+            !proj_cp.exists(),
+            "an expired, inactive Tier 2 checkpoint is collected by rule 4"
+        );
+        assert!(payload.exists(), "the live session's payload is active");
+        assert!(
+            store.path_for_id(&s.id).exists(),
+            "transcripts are not blobs"
+        );
+        assert!(
+            !tmp.exists(),
+            "a long-abandoned staging file is collected as orphan debris"
+        );
+        assert!(
+            stray.exists(),
+            "a non-blob file in a project dir is untouched"
+        );
 
         // Idempotent, and harmless when there is nothing to collect.
-        assert_eq!(store.gc_system_checkpoints(&["bbb", "ccc"]), 0);
+        assert_eq!(store.sweep(&active, &policy, future), 0);
         let empty = temp_dir("sys-gc-empty");
         let empty_store = SessionStore::open(&empty).unwrap();
-        assert_eq!(empty_store.gc_system_checkpoints(&["bbb"]), 0);
-        // An empty keep set is a full sweep, not a no-op: the caller decides
-        // what is live, and "nothing" would only ever be a bug upstream.
-        assert_eq!(store.gc_system_checkpoints(&[]), 2);
+        assert_eq!(empty_store.sweep(&["bbb"], &policy, future), 0);
+        // An empty active set is a full sweep of everything expired, not a
+        // no-op: the caller decides what is live.
+        // Everything left: the two formerly-active Tier 1 bodies at five bytes
+        // each plus the session payload at seven.
+        assert_eq!(store.sweep(&[], &policy, future), 17);
+        assert!(!dir.join(sysprompt_checkpoint_name("bbb")).exists());
+        assert!(!dir.join(sysprompt_checkpoint_name("ccc")).exists());
+        assert!(!payload.exists());
+        assert!(store.path_for_id(&s.id).exists());
         let _ = fs::remove_dir_all(&empty);
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Ported from `gc_keeps_only_the_current_project_checkpoint`: superseded
+    /// Tier 2 checkpoints are collected, the live one survives, and a
+    /// neighbouring project's files are unaffected. The sweep is no longer
+    /// scoped to one project directory, so the neighbour survives by being
+    /// listed as active rather than by being out of scope.
     #[test]
-    fn gc_keeps_only_the_current_project_checkpoint() {
+    fn sweep_collects_superseded_project_checkpoints() {
         let dir = temp_dir("proj-gc");
         let store = SessionStore::open(&dir).unwrap();
         let project = Path::new("/proj/gc");
@@ -2056,22 +2994,244 @@ hello\n";
         for fp in ["aaa", "bbb", "ccc"] {
             fs::write(store.project_checkpoint_path(project, fp), b"fp\nkv").unwrap();
         }
-        // A neighbouring project's checkpoint and a non-checkpoint file must
-        // both survive: GC is scoped to one project's Tier 2 files.
-        fs::write(store.project_checkpoint_path(other, "aaa"), b"fp\nkv").unwrap();
+        fs::write(store.project_checkpoint_path(other, "ddd"), b"fp\nkv").unwrap();
         let stray = store.project_dir(project).join("notes.txt");
         fs::write(&stray, b"keep me").unwrap();
 
-        assert_eq!(store.gc_project_checkpoints(project, "bbb"), 2);
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 30 * 86_400,
+            max_bytes: 0,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        assert_eq!(
+            store.sweep(&["bbb", "ddd"], &policy, future),
+            10,
+            "aaa + ccc"
+        );
         assert!(store.project_checkpoint_path(project, "bbb").exists());
         assert!(!store.project_checkpoint_path(project, "aaa").exists());
         assert!(!store.project_checkpoint_path(project, "ccc").exists());
-        assert!(store.project_checkpoint_path(other, "aaa").exists());
+        assert!(store.project_checkpoint_path(other, "ddd").exists());
         assert!(stray.exists());
 
-        // Idempotent, and harmless for a project with no checkpoint dir yet.
-        assert_eq!(store.gc_project_checkpoints(project, "bbb"), 0);
-        assert_eq!(store.gc_project_checkpoints(Path::new("/nope"), "bbb"), 0);
+        // Idempotent, and harmless for a cache with nothing collectable.
+        assert_eq!(store.sweep(&["bbb", "ddd"], &policy, future), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two bodies can share one fingerprint: a root `sysprompt-<fp>.kv_raw` and
+    /// a `<proj>/project-<fp>.kv_raw`. The verdict must follow the path, not the
+    /// fingerprint — a fingerprint-keyed delete took the kept namesake with the
+    /// doomed one.
+    #[test]
+    fn sweep_does_not_delete_a_kept_body_sharing_a_doomed_ones_fingerprint() {
+        let dir = temp_dir("sweep-dup-fp");
+        let store = SessionStore::open(&dir).unwrap();
+        let project = Path::new("/proj/dup");
+        fs::create_dir_all(store.project_dir(project)).unwrap();
+
+        // Same fingerprint, two bodies. The root one is expired (sidecar with
+        // `last_used = 0`); the project one is pinned, so only its own sidecar
+        // can save it.
+        let expired = dir.join(sysprompt_checkpoint_name("dup"));
+        fs::write(&expired, b"fp\nkv").unwrap();
+        crate::kvmeta::store(
+            &expired,
+            &crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::System, "dup", 5, 0),
+        )
+        .unwrap();
+        let pinned_path = store.project_checkpoint_path(project, "dup");
+        fs::write(&pinned_path, b"fp\nkv").unwrap();
+        let mut pinned =
+            crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::Project, "dup", 5, 0);
+        pinned.pinned = true;
+        crate::kvmeta::store(&pinned_path, &pinned).unwrap();
+
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 30 * 86_400,
+            max_bytes: 0,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        assert_eq!(
+            store.sweep(&[], &policy, future),
+            5,
+            "only the expired body"
+        );
+        assert!(!expired.exists(), "the expired body goes");
+        assert!(pinned_path.exists(), "the pinned namesake survives");
+        assert!(crate::kvmeta::sidecar_path(&pinned_path).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A blob's sidecar goes with it; a phantom node otherwise survives every
+    /// later scan, since `kv_nodes` reads sidecars as well as bodies.
+    #[test]
+    fn sweep_takes_the_sidecar_with_the_body() {
+        let dir = temp_dir("sweep-sidecar");
+        let store = SessionStore::open(&dir).unwrap();
+        let blob = dir.join(sysprompt_checkpoint_name("aaa"));
+        fs::write(&blob, b"fp\nkv").unwrap();
+        let meta = crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::System, "aaa", 5, 0);
+        crate::kvmeta::store(&blob, &meta).unwrap();
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 0,
+            ttl_tier_secs: 0,
+            max_bytes: 0,
+        };
+        assert_eq!(store.sweep(&[], &policy, crate::kvmeta::now_secs()), 5);
+        assert!(!blob.exists());
+        assert!(!crate::kvmeta::sidecar_path(&blob).exists());
+        assert!(store.kv_nodes().is_empty(), "no phantom node remains");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The converse trust direction. Every other test corrupts the *sidecar* and
+    /// checks the body still loads; this one leaves a perfectly agreeing sidecar
+    /// in place and checks a bad body still does not. Metadata is advisory in
+    /// both directions: the signature inside the body is the sole trust input.
+    #[test]
+    fn a_sidecar_that_agrees_with_a_bad_body_does_not_make_it_loadable() {
+        let dir = temp_dir("sidecar-trust-converse");
+        let store = SessionStore::open(&dir).unwrap();
+        let key = KvKey::System { fp: "a".repeat(40) };
+        let cache = crate::kvcache::KVCache::new(
+            vec![1, 2, 3, 4],
+            crate::ds4tokens::TokenTranscript::new(),
+        );
+        store
+            .kv_store_labeled(&key, &cache, None, "m", &crate::kvmeta::KvLabel::Unknown)
+            .unwrap();
+        let path = store.kv_path(&key);
+        assert!(store.kv_load(&key).is_some(), "the good body loads");
+
+        // 1. Truncated body, sidecar untouched and still describing it.
+        let good = fs::read(&path).unwrap();
+        let nl = good.iter().position(|&b| b == b'\n').unwrap();
+        fs::write(&path, &good[..=nl]).unwrap();
+        assert_eq!(
+            crate::kvmeta::load(&path).expect("a sidecar").fingerprint,
+            *key.signature(),
+            "the sidecar still agrees with the body's name"
+        );
+        assert!(
+            store.kv_load(&key).is_none(),
+            "a truncated body is not loadable however good its sidecar"
+        );
+
+        // 2. A body carrying a different signature, under a sidecar still naming
+        // the right fingerprint.
+        let other = crate::kvcache::KVCache::new(vec![9], crate::ds4tokens::TokenTranscript::new());
+        fs::write(&path, other.encode("not-the-signature")).unwrap();
+        assert_eq!(
+            crate::kvmeta::load(&path).expect("a sidecar").fingerprint,
+            *key.signature()
+        );
+        assert!(
+            store.kv_load(&key).is_none(),
+            "the body's own signature is the sole trust input"
+        );
+        // The blob still lists, because listing is advisory too: a blob you
+        // cannot see is a blob you cannot delete.
+        assert_eq!(store.kv_nodes().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two processes on one cache directory, modelled as two threads: one
+    /// storing bodies while the other sweeps. Whatever the interleaving, a
+    /// surviving body must never be left beside a sidecar describing a different
+    /// blob — the sidecar's fingerprint must still be the signature the body
+    /// itself carries.
+    #[test]
+    fn a_concurrent_store_and_sweep_never_pair_a_body_with_a_foreign_sidecar() {
+        let dir = temp_dir("kv-interleave");
+        let store = SessionStore::open(&dir).unwrap();
+        // `KvKey::Session`, deliberately: a session body's signature is the
+        // payload fingerprint, which never equals the `<id>` its file is named
+        // after. With `KvKey::System` the two coincide, so a body left with *no*
+        // sidecar still satisfied `from_file(path, synthesized_fp)` — the sweep
+        // unlinking the sidecar of a body the other thread had just rewritten
+        // passed silently, which is the only interesting outcome here.
+        let ids: Vec<String> = (0..40u32).map(|i| format!("session-{i:02}")).collect();
+        let fps: Vec<String> = (0..40u32).map(|i| format!("{:040x}", i + 1_000)).collect();
+        for (id, fp) in ids.iter().zip(&fps) {
+            assert_ne!(id, fp, "the signature must differ from the file stem");
+        }
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                for (id, fp) in ids.iter().zip(&fps) {
+                    let key = KvKey::Session {
+                        id: id.clone(),
+                        fp: fp.clone(),
+                    };
+                    let cache = crate::kvcache::KVCache::new(
+                        vec![7u8; 512],
+                        crate::ds4tokens::TokenTranscript::new(),
+                    );
+                    let _ = store.kv_store_labeled(
+                        &key,
+                        &cache,
+                        None,
+                        "m",
+                        &crate::kvmeta::KvLabel::Unknown,
+                    );
+                }
+            });
+            sc.spawn(|| {
+                // A zero TTL and a clock far in the future: every body the other
+                // thread writes is immediately collectable, so the two threads
+                // race over the same paths for the whole run.
+                let policy = crate::kvgc::SweepPolicy {
+                    ttl_session_secs: 0,
+                    ttl_tier_secs: 0,
+                    max_bytes: 0,
+                };
+                let future = crate::kvmeta::now_secs() + 400 * 86_400;
+                for _ in 0..40 {
+                    let _ = store.sweep(&[], &policy, future);
+                }
+            });
+        });
+        let survivors = store.kv_blob_nodes();
+        for (path, meta) in &survivors {
+            // A surviving body must still have its own sidecar. Each id is stored
+            // exactly once, so a body the sweep unlinked never comes back — a
+            // body present with its sidecar gone therefore means the sweep took
+            // the sidecar of a body that outlived it.
+            assert!(
+                crate::kvmeta::sidecar_path(path).exists(),
+                "{} outlived its sidecar",
+                path.display()
+            );
+            assert_eq!(
+                meta.fingerprint,
+                crate::kvmeta::load(path).expect("a sidecar").fingerprint,
+                "{} is nodes-scanned under a synthesized fingerprint",
+                path.display()
+            );
+            assert!(
+                crate::kvcache::KVCache::from_file(path, &meta.fingerprint).is_some(),
+                "{} does not match the sidecar beside it",
+                path.display()
+            );
+        }
+        // How many bodies survive the race is timing-dependent, so nothing is
+        // asserted about the count. That these bodies were genuinely sweepable —
+        // i.e. the assertions above were not vacuously ranging over blobs no
+        // sweep would ever have touched — is checked deterministically, single
+        // threaded, after the joins.
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 0,
+            ttl_tier_secs: 0,
+            max_bytes: 0,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        let _ = store.sweep(&[], &policy, future);
+        assert!(
+            store.kv_blob_nodes().is_empty(),
+            "every body in this fixture is collectable"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2079,6 +3239,19 @@ hello\n";
     fn sha1_known_vectors() {
         assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
         assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        // Both of the above are one padded block, so they exercise none of the
+        // block loop. A session id is the hash of a transcript and is routinely
+        // kilobytes, so the multi-block path is the one that actually runs.
+        // 56 bytes is the standard vector that pads into a *second* block.
+        assert_eq!(
+            sha1_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+        // And four blocks, cross-checked against `shasum -a 1`.
+        assert_eq!(
+            sha1_hex(&[b'a'; 200]),
+            "e61cfffe0d9195a525fc6cf06ca2d77119c24a40"
+        );
     }
 
     #[test]
@@ -2218,10 +3391,41 @@ hello\n";
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Session-start scaffolding is context for the model, never conversation to
+    /// replay: it neither anchors the history window nor renders.
     #[test]
-    fn resume_list_renders_numbers_tags_and_last_prompt() {
+    fn replayed_history_skips_session_start_context() {
+        let git = "This is the git status at the start of the conversation.\n\nbranch: main";
+        let transcript = vec![
+            Message::user("Agent instructions:\n\n# CLAUDE.md\nbe careful"),
+            Message::user(format!("{git}\n\nToday's date is 2026-08-10.")),
+            Message::user("fix the resume replay"),
+            Message::assistant("done"),
+        ];
+        // Two human turns requested, one real one available: the window starts
+        // at the real turn rather than sliding back over the scaffolding.
+        assert_eq!(history_window(&transcript, 2), Some((2, false)));
+        let out = render_history(&transcript, 6, false);
+        assert!(out.contains("fix the resume replay"), "got: {out}");
+        assert!(
+            !out.contains("CLAUDE.md"),
+            "agent instructions leaked: {out}"
+        );
+        assert!(!out.contains("git status"), "git status leaked: {out}");
+        assert!(!out.contains("Today's date"), "date leaked: {out}");
+
+        // Scaffolding only: nothing to replay at all.
+        assert_eq!(history_window(&transcript[..2], 6), None);
+        assert_eq!(
+            render_history(&transcript[..2], 6, false),
+            "\n(no user history)\n"
+        );
+    }
+
+    #[test]
+    fn resume_list_leads_with_the_name_then_the_title() {
         let entries = vec![SessionEntry {
-            id: "a".repeat(40),
+            id: "deadly-einstein".to_string(),
             title: "Fix CI".to_string(),
             created_at: 100,
             last_used: 100,
@@ -2232,9 +3436,15 @@ hello\n";
             path: PathBuf::new(),
         }];
         let out = render_resume_list(&entries, 100, false, 10);
-        assert!(out.contains(" 1. Fix CI [wip]"), "got: {out}");
+        assert!(out.contains(" 1. deadly-einstein [wip]"), "got: {out}");
+        assert!(out.contains("     Fix CI"), "got: {out}");
         assert!(out.contains("last: rerun the tests"), "got: {out}");
-        assert!(out.contains("Use /resume <number>"), "got: {out}");
+        assert!(out.contains("Use /resume <name>"), "got: {out}");
+        // A legacy 40-hex id still shows the way it always did.
+        let mut legacy = entries.clone();
+        legacy[0].id = "a".repeat(40);
+        let out = render_resume_list(&legacy, 100, false, 10);
+        assert!(out.contains(" 1. aaaaaaaa [wip]"), "got: {out}");
         assert_eq!(
             render_resume_list(&[], 0, false, 10),
             "no saved sessions to resume\n"
@@ -2299,6 +3509,109 @@ hello\n";
         assert_eq!(store.delete(&id).unwrap(), id);
         assert!(store.list().unwrap().is_empty());
         assert!(store.load(&id).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_moves_the_session_file_and_its_payload() {
+        let dir = temp_dir("store-rename");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.id = "old-name".to_owned();
+        s.push(Message::user("hello"));
+        store.save(&mut s).unwrap();
+        // A payload sidecar and its metadata sit beside the transcript.
+        fs::write(store.payload_path("old-name"), b"payload").unwrap();
+        fs::write(
+            crate::kvmeta::sidecar_path(&store.payload_path("old-name")),
+            b"{}",
+        )
+        .unwrap();
+
+        let id = store.rename("old-name", "new-name").unwrap();
+        assert_eq!(id, "new-name");
+        assert!(
+            !store.path_for_id("old-name").exists(),
+            "old transcript gone"
+        );
+        assert!(
+            store.path_for_id("new-name").exists(),
+            "new transcript there"
+        );
+        assert!(store.payload_path("new-name").exists(), "payload followed");
+        assert!(
+            crate::kvmeta::sidecar_path(&store.payload_path("new-name")).exists(),
+            "sidecar followed"
+        );
+        // The identity is the filename, so the loaded session reports the new name.
+        assert_eq!(store.load("new-name").unwrap().id, "new-name");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_refuses_an_invalid_or_taken_name() {
+        let dir = temp_dir("store-rename-refuse");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut a = Session::new();
+        a.id = "one".to_owned();
+        a.push(Message::user("a"));
+        store.save(&mut a).unwrap();
+        let mut b = Session::new();
+        b.id = "two".to_owned();
+        b.push(Message::user("b"));
+        store.save(&mut b).unwrap();
+
+        // A name that already names a saved session is refused, and nothing moves:
+        // silently clobbering `two` would destroy a transcript.
+        assert!(store.rename("one", "two").is_err());
+        assert!(store.path_for_id("one").exists());
+        assert!(store.path_for_id("two").exists());
+        // `validate_name`'s rules still apply.
+        assert!(store.rename("one", "").is_err());
+        assert!(store.rename("one", "has spaces").is_err());
+        // Renaming to its own name is a no-op success, not an "already taken" error.
+        assert_eq!(store.rename("one", "one").unwrap(), "one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_to_a_case_variant_of_the_same_name_is_a_no_op_success() {
+        let dir = temp_dir("store-rename-case-noop");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.id = "one".to_owned();
+        s.push(Message::user("hello"));
+        store.save(&mut s).unwrap();
+
+        // On a case-insensitive filesystem, "One" and "one" are the same
+        // underlying file: `dest.exists()` must not fire against the very
+        // session being renamed. Reverting the lowercase canonicalization
+        // makes this return the "already saved" error instead.
+        let id = store.rename("one", "One").unwrap();
+        assert_eq!(id, "one");
+        assert_eq!(store.load("one").unwrap().id, "one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_to_a_mixed_case_name_returns_the_lowercase_id() {
+        let dir = temp_dir("store-rename-mixed-case");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.id = "one".to_owned();
+        s.push(Message::user("hello"));
+        store.save(&mut s).unwrap();
+
+        // The returned id must be exactly what `find`/`list` report next,
+        // since `session_files` lowercases every stem. Reverting the
+        // canonicalization makes this return "New-Case" while `find` and
+        // `list` report "new-case", failing the equality checks below.
+        let id = store.rename("one", "New-Case").unwrap();
+        assert_eq!(id, "new-case");
+        let (found_id, _) = store.find("new").unwrap();
+        assert_eq!(found_id, id);
+        let listed_ids: Vec<String> = store.list().unwrap().into_iter().map(|e| e.id).collect();
+        assert!(listed_ids.contains(&id));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2463,6 +3776,50 @@ hello\n";
     }
 
     #[test]
+    fn a_preminted_name_survives_the_first_save() {
+        let dir = temp_dir("premint");
+        let store = SessionStore::open(&dir).unwrap();
+
+        // What `new_agent` does at launch: name the session before a word of it
+        // exists, then save it later under exactly that name.
+        let id = store.mint_id();
+        assert!(id.contains('-'), "memorable slug, got {id:?}");
+        assert!(!store.path_for_id(&id).exists());
+
+        let mut s = Session::new();
+        s.id = id.clone();
+        assert!(!s.is_persisted(), "unsaved despite having a name");
+        s.push(Message::user("hi"));
+        assert_eq!(store.save(&mut s).unwrap(), id);
+        assert!(s.is_persisted());
+        assert_eq!(store.load(&id).unwrap().id, id);
+
+        // And a minted name never collides with one already on disk.
+        assert_ne!(store.mint_id(), id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_names_are_validated_not_sanitized() {
+        assert_eq!(validate_name("  parser-hunt  ").unwrap(), "parser-hunt");
+        assert_eq!(validate_name("v2.9_final").unwrap(), "v2.9_final");
+        for bad in [
+            "",
+            "   ",
+            ".hidden",
+            "..",
+            "a/b",
+            "a\\b",
+            "why not",
+            "caf\u{e9}",
+        ] {
+            assert!(validate_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(validate_name(&"a".repeat(NAME_MAX)).is_ok());
+        assert!(validate_name(&"a".repeat(NAME_MAX + 1)).is_err());
+    }
+
+    #[test]
     fn title_derivation() {
         assert_eq!(title_from_transcript(&[], 0), "(no user prompt)");
         assert_eq!(
@@ -2478,6 +3835,23 @@ hello\n";
         assert!(long.len() <= 10);
         assert_eq!(title_clip("short", 40), "short");
         assert_eq!(title_clip("abcdefghij", 8), "abcde...");
+    }
+
+    /// Session-start context is a user turn nobody typed: titling by it names
+    /// every session in a project the same thing.
+    #[test]
+    fn a_title_skips_the_injected_session_context() {
+        let scaffolding = Message::user("Agent instructions:\n\nread CLAUDE.md");
+        assert_eq!(
+            title_from_transcript(&[scaffolding.clone(), Message::user("fix the bug")], 0),
+            "fix the bug"
+        );
+        // Nothing but scaffolding still has to say *something*, and the block
+        // itself beats "(no user prompt)".
+        assert!(
+            title_from_transcript(&[scaffolding], 0).starts_with("Agent instructions:"),
+            "a context-only session falls back to the block"
+        );
     }
 
     #[test]
@@ -2624,5 +3998,100 @@ hello\n";
             "project checkpoints must not collide across projects"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storing_writes_a_sidecar_and_loading_counts_the_hit() {
+        use crate::kvcache::KVCache;
+        let dir = std::env::temp_dir().join(format!("plank-kvmeta-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let key = KvKey::System { fp: "a19f".into() };
+        let cache = KVCache::new(vec![1, 2, 3], crate::ds4tokens::TokenTranscript::new());
+
+        store
+            .kv_store_labeled(
+                &key,
+                &cache,
+                None,
+                "test-model",
+                &crate::kvmeta::KvLabel::System {
+                    think_mode: "max".into(),
+                    trusted_len: 12,
+                    global_mcp: vec!["tokensave".into()],
+                },
+            )
+            .unwrap();
+
+        let meta = crate::kvmeta::load(&store.kv_path(&key)).expect("sidecar written");
+        assert_eq!(meta.fingerprint, "a19f");
+        assert_eq!(meta.model, "test-model");
+        assert_eq!(
+            meta.bytes,
+            std::fs::metadata(store.kv_path(&key)).unwrap().len()
+        );
+        assert_eq!(meta.hits, 0, "storing is not a hit");
+        assert!(meta.parent.is_none());
+
+        assert!(store.kv_load(&key).is_some());
+        assert_eq!(
+            crate::kvmeta::load(&store.kv_path(&key)).unwrap().hits,
+            1,
+            "a successful load is a hit"
+        );
+
+        // A miss must not invent a sidecar or touch counters.
+        assert!(
+            store
+                .kv_load(&KvKey::System { fp: "beef".into() })
+                .is_none()
+        );
+        assert_eq!(crate::kvmeta::load(&store.kv_path(&key)).unwrap().hits, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_sidecar_never_blocks_a_good_blob() {
+        use crate::kvcache::KVCache;
+        let dir = std::env::temp_dir().join(format!("plank-kvmeta-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let key = KvKey::System { fp: "a19f".into() };
+        store
+            .kv_store(
+                &key,
+                &KVCache::new(vec![9], crate::ds4tokens::TokenTranscript::new()),
+            )
+            .unwrap();
+        std::fs::write(
+            crate::kvmeta::sidecar_path(&store.kv_path(&key)),
+            b"garbage",
+        )
+        .unwrap();
+        assert!(
+            store.kv_load(&key).is_some(),
+            "the signature in the body is the only trust input"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kv_role_maps_each_key_variant() {
+        use crate::kvmeta::KvRole;
+        assert_eq!(kv_role(&KvKey::System { fp: "a".into() }), KvRole::System);
+        assert_eq!(
+            kv_role(&KvKey::Project {
+                dir: PathBuf::from("/p"),
+                fp: "b".into()
+            }),
+            KvRole::Project
+        );
+        assert_eq!(
+            kv_role(&KvKey::Session {
+                id: "i".into(),
+                fp: "c".into()
+            }),
+            KvRole::Session
+        );
     }
 }

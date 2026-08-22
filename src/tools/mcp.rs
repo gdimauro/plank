@@ -38,6 +38,12 @@ fn mcp_timeout_sec() -> u64 {
     crate::settings::active().mcp.timeout_secs
 }
 
+/// Bytes of a stdio server's stderr kept for diagnostics.
+///
+/// Enough for a startup error or a panic line; a chatty server that logs to
+/// stderr forever must not grow this without bound.
+const STDERR_TAIL_CAP: usize = 4096;
+
 // ============================================================================
 // Minimal JSON value (port of agent_json)
 // ============================================================================
@@ -417,6 +423,13 @@ struct StdioTransport {
     stdin: ChildStdin,
     stdout: ChildStdout,
     rbuf: Vec<u8>,
+    /// Tail of the server's stderr, drained by a reader thread.
+    ///
+    /// A server that dies during startup usually explains why on stderr (a
+    /// missing index, a bad flag, a panic). Discarding it left every such
+    /// death indistinguishable from a timeout, so keep the last
+    /// [`STDERR_TAIL_CAP`] bytes to quote back in the error.
+    stderr_tail: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 struct HttpTransport {
@@ -493,18 +506,48 @@ impl McpServer {
                 .envs(cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                // stderr to /dev/null so stdout carries only JSON-RPC.
-                .stderr(Stdio::null())
+                // stderr is piped, not inherited: it must never interleave
+                // with the UI, but it is the only place a server explains its
+                // own death, so a thread drains it into `stderr_tail`.
+                .stderr(Stdio::piped())
                 .process_group(0)
                 .spawn()
                 .map_err(|e| format!("failed to start {}: {e}", cfg.command))?;
             let stdin = child.stdin.take().ok_or("no stdin pipe")?;
             let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+            let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            if let Some(mut err) = child.stderr.take() {
+                let sink = std::sync::Arc::clone(&stderr_tail);
+                // Detached: it ends at EOF when the child's stderr closes.
+                std::thread::spawn(move || {
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Ok(n) = std::io::Read::read(&mut err, &mut chunk) else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        let Ok(mut tail) = sink.lock() else { return };
+                        tail.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                        // Keep the tail, dropping whole chars off the front:
+                        // the newest lines are the ones worth reporting.
+                        if tail.len() > STDERR_TAIL_CAP {
+                            let cut = tail.len() - STDERR_TAIL_CAP;
+                            let cut = (cut..tail.len())
+                                .find(|i| tail.is_char_boundary(*i))
+                                .unwrap_or(tail.len());
+                            tail.drain(..cut);
+                        }
+                    }
+                });
+            }
             Transport::Stdio(StdioTransport {
                 child,
                 stdin,
                 stdout,
                 rbuf: Vec::new(),
+                stderr_tail,
             })
         } else {
             let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -687,6 +730,49 @@ impl McpServer {
 }
 
 impl StdioTransport {
+    /// Explains a failed read: whether the child died (with its status and
+    /// whatever it said on stderr) or simply never answered in time.
+    ///
+    /// `initialize` failing because a server exits on startup and a server
+    /// that ignores requests are very different problems, and the operator
+    /// can only act on the difference if the message states it.
+    fn failure_reason(&mut self) -> String {
+        // EOF on stdout races the child's exit: the pipe closes before
+        // `waitpid` reports a status, so an immediate `try_wait` says "still
+        // running" for a server that has already died and the message would
+        // wrongly blame the timeout. Give the exit a brief grace period.
+        let grace = Instant::now() + Duration::from_millis(250);
+        let exited = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < grace => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Still running past the grace period, or unknowable.
+                _ => break None,
+            }
+        };
+        let tail = self
+            .stderr_tail
+            .lock()
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default();
+        let mut msg = match exited {
+            Some(status) => match status.code() {
+                Some(code) => format!("server exited with status {code}"),
+                None => "server was killed by a signal".to_string(),
+            },
+            None => format!("no response within {}s", mcp_timeout_sec()),
+        };
+        if !tail.is_empty() {
+            // Last line first: a startup error is usually the final thing
+            // written before the process gives up.
+            let last = tail.lines().next_back().unwrap_or(&tail);
+            let _ = write!(msg, ": {last}");
+        }
+        msg
+    }
+
     /// Reads one newline-delimited message, blocking up to `deadline`.
     ///
     /// Returns `None` on timeout, EOF, or error (the caller marks the server
@@ -737,7 +823,7 @@ impl StdioTransport {
         let deadline = Instant::now() + Duration::from_secs(mcp_timeout_sec());
         loop {
             let Some(line) = self.read_line(deadline) else {
-                return Err("no response from server (timeout or closed pipe)".to_string());
+                return Err(self.failure_reason());
             };
             // Ignore unparsable/log lines on stdout.
             let Some(resp) = json_parse(&line) else {
@@ -852,6 +938,20 @@ impl HttpTransport {
 /// name could never be routed back.
 #[must_use]
 pub fn config_load_checked(path: &Path) -> Option<Vec<McpServerConfig>> {
+    config_load_reporting(path).map(|(configs, _)| configs)
+}
+
+/// Parses `.mcp.json`, reporting *why* each dropped entry was dropped.
+///
+/// Same parse and same acceptance rules as [`config_load_checked`], but
+/// instead of only printing a rejection to stderr it also returns one
+/// human-readable rejection string per dropped entry (server name plus the
+/// real reason it was rejected), so a second caller can turn those into its
+/// own warnings without re-parsing the file. `None` has the same meaning as
+/// in `config_load_checked`: the file could not be read or did not parse as
+/// JSON.
+#[must_use]
+pub fn config_load_reporting(path: &Path) -> Option<(Vec<McpServerConfig>, Vec<String>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let Some(root) = json_parse(&text) else {
         eprintln!(
@@ -861,18 +961,23 @@ pub fn config_load_checked(path: &Path) -> Option<Vec<McpServerConfig>> {
         return None;
     };
     let mut out = Vec::new();
+    let mut rejected = Vec::new();
     let Some(Json::Obj(servers)) = root.get("mcpServers") else {
-        return Some(out);
+        return Some((out, rejected));
     };
     for (name, sv) in servers {
         let command = sv.str_or("command", "");
         let url = sv.str_or("url", "");
         if command.is_empty() && url.is_empty() {
             eprintln!("plank: MCP server \"{name}\" has no command or url, skipping");
+            rejected.push(format!(
+                "server '{name}' has no command or url and was rejected"
+            ));
             continue;
         }
         if name.contains("__") {
             eprintln!("plank: MCP server name \"{name}\" must not contain \"__\", skipping");
+            rejected.push(format!("server '{name}' contains '__' and was rejected"));
             continue;
         }
         let mut cfg = McpServerConfig {
@@ -922,7 +1027,7 @@ pub fn config_load_checked(path: &Path) -> Option<Vec<McpServerConfig>> {
         }
         out.push(cfg);
     }
-    Some(out)
+    Some((out, rejected))
 }
 
 /// Parses `.mcp.json`, treating an absent or invalid file as "no servers".
@@ -985,6 +1090,16 @@ fn hierarchy_from_global(
     let default = Path::new(".mcp.json");
     let local = config_load(local_path.unwrap_or(default));
     merge_configs(global, local)
+}
+
+/// Overlays plugin-contributed servers onto the global config, then the local
+/// config onto that, so precedence runs global < plugins < local.
+fn hierarchy_with_plugins(
+    global: Vec<McpServerConfig>,
+    plugin: Vec<McpServerConfig>,
+    local: Vec<McpServerConfig>,
+) -> Vec<McpServerConfig> {
+    merge_configs(merge_configs(global, plugin), local)
 }
 
 /// Overlays `local` server configs onto `global`, matching by server name.
@@ -1066,9 +1181,17 @@ pub fn global_eligible_names(local_path: Option<&Path>) -> Vec<String> {
 /// advertisement, so the system prompt — and hence the Tier 1 KV snapshot —
 /// stays byte-identical across a flap. `path` overrides the local config
 /// location; the global `~/.plank/.mcp.json` always applies underneath (see
-/// [`config_load_hierarchy`]).
+/// [`config_load_hierarchy`]). `plugins` contributes servers that sit between
+/// the global and local configs (see [`crate::plugins::mcp_servers`]).
+///
+/// Returns the started servers alongside the plugin-contribution warnings
+/// [`crate::plugins::mcp_servers`] raised — a rejected or renamed plugin server
+/// is invisible otherwise, so the caller is expected to surface them.
 #[must_use]
-pub fn load_and_start(path: Option<&Path>) -> Vec<McpServer> {
+pub fn load_and_start(
+    path: Option<&Path>,
+    plugins: &crate::plugins::PluginSet,
+) -> (Vec<McpServer>, Vec<String>) {
     // Read once: the eligible-names set, the prune keep-list and the merged
     // hierarchy all derive from this single `Option`, so they cannot disagree
     // about whether the global config was readable.
@@ -1089,13 +1212,17 @@ pub fn load_and_start(path: Option<&Path>) -> Vec<McpServer> {
     if let Some(root) = root.as_deref() {
         prune_records(root, global_names.as_deref());
     }
+    let default = Path::new(".mcp.json");
+    let local_configs = config_load(path.unwrap_or(default));
+    let (plugin_servers, warnings) = crate::plugins::mcp_servers(plugins);
     let mut start = spawn_and_handshake;
-    start_servers_with(
-        hierarchy_from_global(global.unwrap_or_default(), path),
+    let servers = start_servers_with(
+        hierarchy_with_plugins(global.unwrap_or_default(), plugin_servers, local_configs),
         &eligible,
         root.as_deref(),
         &mut start,
-    )
+    );
+    (servers, warnings)
 }
 
 /// Prunes advertisement records for servers no longer in the global config.
@@ -1219,6 +1346,27 @@ fn append_short_description(out: &mut String, desc: &str) {
     }
 }
 
+/// One directory line per non-primary tool: `- mcp__server__tool: short desc`.
+///
+/// Shared by the text path's `### MCP Tool Directory` block and the provider
+/// path's `mcp_call` description, so the two cannot drift into advertising
+/// different tool sets. Empty when every tool is primary.
+#[must_use]
+pub fn directory_listing(servers: &[McpServer]) -> String {
+    let mut out = String::new();
+    for s in servers {
+        for t in &s.tools {
+            if t.primary {
+                continue;
+            }
+            let _ = write!(out, "- mcp__{}__{}: ", s.name, t.name);
+            append_short_description(&mut out, &t.description);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Renders MCP tools for the system prompt.
 ///
 /// Primary tools get their full function-call JSON schema like the native
@@ -1259,16 +1407,7 @@ pub fn append_tool_schemas(out: &mut String, servers: &[McpServer]) {
          }\n\n\
          Directory:\n",
     );
-    for s in servers {
-        for t in &s.tools {
-            if t.primary {
-                continue;
-            }
-            let _ = write!(out, "- mcp__{}__{}: ", s.name, t.name);
-            append_short_description(out, &t.description);
-            out.push('\n');
-        }
-    }
+    out.push_str(&directory_listing(servers));
     out.push('\n');
 }
 
@@ -1412,7 +1551,39 @@ fn offline_tool_error(server: &str) -> String {
 
 /// Executes one `mcp__<server>__<tool>` call, mirroring `agent_tool_mcp_call`.
 pub fn tool_mcp_call(servers: &mut [McpServer], call: &ToolCall) -> String {
-    let Some((server_name, tool_name)) = split_name(&call.name) else {
+    invoke_mcp_tool(servers, &call.name, &args_to_json(call))
+}
+
+/// `mcp_call`: invokes any MCP tool named in the arguments.
+///
+/// The provider (OpenAI-compatible) path advertises only *primary* tools as
+/// native function specs, and a strict gateway — or llama.cpp's grammar-
+/// constrained tool calling — will not let the model emit a function name that
+/// was never declared. Without this escape hatch, narrowing the declared set
+/// would make every directory tool unreachable rather than merely unschema'd.
+/// The text path needs no equivalent: there the model writes DSML, which is
+/// free text and can name any tool.
+#[must_use]
+pub fn tool_mcp_invoke(servers: &mut [McpServer], call: &ToolCall) -> String {
+    let Some(name) = call.arg_value("name").filter(|n| !n.is_empty()) else {
+        return "Tool error: mcp_call requires name\n".to_string();
+    };
+    // Absent arguments is a legitimate no-parameter call, not an error.
+    let args = call.arg_value("arguments").unwrap_or("").trim().to_string();
+    let args = if args.is_empty() { "{}" } else { args.as_str() };
+    // The payload must be a JSON object: forwarding a scalar or an array would
+    // produce a `tools/call` the server rejects with a schema error that reads
+    // as the tool's fault rather than the caller's.
+    if !json_parse(args).is_some_and(|v| matches!(v, Json::Obj(_))) {
+        return "Tool error: mcp_call arguments must be a JSON object\n".to_string();
+    }
+    invoke_mcp_tool(servers, name, args)
+}
+
+/// Shared body of [`tool_mcp_call`] and [`tool_mcp_invoke`]: routes one
+/// `mcp__<server>__<tool>` name plus an already-encoded JSON argument object.
+fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) -> String {
+    let Some((server_name, tool_name)) = split_name(full_name) else {
         return "Tool error: malformed mcp tool name, expected mcp__server__tool\n".to_string();
     };
     // An offline shadow matches too: its tools are advertised in the prompt, so
@@ -1431,13 +1602,13 @@ pub fn tool_mcp_call(servers: &mut [McpServer], call: &ToolCall) -> String {
         return offline_tool_error(&server.name);
     }
     if server.find_tool(tool_name).is_none() {
-        return format!("Tool error: unknown mcp tool: {}\n", call.name);
+        return format!("Tool error: unknown mcp tool: {full_name}\n");
     }
 
     let mut params = String::from("{\"name\":");
     json_escape(&mut params, tool_name);
     params.push_str(",\"arguments\":");
-    params.push_str(&args_to_json(call));
+    params.push_str(arguments);
     params.push('}');
 
     let result = match server.request("tools/call", &params) {
@@ -2325,6 +2496,93 @@ mod tests {
     }
 
     #[test]
+    fn mcp_call_invokes_a_directory_tool_the_provider_never_declared() {
+        // The provider path advertises only primary tools, so a directory tool
+        // is reachable only through `mcp_call`. This proves the whole route:
+        // name + JSON arguments in, real `tools/call` on the wire, result out.
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"protocolVersion\":\"2024-11-05\"}}" ;;
+    *'"tools/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"tools\":[{\"name\":\"buried\",\"description\":\"b\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+    *'"tools/call"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"buried ran with depth=2\"}]}}" ;;
+    *)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"error\":{\"message\":\"method not found\"}}" ;;
+  esac
+done
+"#;
+        // `primaryTools: []` makes every tool a directory tool.
+        let path = write_temp_config(&format!(
+            "{{\"mcpServers\":{{\"demo\":{{\"command\":\"sh\",\"args\":[\"-c\",{}],\"primaryTools\":[]}}}}}}",
+            {
+                let mut esc = String::new();
+                json_escape(&mut esc, script);
+                esc
+            }
+        ));
+        let mut servers = start_servers(config_load(&path));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(servers.len(), 1);
+        assert!(!servers[0].tools[0].primary, "should be a directory tool");
+
+        let call = ToolCall {
+            name: "mcp_call".to_string(),
+            args: vec![
+                ToolArg {
+                    name: "name".to_string(),
+                    value: "mcp__demo__buried".to_string(),
+                    is_string: true,
+                },
+                ToolArg {
+                    name: "arguments".to_string(),
+                    value: "{\"depth\": 2}".to_string(),
+                    is_string: true,
+                },
+            ],
+        };
+        assert_eq!(
+            tool_mcp_invoke(&mut servers, &call),
+            "buried ran with depth=2\n"
+        );
+    }
+
+    #[test]
+    fn mcp_call_rejects_a_bad_name_or_non_object_arguments() {
+        let mut servers: Vec<McpServer> = Vec::new();
+        let arg = |n: &str, v: &str| ToolArg {
+            name: n.to_string(),
+            value: v.to_string(),
+            is_string: true,
+        };
+        let call = |args: Vec<ToolArg>| ToolCall {
+            name: "mcp_call".to_string(),
+            args,
+        };
+        assert!(
+            tool_mcp_invoke(&mut servers, &call(vec![])).contains("requires name"),
+            "a missing name must not reach the wire"
+        );
+        // A scalar or array would produce a `tools/call` the server rejects with
+        // a schema error that reads as the tool's fault, not the caller's.
+        let bad = call(vec![arg("name", "mcp__d__t"), arg("arguments", "[1,2]")]);
+        assert!(
+            tool_mcp_invoke(&mut servers, &bad).contains("must be a JSON object"),
+            "non-object arguments must be caught locally"
+        );
+        // No arguments at all is a legitimate zero-parameter call: it must get
+        // past validation and fail only on the (absent) server.
+        let none = call(vec![arg("name", "mcp__d__t")]);
+        assert!(
+            tool_mcp_invoke(&mut servers, &none).contains("server not available"),
+            "omitted arguments must be treated as {{}}"
+        );
+    }
+
+    #[test]
     fn end_to_end_against_scripted_stdio_server() {
         // A tiny shell MCP server: answers initialize, ignores the
         // notification, lists one echo tool, and echoes tool call arguments.
@@ -2377,6 +2635,47 @@ done
         };
         let out = tool_mcp_call(&mut servers, &call);
         assert_eq!(out, "echoed: hi\n");
+    }
+
+    #[test]
+    fn a_server_that_dies_on_startup_reports_its_status_and_stderr() {
+        // Regression: tokensave exits 1 with a "no index found" message on
+        // stderr when started outside an indexed project. With stderr sent to
+        // /dev/null and no exit check, that surfaced as "timeout or closed
+        // pipe" — blaming a timeout that never happened and hiding the one
+        // line that says how to fix it.
+        let script = "echo 'Error: config error: no TokenSave index found' >&2; exit 1";
+        let cfg = McpServerConfig {
+            name: "dying".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            primary_tools: None,
+        };
+        let mut server =
+            McpServer::spawn(&cfg).expect("spawn should succeed; the server dies after");
+        let started = Instant::now();
+        let err = server.handshake(None).expect_err("handshake must fail");
+        assert!(
+            err.contains("exited with status 1"),
+            "should name the exit status, got {err:?}"
+        );
+        assert!(
+            err.contains("no TokenSave index found"),
+            "should quote the server's stderr, got {err:?}"
+        );
+        assert!(
+            !err.contains("no response within"),
+            "a dead server must not be reported as a timeout, got {err:?}"
+        );
+        // And it must fail fast rather than burning the request timeout.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -2800,5 +3099,30 @@ done
             "binary flagged: {out}"
         );
         assert!(!out.contains("AAAA"), "blob bytes must not inline: {out}");
+    }
+
+    #[test]
+    fn plugin_servers_sit_between_the_global_and_local_configs() {
+        let global = vec![McpServerConfig {
+            name: "shared".to_string(),
+            command: "global".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            primary_tools: None,
+        }];
+        let plugin = vec![McpServerConfig {
+            name: "shared".to_string(),
+            command: "plugin".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            primary_tools: None,
+        }];
+        let merged = hierarchy_with_plugins(global, plugin, Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].command, "plugin");
     }
 }

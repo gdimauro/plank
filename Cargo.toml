@@ -1,6 +1,6 @@
 [package]
 name = "plank"
-version = "2.9.1"
+version = "3.1.1"
 edition = "2024"
 authors = ["Enzo Lombardi <enzinol@gmail.com>"]
 repository = "https://github.com/aovestdipaperino/plank"
@@ -9,13 +9,15 @@ license = "MIT"
 keywords = ["agent", "llm", "tui", "macos"]
 categories = ["command-line-utilities"]
 rust-version = "1.93"
-exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf"]
+exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf", "spike/*", "guests/*"]
 
 [features]
-default = ["use_obscura", "builtin_editor", "docparse"]
-# Image pasting (Cmd-V clipboard images, image file paths) is disabled until
-# the model's handling of image-file references is understood; build with
-# `--features images` to re-enable.
+default = ["use_obscura", "builtin_editor", "docparse", "images", "plugins"]
+# Image pasting (Cmd-V clipboard images, image file paths). This was off while
+# the model had no way to act on an image-file reference — the attachment named
+# a path and nothing could read it. The `ocr-mcp` MCP server closes that gap
+# (`transcribe_image` reads the cached file), so the gate has outlived its
+# reason and pasting is on by default. Disable with `--no-default-features`.
 images = []
 # Key the system-prompt KV checkpoint by project directory
 # (`sysprompt-<hash>.kv`) so per-project prompt inputs (AGENTS.md, local MCP
@@ -38,6 +40,18 @@ builtin_editor = ["dep:edit", "dep:stdext"]
 # build of libtesseract; disable with `--no-default-features` to get the old
 # behaviour (a PDF reads as bytes).
 docparse = ["dep:liteparse", "dep:tokio"]
+# WASM plugins (docs/WASM-PLUGINS.md and WASM-PLUGIN-AUTHORING.md). **On by
+# default**, which is a deliberate reversal: the system was built behind this
+# flag while it was feasibility-stage, and a plugin nobody can run without
+# rebuilding plank is not a plugin system.
+#
+# It costs ~18 MB of binary — Extism, and through it wasmtime's cranelift
+# backend, the heaviest dependency in the tree by a wide margin. Build with
+# `--no-default-features` (plus whichever others you want) to get the lean
+# binary back. Everything behind this flag sits under the `WasmHost` trait,
+# whose no-op implementation is what the rest of plank talks to when the feature
+# is off: the same shape as `Engine`/`EchoEngine`, and for the same reason.
+plugins = ["dep:extism"]
 
 [dependencies]
 libc = "0.2"
@@ -47,6 +61,16 @@ libc = "0.2"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 unicode-width = "0.2"
 ureq = "3"
+# Plugin signature verification (minisign, docs/WASM-PLUGINS.md). `ring` is
+# already in the tree behind rustls/ureq, so promoting it to a direct dependency
+# costs no binary size and adds no new audit surface; it supplies Ed25519.
+ring = "0.17"
+# Blake2b-512, which `ring` does not have and minisign's default (prehashed)
+# signature format requires: minisign 0.12 signs `Blake2b-512(file)` unless the
+# publisher passes `-l`, so without this plank would reject every signature the
+# reference tool produces by default. Same RustCrypto family as `sha2`, already
+# present.
+blake2 = "0.10"
 logo-art = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Fork of ratatui-markdown v0.3.6 (MIT OR Apache-2.0, cut at tag v0.3.6 before
@@ -83,6 +107,15 @@ liteparse = { version = "=2.10", optional = true }
 # scratch arenas the buffer and TUI allocate from.
 edit = { path = "refs/edit/crates/edit", optional = true }
 stdext = { path = "refs/edit/crates/stdext", optional = true }
+# WASM plugin runtime (feature `plugins`). Extism's `http`, `register-http`
+# and `register-filesystem` defaults are dropped: they would give every plugin
+# a network and loader path that the capability model says must be granted
+# per-plugin, never by the runtime's own default. `wasmtime-default-features`
+# must stay on — it is what carries the cranelift backend, and without it
+# extism itself does not compile.
+extism = { version = "1.30", default-features = false, features = [
+    "wasmtime-default-features",
+], optional = true }
 
 [lints.rust]
 missing_debug_implementations = "warn"

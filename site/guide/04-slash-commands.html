@@ -121,6 +121,7 @@
     <div class="bar">
       <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
       <div class="navlinks">
+        <a class="ghost" href="/whats-new">What's new</a>
         <a class="ghost" href="/guide/">Guide</a>
         <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
@@ -176,8 +177,14 @@ a list</td>
 <code>/list</code></td>
 </tr>
 <tr>
+<td><code>/rename &lt;name&gt;</code></td>
+<td>change the name later saves use; what is already on disk keeps its
+old name</td>
+</tr>
+<tr>
 <td><code>/strip &lt;id&gt;</code></td>
-<td>trim a saved session's oldest turns to reclaim space</td>
+<td>drop a saved session's KV payload to reclaim disk; the transcript
+survives and a later resume re-prefills it</td>
 </tr>
 <tr>
 <td><code>/history</code></td>
@@ -290,6 +297,11 @@ on</td>
 <td>which hooks are configured and on what events</td>
 </tr>
 <tr>
+<td><code>/plugins</code></td>
+<td>loaded plugins, where each came from, what it contributes, and any
+warnings</td>
+</tr>
+<tr>
 <td><code>/tasks</code></td>
 <td>the model's task list</td>
 </tr>
@@ -382,6 +394,16 @@ href="08-configuration.html">Configuration</a>.</p>
 auto-named; HTML is standalone)</td>
 </tr>
 <tr>
+<td><code>/kvcache</code></td>
+<td>browse the KV cache as a tree: what each snapshot is, what it was
+built on, its size, how often it has been used, and when it expires</td>
+</tr>
+<tr>
+<td><code>/kvcache gc|pin|unpin|rm</code></td>
+<td>sweep expired entries now, or pin, unpin or delete one by
+fingerprint prefix</td>
+</tr>
+<tr>
 <td><code>/insights [fast]</code></td>
 <td>a usage report computed from every saved session, written to
 <code>~/.plank/usage-data/report.html</code> (<code>fast</code> skips
@@ -402,6 +424,33 @@ single self-contained file. It never touches the live session.</p>
 and uses the model only for prose it cannot replace — a failed or
 skipped model call costs the report its narrative, never its
 statistics.</p>
+<h2 id="editing-a-file">Editing a file</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/open [path]</code></td>
+<td>edit an existing file in the built-in editor; with no path, reopens
+the last file a tool call edited this session</td>
+</tr>
+</tbody>
+</table>
+<p><code>/open</code> hands the terminal to the same editor
+<code>Ctrl-G</code> uses, with the file loaded: <code>Ctrl-S</code>
+saves, <code>Esc</code> discards. It is the fast way to fix up an edit
+the model just made — bare <code>/open</code> needs no path at all — or
+to look at a file without spending a turn on it.</p>
+<p>It edits, and only edits. A path that does not exist is refused
+rather than created, so a typo cannot leave an empty file behind, and so
+are directories, binary files, and anything over 32 MB. An untouched
+<code>Ctrl-S</code> writes nothing. Saving follows a symlink to the file
+it points at instead of replacing the link. TUI only; in the plain REPL
+the command is not available.</p>
 <h2 id="remote-control">Remote control</h2>
 <table>
 <thead>

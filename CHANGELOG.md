@@ -8,6 +8,307 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Greedy chain decode on Metal**, via the ds4 engine's new
+  `ds4_session_eval_chain_greedy`. At temperature 0 plank decodes a run of
+  argmax tokens with the next token id kept on-device, removing the per-token
+  host round-trip (GPU sync, 517 KiB logits readback, CPU argmax). Output is
+  bit-identical to the previous path, verified by md5 over the reply.
+
+  **Off on M5.** Upstream measured +1.75% on an M3 Ultra, but on an M5 Max it
+  is ~1.3% *slower* — it lost all three interleaved pairs — so the chain is
+  enabled everywhere except M5, matching where the fork gates its other Metal
+  decode work. `PLANK_GREEDY_CHAIN=1` forces it on to re-measure after a kernel
+  change; `DS4_DISABLE_GREEDY_CHAIN=1` turns it off everywhere.
+
+  The engine declines the chain for any session holding a `--dspark`/MTP
+  support model, so the two are mutually exclusive.
+
+### Changed
+
+- **The `--dspark` footer segment now reads `1.5t/step`, not `1.5x`.** It was
+  always mean tokens committed per speculative step, which is not a wall-clock
+  speedup: on Metal it reads well above 1.0 on runs that decode *slower* than
+  plain decode, because a batched verify costs more per token than plain decode
+  does. The accompanying percentage is likewise a lower bound — plank cannot
+  see how many tokens the C actually drafted, only the block size it was
+  allowed. `FINDINGS.md` has the measurements.
+
+- **Bumped the `refs/ds4` submodule** to `ivanfioravanti/ds4-metal` for the
+  chain-decode API and the pre-M5 Metal decode work.
+
+
+## [3.1.0] - 2026-08-22
+
+### Added
+
+- **`Ctrl+W` wipes every saved session** from the `/resume` picker. Same
+  two-press arming as the single-session `Ctrl+X`, but the confirmation names
+  the count — `Ctrl+W again to delete ALL 362 saved sessions` — because this one
+  is not undoable. Transcripts and their KV payloads go; the shared
+  system-prompt and project checkpoints stay, since rebuilding those would cost
+  a full prefill on the next launch for nothing.
+
+### Changed
+
+- **`--dspark` defaults the sampling temperature to 0.** Speculative decoding
+  only engages at temperature 0, so asking for DSpark and leaving the 0.6
+  default in place silently decoded target-only. An explicit `--temp` still
+  wins, in either flag order.
+
+## [3.0.4] - 2026-08-11
+
+### Added
+
+- **`/resume` is a picker now.** In the TUI, a bare `/resume` opens a panel over
+  every saved session instead of printing ten numbered lines: type to filter on
+  name, title, tag or last prompt, arrow through the results, Space to preview a
+  session's last turns, `Ctrl+R` to rename, `Ctrl+X` twice to delete, Enter to
+  resume. The plain-stdout path keeps the numbered listing, and `/resume <name>`
+  still resumes directly from either front end.
+
+- **`/retitle`** re-derives every saved session's title from its transcript. It
+  splices the title record in place rather than re-saving, so the `last used`
+  stamps the picker sorts on survive the pass.
+
+### Fixed
+
+- **Session titles no longer name the project instead of the conversation.** A
+  title was taken from the transcript's first user message, and the first user
+  message is usually the session-start context plank injects itself — so every
+  session in a repo was titled `Agent instructions: --- # From: …/CLAUDE.md` and
+  the new picker was a wall of identical rows. Titles now come from the first
+  turn a human actually typed. Existing sessions keep their stored title until
+  `/retitle` is run.
+
+## [3.0.3] - 2026-08-11
+
+### Added
+
+- **plank can read your screenshots.** Image pasting is on by default now, and
+  paired with the [`ocr-mcp`](https://github.com/aovestdipaperino/ocr-mcp)
+  server the model can act on what you paste: it calls `transcribe_image` on the
+  cached path and gets the text back. Transcription runs on your own machine
+  against a 0.9B OCR model, so no image leaves the laptop and there is no API
+  key. Install it with `brew install llama.cpp && cargo install ocr-mcp` and
+  register it in `.mcp.json`; the guide covers fetching the weights.
+
+  The feature had been compiled out behind `--features images` because a pasted
+  image reached the model as a path nothing could open, which made the whole
+  thing a tease. There is now a tool that opens it.
+
+### Changed
+
+- **Pasted images are cached byte-for-byte.** plank used to downsample every PNG
+  to 2000px on its long edge, a rule inherited from an image-upload API limit
+  that plank does not have: the ds4 engine is text-only and never uploads pixels
+  anywhere. The resampling only discarded the pixel density and DPI metadata that
+  an OCR tool then needs. Note that `~/.plank/image-cache/` is bounded by file
+  count rather than bytes, so it now grows larger for the same number of images.
+
+## [3.0.2] - 2026-08-11
+
+### Added
+
+- **Plugins load.** A plugin is one directory bundling skills, agents,
+  templates, hooks, an `.mcp.json` and a `settings.json`, contributed to a
+  session as a unit. plank picks them up from `~/.plank/plugins/dev/`, from
+  `./.plank/plugins/`, and from a repeatable `--plugin-dir <path>` that lasts
+  for the session — and it reads both its own spelling (`.plank-plugin/plugin.json`,
+  `templates/`, `hooks.json`) and Claude Code's (`.claude-plugin/plugin.json`,
+  `commands/`, `hooks/hooks.json`). A directory with no manifest but with
+  recognizable components still loads, named after itself.
+
+- **A plugin contribution is always addressable as `<plugin>:<name>`,** and keeps
+  the bare `<name>` only when nothing else claims it, so your own skills, agents
+  and templates never lose theirs to a plugin. Two plugins offering the same name
+  both keep only the namespaced form. MCP servers are the exception: the
+  separator is `-`, because a server name is embedded in `mcp__<server>__<tool>`
+  and split at the first `__` — and a plugin server name containing `__` is
+  rejected outright.
+
+- **Plugin settings sit below yours.** The order is defaults, then plugin
+  settings in load order, then `~/.plank/settings.json`, then
+  `./.plank/settings.json`, then the environment and the command line, so a
+  plugin can never override a setting you wrote. A plugin that sets a `safety.*`
+  key still beats the built-in default, and plank warns by name when one does.
+  Hooks are additive and all run, ordered `~/.plank`, then plugins, then the
+  project file.
+
+- **`/plugins`** lists what loaded, where each plugin came from, what it
+  contributes, and every warning. Nothing about a malformed plugin is fatal: a
+  bad manifest or component demotes itself and says so. There is no installer and
+  no marketplace yet — you place the directory yourself.
+
+- **`/goal [--max <n>] <objective>`** hands control back to the model turn after
+  turn until the objective is settled, instead of you typing "continue". After
+  each turn plank asks for a one-line adjudication (`ATTAINED`, `UNATTAINABLE`,
+  `NEEDS_USER` or `CONTINUE`) and stops on the first terminal verdict, printing a
+  closing line with the reason and the iteration count. Anything unparseable
+  reads as `CONTINUE`, so a parse miss costs an iteration rather than falsely
+  declaring success, and the cap (20 by default) bounds the loop. Ctrl-C in the
+  plain REPL and Esc in the TUI end the goal, not just the turn in flight.
+
+- **The sandbox can grant `~/.plank` writes on request,** per session, for the
+  cases where a tool legitimately needs to write into plank's own home.
+
+## [3.0.0] - 2026-08-10
+
+### Added
+
+- **A session is named the moment it starts, and the name is on screen the whole
+  time.** The memorable `adjective-celebrity` name used to be minted at save
+  time, so until you quit there was nothing to call the conversation you were
+  having. It is now minted at session start (and again on `/new`), and the TUI
+  floats it at the right end of the rule above the prompt — so the name a
+  transcript will be saved under is visible from the first frame.
+
+- **`/rename <name>`** changes the name later saves use. Nothing already on disk
+  is touched: a session saved before the rename stays resumable under its old
+  name, so the next save is a logical copy rather than a move. Names are
+  validated rather than sanitized (letters, digits, `-`, `_`, `.`), so the name
+  you see is the name you typed, and a name already on disk asks before taking
+  it — the `ask` panel in the TUI, a `[y/N]` prompt on the plain path, declining
+  wherever there is nobody to ask. `/save` already wrote the session without
+  quitting; it now reports the name rather than eight characters of it.
+
+- **`/kvcache`** shows the KV cache as the tree it actually is. Every persisted
+  snapshot now carries a JSON metadata sidecar recording what it is, the
+  fingerprint of the snapshot it extends, the model and reasoning level behind
+  it, its size, its hit count, when it was last used, and whether it is pinned.
+  The pane draws that tree with `↑↓` to move, `←→` to fold, `p` to pin, `d` to
+  delete and `g` to sweep; the plain REPL prints the same tree and takes
+  `/kvcache pin|unpin|rm|gc` by fingerprint prefix.
+
+  The metadata is strictly advisory. The signature inside a snapshot's own body
+  remains the only thing that decides whether its bytes may be restored, so a
+  missing or corrupt sidecar costs display quality and never correctness.
+
+- **`/open [path]`** edits an existing file in the built-in editor: `Ctrl-S`
+  saves, `Esc` discards. Bare `/open` reopens the last file a tool call
+  edited this session. TUI-only, and it never creates a file.
+
+### Changed
+
+- **The `/resume` picker leads with the session name.** Each row is the name and
+  age, then the title, then the last prompt, and the help line says to type the
+  name (a number from the list still works). The name is what you type to pick a
+  session and, now that it exists from session start, what you were looking at
+  on the prompt rule the whole time it ran.
+
+- **Replayed history leaves out the session-start context.** Resuming a session
+  used to replay the scaffolding plank injects for the model — agent
+  instructions, persistent memory, the sub-agent roster, git status, the date —
+  which on a short session was most of what you saw. Those blocks are user turns
+  as far as the model is concerned but nobody typed them, so they no longer
+  count as turns for the history window and are never rendered. A session that
+  holds nothing else replays nothing at all.
+
+- **The KV cache expires on age and is capped on size**, instead of keeping
+  only the current fingerprints. The old garbage collector kept exactly the
+  live system-prompt and project checkpoints and deleted every sibling, so
+  switching model or reasoning level and back paid a full system-prompt
+  re-prefill each way. Snapshots now expire on time since last use
+  (`kvcache.ttlSessionDays`, default 14; `kvcache.ttlTierDays`, default 30),
+  and if the survivors still exceed `kvcache.maxBytes` (default 20 GB) the
+  least-recently-used are evicted until they fit. Pinned entries, the chain the
+  current launch is using, and any snapshot something newer still builds on are
+  exempt, and when everything remaining is protected plank stays over budget
+  rather than deleting something it should not. Several system prompts now
+  coexist for as long as they are all in use.
+
+- **Every KV body is now a `.kv_raw` file**, so `.kv` means "session
+  transcript" and nothing else. The two used to share an extension, which
+  forced the collector to filter by filename prefix to avoid eating a
+  transcript.
+
+- **`/strip`'s description was wrong** in the guide and is now correct: it drops
+  a session's KV payload to reclaim disk and leaves the transcript untouched.
+  It never trimmed turns.
+
+### Migration
+
+On the first launch after upgrading, plank deletes the old-format KV snapshots
+once and reports how much it reclaimed. **Session transcripts are not touched**,
+so every saved conversation still loads; each pays one re-prefill the next time
+you open it, and the shared system-prompt and project snapshots rebuild on
+demand. If your cache had grown large, expect that first launch to hand back
+most of it. The 20 GB ceiling then applies to what you rebuild afterwards.
+
+### Fixed
+
+- **A dropped network no longer freezes the turn with no way out.** Losing the
+  link mid-generation — Wi-Fi off, sleep, a NAT rebind — used to hang plank
+  indefinitely, with Ctrl-C and Esc doing nothing. Two faults compounded. The
+  streaming HTTP agent set no timeouts at all (every `ureq` timeout defaults to
+  `None`, and it was the one agent in the tree that did not override them), and
+  a silent drop produces no RST or FIN: with the request already sent there is
+  no unacked data for TCP to retransmit, so no kernel timeout ever fires and
+  the socket sits established but black-holed forever. Meanwhile cancellation
+  was polled *inside* the SSE callback, which runs per arriving event — so zero
+  bytes meant zero interrupt checks, and the one situation that needed
+  cancelling was the one where it could not work.
+
+  The response body now reads on its own thread feeding a channel, and the turn
+  polls it with a timeout, so the interrupt flag is checked on a **clock rather
+  than on data arrival** — Ctrl-C lands within a quarter second even against a
+  dead socket. Ninety seconds of silence is reported as a stalled stream
+  instead of a hang, which is sound because both providers keepalive their
+  streams. Connect and header timeouts cover a drop *before* the stream starts.
+  Both remote engines are fixed. As a last resort, a second Ctrl-C on an
+  interrupt the worker has not acknowledged within two seconds force-quits,
+  with the status bar saying so.
+
+### Changed
+
+- **The status bar task counter reads `✓ Tasks: 2/5`.** The bare `✓ 2/5` did
+  not say what it was counting.
+
+- **The window title shows `❓ waiting for you...` while the `ask` tool has the
+  turn open**, so a backgrounded window says the turn is waiting on *you*
+  rather than on the model. The title it displaced — normally the `🚀` of a
+  running turn — comes back however the question ends, including a declined or
+  interrupted one.
+
+### Added
+
+- **DSpark speculative decoding, behind `--dspark`.** DeepSeek's auxiliary
+  draft checkpoint for V4 Flash reads hidden states from the main model and
+  proposes up to five tokens ahead; the target model verifies them and commits
+  only the prefix it agrees with, so one verification pass can advance the
+  stream by several tokens. Off by default. `--dspark-confidence F` sets the
+  pruning threshold, `--dspark-strict` loads the drafter but keeps target-only
+  decode, and sampled decoding never uses proposals — verification is argmax,
+  so speculation only applies at `--temp 0`.
+
+  The support model does not need `--mtp`: it resolves to
+  `~/.plank/ds4flash.dspark.gguf` and is offered for download (~5.6 GB) through
+  the same prompt, resume and progress path as the main model. An explicit
+  `--mtp` still wins, since that is also how a legacy one-stage MTP drafter is
+  supplied.
+
+  Worth knowing before turning it on: the payoff moved a long way during
+  development. Through the M5 decode-fusion work it was a consistent *loss* on
+  an M5 Max — 0.71× on generation, because verification and replay cost more
+  than the target passes they saved. Upstream then pipelined the Metal verifier
+  (`42033ee`), and the same measurement flipped to **1.19×**, with wall clock
+  agreeing at 0.81×. Both figures are one machine, one quant, one engine
+  commit; treat any DSpark number as attached to a specific engine SHA.
+
+- **The exit message reports the session's peak prefill and generation rates**
+  per model, alongside the token totals:
+
+  ```
+  peak DeepSeek V4 Flash  prefill 167.1 tok/s  ·  generation 16.8 tok/s
+  ```
+
+  Session-scoped on purpose — nothing is written to disk. A peak from last week
+  was measured on a different engine build, a different context length and a
+  cooler machine, so comparing against it silently is worse than not comparing.
+  Both rates exclude the first two seconds of their phase, which is where the
+  bias lives: the first decode token pays one-time GPU costs, and a short pass
+  divides by an elapsed dominated by fixed setup. A KV-cache restore is not
+  counted as prefill, however fast it looks.
+
 - **A third screensaver face: two minions.** `ui.screensaverFace` gains
   `minions` alongside `matrix` and `starfield`, and `random` now draws from all
   three: a pair of minions on the shore of a night lake, who walk, blink, elbow

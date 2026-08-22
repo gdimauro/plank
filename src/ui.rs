@@ -635,6 +635,7 @@ impl CompactSink for TuiCompactSink<'_> {
                 None,
                 &tui::TaskView::default(),
                 None,
+                &tui::RosterView::default(),
             );
         });
     }
@@ -698,6 +699,10 @@ struct FanoutSlot {
     /// are always clean-room.
     session: Session,
     label: String,
+    /// The delegated task, kept for the slot's roster row. The framed task in
+    /// `session` is wrapped in the sub-agent envelope, so it is not the plain
+    /// text a row wants to show.
+    task: String,
     /// Model text accumulated for the pane, flushed as one labelled block when
     /// the whole fan-out finishes.
     output: String,
@@ -984,8 +989,40 @@ fn last_assistant_text(messages: &[Message]) -> Option<String> {
     messages
         .iter()
         .rev()
-        .find(|m| matches!(m.role, crate::session::Role::Assistant) && !m.text.trim().is_empty())
-        .map(|m| m.text.trim().to_owned())
+        .filter(|m| matches!(m.role, crate::session::Role::Assistant))
+        .map(|m| strip_thinking(&m.text))
+        .find(|text| !text.is_empty())
+}
+
+/// Removes `<think>…</think>` blocks from an assistant message, leaving the
+/// prose it actually said.
+///
+/// Every caller of [`last_assistant_text`] is extracting a sub-agent's *report*,
+/// which becomes a tool observation in the parent's transcript. A transcript
+/// keeps thinking verbatim (the KV prefix depends on it), so the raw text
+/// carries the sub-agent's reasoning — and handing that to the parent as the
+/// report makes it read as a muddle of half-conclusions the parent then feels
+/// obliged to re-verify. The reasoning was already on screen in the sub-agent's
+/// own pane; the report is the answer.
+///
+/// An unterminated block (an interrupted run) is dropped to the end, since
+/// everything after an unclosed `<think>` is thinking by definition.
+fn strip_thinking(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + OPEN.len()..];
+        let Some(end) = after.find(CLOSE) else {
+            // Unterminated: everything after an unclosed `<think>` is thinking.
+            return out.trim().to_owned();
+        };
+        rest = &after[end + CLOSE.len()..];
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
 }
 
 /// Concatenates tool outputs into the model-facing result block, given
@@ -1084,10 +1121,10 @@ fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
 /// ANSI reset used by the slash-command reports.
 const ANSI_RESET: &str = "\x1b[0m";
 
-/// Image pasting is feature-gated off until the model's handling of
-/// image-file references is understood (`--features images` re-enables it).
-/// The code stays compiled either way; this constant kills every runtime
-/// path: clipboard probing, paste capture, and attachment injection.
+/// Image pasting, on by default since the `images` feature joined the default
+/// set (`--no-default-features` turns it off). The code stays compiled either
+/// way; this constant kills every runtime path: clipboard probing, paste
+/// capture, and attachment injection.
 const IMAGES_ENABLED: bool = cfg!(feature = "images");
 
 /// Renders the `/mcp` server report following Claude Code's layout: a header
@@ -1168,9 +1205,18 @@ struct Agent<'a> {
     /// no generation has run against the current transcript. Anchors the
     /// `/context` report to the real context usage.
     last_ctx_used: i32,
+    /// Speculative-decoding figures from the last turn that speculated, so the
+    /// idle footer keeps showing them between turns. Not reset with
+    /// `last_ctx_used` on a new session: it describes the engine's behaviour,
+    /// which a `/clear` does not change.
+    last_spec: crate::engine::SpecStats,
     /// Whether the most recent turn ended by user interrupt, so the turn-end
     /// notification says "interrupted" instead of "finished".
     last_turn_interrupted: bool,
+    /// Live `/goal` run, or `None`. Transient by construction: both front ends
+    /// clear it before returning to the prompt, so a resumed or cleared session
+    /// never inherits a goal (`docs/superpowers/specs/2026-08-10-goal-command-design.md`).
+    goal: Option<crate::goal::GoalLoop>,
     /// A framed `/btw` prompt waiting to be answered *alongside* the next main
     /// pass rather than in place of it (`docs/SESSION-CLONE-DESIGN.md` §6.2).
     ///
@@ -1194,6 +1240,14 @@ struct Agent<'a> {
     /// Named in-session rollback points (`/checkpoint`, `/rollback`); dropped
     /// when the session is replaced.
     checkpoints: crate::checkpoint::CheckpointStore,
+    /// Absolute path of the last file this session touched — one an `edit` or
+    /// `write` tool call changed, or one plank itself generated (a `/repro`
+    /// dump) — and the default target of a bare `/open`.
+    ///
+    /// In-memory only, like [`crate::tools::ToolContext::worktree`]: a resumed
+    /// session starts with no pointer rather than one aimed at a file the
+    /// previous run happened to edit.
+    last_edited: Option<std::path::PathBuf>,
     /// Live remote-control bridge (issue #25): the shared [`BroadcastBus`] that
     /// this agent's turn output mirrors into, plus the shared [`TurnShared`] that
     /// remote `prompt`/`btw`/`interrupt` frames drive. `None` until `/rc` (or
@@ -1438,6 +1492,8 @@ fn engine_stats_label(engine: &dyn Engine) -> String {
 const HISTORY_DEFAULT_TURNS: usize = 3;
 /// Sessions shown by the /resume picker.
 const RESUME_LIST_LIMIT: usize = 10;
+/// User turns replayed in a `/resume` row's Space preview.
+const RESUME_PREVIEW_TURNS: usize = 2;
 
 /// Outcome of `/insights`: a written report, or the user's decision to stop.
 ///
@@ -1573,6 +1629,9 @@ impl Agent<'_> {
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         let think = self.think;
+        // Bound here rather than inside the event closure, which cannot borrow
+        // `self` while `self.engine` is generating.
+        let model_name = self.engine.model_name();
         let prompt_tokens = self.engine.count_tokens(prompt_text);
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
         let verb = status::random_verb_index();
@@ -1621,6 +1680,9 @@ impl Agent<'_> {
                         }
                     }
                     EngineEvent::Prefill(p) => {
+                        // Every sample, not just the last: the peak is measured
+                        // from the warmup mark onward, which needs the series.
+                        crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
                         bar.show(&Status {
                             // A finished prefill means the engine is sampling,
                             // not prefilling. Saying "prefilling" through the
@@ -1644,8 +1706,10 @@ impl Agent<'_> {
                             ..Status::default()
                         });
                     }
-                    // Notices are a warm-up-only signal; never emitted mid-turn.
-                    EngineEvent::Notice(_) => {}
+                    // Notices are a warm-up-only signal, never emitted mid-turn;
+                    // Spec counters reach this front-end's status line through
+                    // `stats` below, since the plain REPL has no live footer.
+                    EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -1796,7 +1860,10 @@ impl Agent<'_> {
         self.emit_sub(crate::worker::UiEvent::Dim(crate::tui::subagent_signpost(
             &label,
         )));
-        self.emit_sub(crate::worker::UiEvent::SubStart(label));
+        self.emit_sub(crate::worker::UiEvent::SubStart {
+            label,
+            task: task.clone(),
+        });
         self.tool_ctx.subagent_depth += 1;
         let result = match alt {
             None => self.run_subagent_loop(),
@@ -2142,7 +2209,7 @@ impl Agent<'_> {
         // context so the `task` tool mutates the copy that renders and saves.
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| println!("{w}")) {
-            println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+            println!("{}", self.debug_line(&format!("halted: {reason}")));
             return Ok(());
         }
         // A compaction that did not rebuild (interrupted, or no usable summary)
@@ -2155,6 +2222,10 @@ impl Agent<'_> {
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
         let turn_start = Instant::now();
+        // Notify-only: `user_prompt_submit` already owns refusing a turn, and
+        // two events that can both stop one would make "why did nothing happen"
+        // ambiguous.
+        self.fire_notify_event(crate::wasmevents::EventKind::TurnStart, Vec::new());
         // Stop hooks run at most once per turn, so a hook that always exits 2
         // cannot loop the model forever.
         let mut stop_hook_ran = false;
@@ -2192,6 +2263,10 @@ impl Agent<'_> {
                 ctx_size: self.engine.ctx_size(),
                 generated: stats.generated,
                 gen_tps: stats.tps,
+                // Carried into idle so the figures are still readable after the
+                // answer lands — during generation they scroll past too fast to
+                // be useful, which is when people actually want them.
+                spec: stats.spec,
                 power_percent: self.power_percent,
                 think: self.think,
                 ..Status::default()
@@ -2231,7 +2306,9 @@ impl Agent<'_> {
                 self.sync_tasks_after_dispatch();
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
-                for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
+                let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
+                crate::openfile::note_edited(&mut self.last_edited, &previews, &self.tool_ctx.cwd);
+                for preview in previews {
                     print!("{}", preview.to_ansi(self.color));
                 }
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
@@ -2250,7 +2327,7 @@ impl Agent<'_> {
                 )));
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
-                    println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+                    println!("{}", self.debug_line(&format!("halted: {reason}")));
                     return Ok(());
                 }
                 continue;
@@ -2270,6 +2347,10 @@ impl Agent<'_> {
                 )));
                 continue;
             }
+            // Before the footer, not after: the bar is rendered from the
+            // published cells, so refreshing afterwards would show every cell
+            // one turn stale and leave the first turn's bar empty.
+            self.refresh_wasm_segments();
             if self.show_footer && !self.editor_owns_footer {
                 print_footer(&st, self.color);
             }
@@ -2282,7 +2363,115 @@ impl Agent<'_> {
             // Turn over: the front end is back at the prompt.
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
+            self.fire_turn_end(stats.generated, turn_start.elapsed());
             return Ok(());
+        }
+    }
+
+    /// Asks the model for a goal verdict on the plain-stdout path: one
+    /// generation, no tool dispatch.
+    ///
+    /// The prompt and the reply both stay in the transcript. Popping them would
+    /// truncate the session behind the engine's live KV and force a warm reset
+    /// every iteration; keeping them is append-only, and the model's own
+    /// `GOAL_REASON` becomes the context the next iteration works from.
+    fn adjudicate_plain(&mut self) -> Result<crate::goal::Adjudication, String> {
+        self.session
+            .push(Message::user(crate::goal::ADJUDICATION_PROMPT));
+        let prompt_text = render_transcript(&self.session, &self.system);
+        let (stream, text, stats) = self.stream_generation(&prompt_text, Instant::now())?;
+        let finished = stream.finished();
+        self.session.push(Message::assistant(text.clone()));
+        // The flag handling here is exactly `run_turn`'s for a cut-off turn:
+        // record it on `last_turn_interrupted` and clear the
+        // process-wide SIGINT flag here. Leaving that flag raised would return
+        // to the REPL prompt with an interrupt still pending, and the
+        // generation loop polls it — so the user's *next* message would abort
+        // instantly with `[interrupted]` before producing a token.
+        //
+        // Only the flag handling is shared: unlike `run_turn`, this prints
+        // nothing. The goal's single closing notice is the whole story of how
+        // it ended, and a second `[interrupted]` here would double-report it.
+        if stats.interrupted {
+            crate::interrupt::clear();
+            self.last_turn_interrupted = true;
+        }
+        // Work instead of a verdict, or a cut-off pass: neither settles a goal.
+        if stats.interrupted || !finished.calls.is_empty() {
+            return Ok(crate::goal::Adjudication::keep_going());
+        }
+        Ok(crate::goal::parse_verdict(&text))
+    }
+
+    /// Drives turns until the goal is settled (plain-stdout path).
+    ///
+    /// The mirror of the TUI's continuation hook in `tui_turn`; a change here
+    /// almost always needs the matching change there (CLAUDE.md).
+    ///
+    /// `self.goal` must be `None` again by the time this returns, on *every*
+    /// exit path, including an `Err` from a failed generation — the field's
+    /// own invariant is that it is transient state cleared before the front
+    /// end is back at the prompt, and a propagated `?` must not skip that.
+    /// `drive_goal_loop` does the actual work and can fail; this wrapper
+    /// clears `self.goal` unconditionally before deciding whether to print
+    /// the closing notice or propagate the error.
+    fn run_goal_loop(&mut self, goal: &str, max_iters: usize) -> Result<(), String> {
+        self.goal = Some(crate::goal::GoalLoop::new(goal, max_iters));
+        self.session
+            .push(Message::user(crate::goal::kickoff_message(goal)));
+        let result = self.drive_goal_loop();
+        self.goal = None;
+        let (outcome, iters, reason) = result?;
+        // Closes the class, not just the instance: `adjudicate_plain` clears
+        // the SIGINT flag for a generation it saw cut off, but a Ctrl+C landing
+        // between a generation returning and `drive_goal_loop`'s `pending()`
+        // check is seen by the check alone, which consumes nothing. Either way
+        // the goal ends here, so this is the one place that always runs.
+        if outcome == crate::goal::Outcome::Interrupted {
+            crate::interrupt::clear();
+        }
+        println!(
+            "{}",
+            self.debug_line(&crate::goal::closing(outcome, iters, &reason))
+        );
+        Ok(())
+    }
+
+    /// The fallible body of the goal loop, factored out so `run_goal_loop`
+    /// can clear `self.goal` on every exit, including an early `?` return.
+    fn drive_goal_loop(&mut self) -> Result<(crate::goal::Outcome, usize, String), String> {
+        loop {
+            let (iter, max) = {
+                let g = self
+                    .goal
+                    .as_mut()
+                    .expect("goal is live inside its own loop");
+                (g.next_iteration(), g.max_iters())
+            };
+            println!("{}", self.debug_line(&crate::goal::banner(iter, max)));
+            self.run_turn()?;
+            if self.last_turn_interrupted || crate::interrupt::pending() {
+                return Ok((crate::goal::Outcome::Interrupted, iter, String::new()));
+            }
+            let adj = self.adjudicate_plain()?;
+            // Re-checked, mirroring the TUI hook: a Ctrl+C landing *during* the
+            // adjudication only makes it `keep_going`, which would otherwise
+            // cost the user another whole iteration — and read as `Cap` rather
+            // than `Interrupted` if that was the last one.
+            if self.last_turn_interrupted || crate::interrupt::pending() {
+                return Ok((crate::goal::Outcome::Interrupted, iter, String::new()));
+            }
+            if let Some(o) = crate::goal::Outcome::from_verdict(adj.verdict) {
+                return Ok((o, iter, adj.reason));
+            }
+            if self
+                .goal
+                .as_ref()
+                .expect("goal is live inside its own loop")
+                .at_cap()
+            {
+                return Ok((crate::goal::Outcome::Cap, iter, adj.reason));
+            }
         }
     }
 
@@ -2313,9 +2502,6 @@ impl Agent<'_> {
     /// last user message). Exit-0 stdout and any exit-2 block feedback inject a
     /// `<hook_context>` user message into this turn; other nonzero exits warn.
     fn fire_user_prompt_submit(&mut self, warn: &mut dyn FnMut(String)) -> Option<String> {
-        if self.tool_ctx.hooks.user_prompt_submit.is_empty() {
-            return None;
-        }
         let prompt = self
             .session
             .transcript
@@ -2324,31 +2510,82 @@ impl Agent<'_> {
             .find(|m| m.role == crate::session::Role::User)
             .map(|m| m.text.clone())
             .unwrap_or_default();
-        let input = crate::hooks::lifecycle_event_input(
-            "UserPromptSubmit",
-            &[("prompt", &prompt)],
-            &self.tool_ctx.cwd,
+
+        // Shell hooks first, and only when there are any. The WASM dispatch
+        // below runs regardless: guarding it on the hook list is what made this
+        // event silently never fire for a session that had components and no
+        // hooks, which is the ordinary case.
+        let mut hook_stop = None;
+        if !self.tool_ctx.hooks.user_prompt_submit.is_empty() {
+            let input = crate::hooks::lifecycle_event_input(
+                "UserPromptSubmit",
+                &[("prompt", &prompt)],
+                &self.tool_ctx.cwd,
+            );
+            let out = crate::hooks::run_event_ctx(
+                &self.tool_ctx.hooks.user_prompt_submit,
+                "",
+                &input,
+                &self.tool_ctx.cwd,
+            );
+            for w in out.warnings.into_iter().chain(out.system_messages) {
+                warn(w);
+            }
+            if let Some(ctx) = out.context.or(out.block) {
+                self.session
+                    .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+            }
+            hook_stop = out.stop_reason;
+        }
+        // user_prompt_submit for WASM subscribers. Transform: a replacement
+        // rewrites the user's last message in place rather than appending
+        // context, because the event exists so a component can *change* what
+        // the model is asked, not only add to it.
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::UserPromptSubmit,
+            vec![("prompt", prompt)],
         );
-        let out = crate::hooks::run_event_ctx(
-            &self.tool_ctx.hooks.user_prompt_submit,
-            "",
-            &input,
-            &self.tool_ctx.cwd,
-        );
-        for w in out.warnings.into_iter().chain(out.system_messages) {
+        let wasm = &mut self.tool_ctx.wasm;
+        let wout = wasm.registry.dispatch(&mut *wasm.host, &event);
+        for w in wout.printed.into_iter().chain(wout.warnings) {
             warn(w);
         }
-        if let Some(ctx) = out.context.or(out.block) {
-            self.session
-                .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+        if let Some(text) = wout.replaced
+            && let Some(last) = self
+                .session
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == crate::session::Role::User)
+        {
+            last.text = text;
         }
-        out.stop_reason
+        if let Some((id, reason)) = wout.blocked {
+            // A refused prompt is the user's business, not the model's: it is
+            // reported and the turn does not start.
+            return Some(format!("blocked by wasm component {id}: {reason}"));
+        }
+        hook_stop
     }
 
     /// Fires the `SessionStart` hooks with the given source (startup|resume|
     /// clear|compact), injecting any produced context as a `<hook_context>`
     /// user message so it rides along with the session.
     fn fire_session_start(&mut self, source: &str, warn: &mut dyn FnMut(String)) {
+        // The WASM dispatch is deliberately outside the hooks guard below: a
+        // session with components and no shell hooks is the ordinary case, and
+        // returning early on an empty hook list would silently never fire the
+        // event for them.
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::SessionStart,
+            vec![("source", source.to_string())],
+        );
+        let wasm = &mut self.tool_ctx.wasm;
+        let wout = wasm.registry.dispatch(&mut *wasm.host, &event);
+        for w in wout.printed.into_iter().chain(wout.warnings) {
+            warn(w);
+        }
+
         if self.tool_ctx.hooks.session_start.is_empty() {
             return;
         }
@@ -2372,9 +2609,102 @@ impl Agent<'_> {
         }
     }
 
+    /// Re-renders WASM status cells and publishes them to the bar.
+    ///
+    /// Self-throttled by the registry, so this can be called at any boundary
+    /// that happens to be convenient without the caller owning the cadence.
+    /// Deliberately *not* called from the repaint path: the bar redraws on
+    /// every keystroke, and a guest has no business running there.
+    fn refresh_wasm_segments(&mut self) {
+        use std::fmt::Write as _;
+
+        if self.tool_ctx.wasm.registry.loaded.is_empty() {
+            return;
+        }
+        // The facts a cell is likely to want, in the flat-map shape every
+        // other WASM payload uses. Extending it later is additive.
+        let mut status = String::from("{\"cwd\": ");
+        crate::tools::mcp::json_escape(&mut status, &self.tool_ctx.cwd.display().to_string());
+        let _ = write!(
+            status,
+            ", \"messages\": {}, \"ctx_size\": {}}}",
+            self.session.transcript.len(),
+            self.engine.ctx_size(),
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let wasm = &mut self.tool_ctx.wasm;
+        if wasm
+            .registry
+            .refresh_segments(&mut *wasm.host, &status, now_ms)
+        {
+            // Priority travels with the text: the bar needs it to decide what
+            // to drop first when the line does not fit.
+            let cells: Vec<crate::status::Cell> = wasm
+                .registry
+                .segments()
+                .iter()
+                .map(|s| crate::status::Cell {
+                    text: s.text.clone(),
+                    priority: s.priority,
+                    fg: s.fg,
+                    bg: s.bg,
+                })
+                .collect();
+            crate::status::set_wasm_segments(cells);
+        }
+    }
+
+    /// Dispatches `turn_end` to WASM subscribers. Notify-only, so nothing it
+    /// returns can affect the turn that just finished — which is why this can
+    /// sit at the very end, after the footer and the notification, where a
+    /// veto would have been meaningless anyway.
+    ///
+    /// Anything a subscriber printed lands in the tool-context warnings the UI
+    /// already drains, rather than being written here: the turn is over and the
+    /// front end owns the screen again.
+    fn fire_turn_end(&mut self, generated: i32, elapsed: std::time::Duration) {
+        self.fire_notify_event(
+            crate::wasmevents::EventKind::TurnEnd,
+            vec![
+                ("generated", generated.to_string()),
+                ("wall_ms", elapsed.as_millis().to_string()),
+            ],
+        );
+    }
+
+    /// Dispatches one notify-class WASM event.
+    ///
+    /// Shared by every event whose reply cannot change anything: four of them
+    /// would otherwise be the same six lines, and the copy that drifts is the
+    /// one that forgets to drain a subscriber's output.
+    fn fire_notify_event(
+        &mut self,
+        kind: crate::wasmevents::EventKind,
+        fields: Vec<(&str, String)>,
+    ) {
+        // Cheap guard: dispatch walks the subscriber list, and the common case
+        // is a session with no observers at all.
+        if !self.tool_ctx.wasm.registry.has_subscriber(kind) {
+            return;
+        }
+        let event = crate::wasmevents::Event::new(kind, fields);
+        let wasm = &mut self.tool_ctx.wasm;
+        let out = wasm.registry.dispatch(&mut *wasm.host, &event);
+        self.tool_ctx.hook_warnings.extend(out.printed);
+        self.tool_ctx.hook_warnings.extend(out.warnings);
+    }
+
     /// Fires the `SessionEnd` hooks with the exit `reason`. Terminal event: no
     /// context is injected, only user-visible warnings are surfaced.
     fn fire_session_end(&mut self, reason: &str, warn: &mut dyn FnMut(String)) {
+        // Before the early return below: that guard is about shell hooks, and a
+        // WASM subscriber must not be skipped because no shell hook exists.
+        self.fire_notify_event(
+            crate::wasmevents::EventKind::SessionEnd,
+            vec![("reason", reason.to_string())],
+        );
         if self.tool_ctx.hooks.session_end.is_empty() {
             return;
         }
@@ -2548,6 +2878,15 @@ impl Agent<'_> {
     /// is appended after the rebuilt transcript. See [`Agent::fire_pre_compact`]
     /// for why this is shared.
     fn fire_post_compact(&mut self, trigger: &str, summary: &str, note: &mut dyn FnMut(String)) {
+        // Dispatched here rather than at each call site: compaction runs from
+        // two front-ends, and a second call site is the one that gets forgotten.
+        self.fire_notify_event(
+            crate::wasmevents::EventKind::PostCompact,
+            vec![
+                ("trigger", trigger.to_string()),
+                ("summary_chars", summary.len().to_string()),
+            ],
+        );
         if self.tool_ctx.hooks.post_compact.is_empty() {
             return;
         }
@@ -2580,6 +2919,12 @@ impl Agent<'_> {
         let _title = crate::title::Scoped::set(crate::title::State::Compacting);
         let trigger = Self::compact_trigger(reason);
         self.fire_pre_compact(trigger, &mut |w| println!("{w}"));
+        // Beside the shell hook rather than instead of it: the two extension
+        // mechanisms are peers, and a component should see what a hook sees.
+        self.fire_notify_event(
+            crate::wasmevents::EventKind::PreCompact,
+            vec![("trigger", trigger.to_string())],
+        );
         let mut prompt_text = render_transcript(&self.session, &self.system);
         {
             use std::fmt::Write as _;
@@ -2607,7 +2952,7 @@ impl Agent<'_> {
                         progress.summarizing(summary.len());
                     }
                     EngineEvent::Prefill(p) => progress.prefill(p.done, p.total),
-                    EngineEvent::Notice(_) => {}
+                    EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -2709,6 +3054,20 @@ impl Agent<'_> {
     /// for local engines (`stats.usage` is `None`), so `/usage` stays empty
     /// unless an online provider is driving the turns.
     fn record_usage(&mut self, stats: &crate::engine::GenerationStats) {
+        // Speculation figures for the footer, kept here rather than beside each
+        // `last_ctx_used` assignment: there are three generate paths (the plain
+        // REPL, the quiet pass, the TUI worker) and only this call is on all
+        // three. The first version updated two of them and the TUI — the one
+        // front-end with a footer to show it in — was the one left out.
+        // Only a speculating pass overwrites it, so the last real figure stays
+        // readable across turns that did not speculate.
+        if stats.spec.active() {
+            self.last_spec = stats.spec;
+        }
+        // Peak decode rate for this model, reported at exit. Attributed to the
+        // engine that actually ran the pass, which during a sidechain is the
+        // alt engine — same rule as the token tally below.
+        crate::speeds::note_generation(&self.engine.model_name(), stats.steady_tps);
         // Engine-agnostic in/out tally. Must run before `self.last_ctx_used` is
         // updated for this pass, so the local input estimate below sees the
         // previous context size.
@@ -2744,6 +3103,16 @@ impl Agent<'_> {
         if let Some(u) = stats.usage {
             self.usage.total.add(u);
             self.usage.turns += 1;
+        }
+
+        // Inside a sub-agent, credit the run's roster row too. The serial path
+        // has exactly one run open, so the row needs no naming.
+        if self.tool_ctx.subagent_depth > 0 {
+            self.emit_sub(crate::worker::UiEvent::SubTokens {
+                label: None,
+                prefill: u64::try_from(input.max(0)).unwrap_or(0),
+                generated: u64::try_from(output.max(0)).unwrap_or(0),
+            });
         }
     }
 
@@ -3087,9 +3456,14 @@ impl Agent<'_> {
             "/quit" | "/exit" => return Ok(false),
             "/new" | "/clear" => {
                 self.session = Session::new();
+                // A new session, a new name — minted here for the same reason
+                // `new_agent` mints one at launch (see `SessionStore::mint_id`).
+                self.session.id = self.store.mint_id();
                 self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
-                self.context_content = ContextContent::new();
+                // Same merged roster the launch path advertises, so /clear
+                // cannot silently drop plugin-contributed agents from it.
+                self.context_content = ContextContent::new_with_agents(&self.agents);
                 push_session_context(&mut self.session, &self.context_content);
                 // Scaffolding only — not activity worth a resume point (see
                 // `save_for_exit`); a real turn re-dirties it.
@@ -3161,12 +3535,16 @@ impl Agent<'_> {
             },
             "/save" => match self.save_session() {
                 Ok(id) => {
-                    println!("saved session {}", &id[..8]);
+                    println!("saved session {}", crate::session::display_id(&id));
                     if let Some(note) = self.save_session_payload() {
                         println!("{}", self.debug_line(&note));
                     }
                 }
                 Err(e) => println!("save failed: {e}"),
+            },
+            "/rename" => match self.rename_session(arg, &mut confirm_on_stdin) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => println!("rename failed: {e}"),
             },
             "/list" => match self.store.list() {
                 Ok(entries) => print!(
@@ -3198,6 +3576,7 @@ impl Agent<'_> {
                 Ok(id) => println!("deleted session {}", &id[..8]),
                 Err(e) => println!("delete failed: {e}"),
             },
+            "/retitle" => println!("{}", self.retitle_sessions()),
             "/resume" => match self.resume_pick(arg) {
                 Ok(None) => match self.store.list() {
                     Ok(entries) => print!(
@@ -3289,17 +3668,55 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/kvcache" => println!("{}", self.kvcache_text_command(arg)),
             "/config" => {
                 if arg.is_empty() {
                     print!(
                         "{}",
                         crate::configform::render_text_list(crate::settings::active())
                     );
+                    // Discoverability: settable-but-unlisted is the same as
+                    // absent for anyone who did not write the plugin.
+                    print!(
+                        "{}",
+                        crate::configform::render_plugin_list(
+                            crate::settings::active(),
+                            &self.tool_ctx.wasm.registry.declared_config(),
+                        )
+                    );
                 } else {
                     let mut p = arg.splitn(2, char::is_whitespace);
                     let key = p.next().unwrap_or("");
                     let val = p.next().unwrap_or("").trim();
                     let mut working = crate::settings::active().clone();
+                    // Plugin options are addressed `pluginConfig.<id>.<option>`
+                    // and validated against the component's own declaration, so
+                    // they cannot go through the `FieldId` setter.
+                    if key.starts_with("pluginConfig.") {
+                        let declared = self.tool_ctx.wasm.registry.declared_config();
+                        match crate::configform::set_plugin_option(
+                            &mut working,
+                            key,
+                            val,
+                            &declared,
+                        ) {
+                            Ok(written) => match crate::settings::project_path() {
+                                Some(path) => match working.save_to(&path) {
+                                    Ok(()) => {
+                                        crate::settings::reinstall(working);
+                                        println!(
+                                            "set pluginConfig.{written} = {val} (saved to {})",
+                                            path.display()
+                                        );
+                                    }
+                                    Err(e) => println!("config save failed: {e}"),
+                                },
+                                None => println!("no project settings file to save to"),
+                            },
+                            Err(e) => println!("{e}"),
+                        }
+                        return Ok(true);
+                    }
                     match crate::configform::set_from_path(&mut working, key, val) {
                         Ok(field) => {
                             let (section, fkey) = (field.section, field.key);
@@ -3328,12 +3745,25 @@ impl Agent<'_> {
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/usage" => print!("{}", self.render_usage_report(self.color)),
+            "/goal" => {
+                match crate::goal::parse_command(arg) {
+                    Ok((goal, max)) => self.run_goal_loop(&goal, max)?,
+                    Err(usage) => println!("{usage}"),
+                }
+                return Ok(true);
+            }
             "/compact" => {
                 // Any argument is extra summarization instructions for this one
                 // pass. The interrupted case already printed its own notice.
                 self.compact("user request", arg)?;
             }
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/frame" => println!(
+                "/frame needs the full-screen TUI — a piped session has no screen to give a \
+                 component\n{}",
+                self.frame_command("")
+            ),
+            "/plugins" => print!("{}", self.plugins_command(arg)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!("{}", self.session.tasks.render_list()),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
@@ -3342,6 +3772,13 @@ impl Agent<'_> {
                 println!(
                     "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
                 );
+            }
+            // Reachable but always empty-handed here: a bridge can only be
+            // started from the TUI, so nothing can be waiting for a grant.
+            "/grant" => {
+                for line in self.grant_lines(arg) {
+                    println!("{line}");
+                }
             }
             "/btw" => {
                 if arg.is_empty() {
@@ -3361,6 +3798,10 @@ impl Agent<'_> {
                 Ok(path) => println!("exported session to {}", path.display()),
                 Err(e) => println!("export failed: {e}\nusage: /export [md|html] [path]"),
             },
+            // miniedit needs the raw terminal and only the TUI can suspend
+            // itself to hand it over; there is deliberately no $EDITOR
+            // fallback here.
+            "/open" => println!("/open requires the interactive TUI"),
             "/insights" => {
                 let color = self.color;
                 let mut note = |line: String| println!("{}", status::system_line(&line, color));
@@ -3479,7 +3920,29 @@ impl Agent<'_> {
                     self.run_turn()?;
                 }
                 Some(Err(e)) => println!("{e}"),
-                None => println!("unknown command: {cmd}"),
+                None => match self.wasm_command(cmd, arg) {
+                    Some(Ok(out)) => {
+                        for line in &out.print {
+                            println!("{line}");
+                        }
+                        if out.inject.is_some() {
+                            // No input box to prefill on this path. Said out
+                            // loud rather than dropped: a component that looks
+                            // like it did nothing is worse than one that
+                            // explains what it could not do here.
+                            println!(
+                                "({cmd} wanted to prefill the input box; not available on the plain REPL)"
+                            );
+                        }
+                        if let Some(prompt) = out.prompt {
+                            print!("{}", status::format_user_prompt_echo(&prompt, self.color));
+                            self.session.push(Message::user(prompt));
+                            self.run_turn()?;
+                        }
+                    }
+                    Some(Err(e)) => println!("{e}"),
+                    None => println!("unknown command: {cmd}"),
+                },
             },
         }
         Ok(true)
@@ -3548,7 +4011,7 @@ impl Agent<'_> {
     /// front-end to display at startup.
     fn resumed_history(&self) -> Option<String> {
         use std::fmt::Write as _;
-        if self.session.id.is_empty() {
+        if !self.session.is_persisted() {
             return None;
         }
         let mut out = crate::session::render_history(&self.session.transcript, 6, self.color);
@@ -3569,7 +4032,7 @@ impl Agent<'_> {
     /// spans, not an ANSI string.
     fn replay_history_into_log(&self, log: &mut OutputLog) {
         use crate::session::Role;
-        if self.session.id.is_empty() {
+        if !self.session.is_persisted() {
             return;
         }
         let transcript = &self.session.transcript;
@@ -3588,6 +4051,11 @@ impl Agent<'_> {
             !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured();
 
         for m in &transcript[start..] {
+            // Session-start scaffolding (agent instructions, git status, the
+            // date) is context for the model, not conversation: never replayed.
+            if m.is_session_context() {
+                continue;
+            }
             match m.role {
                 Role::User if m.is_tool_user() => {
                     log.push_dim("Tool result:");
@@ -3768,7 +4236,29 @@ the original is frozen and listed in /tree"
             id: self.session.id.clone(),
             fp: self.payload_fingerprint_for(&self.session),
         };
-        match self.store.kv_store(&key, &cache) {
+        // Tier 4 hangs off the deepest *cacheable* tier of this launch — Tier 2
+        // when the project has stable context, Tier 1 otherwise — so a session
+        // is never an orphan in the `/kvcache` tree. Tier 3 is deliberately not
+        // a candidate: it is never checkpointed, so naming it would point at a
+        // node that has no blob.
+        let tiers = self.kv_tiers();
+        let parent = tiers
+            .iter()
+            .find(|t| t.kind == crate::kvtier::TierKind::ProjectStable)
+            .or_else(|| {
+                tiers
+                    .iter()
+                    .find(|t| t.kind == crate::kvtier::TierKind::System)
+            })
+            .map(|t| t.fingerprint.as_str());
+        let label = crate::kvmeta::KvLabel::Session {
+            name: self.session.id.clone(),
+            title: self.session.title.clone(),
+        };
+        match self
+            .store
+            .kv_store_labeled(&key, &cache, parent, &self.engine.model_name(), &label)
+        {
             Ok(()) => Some(format!(
                 "saved KV payload ({:.2} MB)",
                 crate::session::to_mb(self.store.payload_bytes(&self.session.id))
@@ -3826,6 +4316,287 @@ the original is frozen and listed in /tree"
             .count_tokens(&render_transcript(&s, &self.system))
             .max(0);
         Ok((id, tokens))
+    }
+
+    /// Runs one textual `/kvcache [gc|pin <fp>|unpin <fp>|rm <fp>]` and returns
+    /// the whole output as a single string.
+    ///
+    /// Both front ends go through this: the plain REPL prints the result, and
+    /// the TUI pushes it into the output log, so the two cannot answer the same
+    /// subcommand differently.
+    fn kvcache_text_command(&self, arg: &str) -> String {
+        let mut words = arg.split_whitespace();
+        let verb = words.next().unwrap_or("");
+        let fp = words.next().unwrap_or("");
+        match verb {
+            "" => crate::kvpane::render_text(&self.kvcache_pane()),
+            "gc" => self.kvcache_sweep(),
+            "pin" | "unpin" | "rm" => self.kvcache_apply(verb, fp),
+            other => {
+                format!("usage: /kvcache [gc|pin <fp>|unpin <fp>|rm <fp>] (got {other:?})")
+            }
+        }
+    }
+
+    /// Builds a `/kvcache` pane over the current on-disk state.
+    ///
+    /// Both front ends construct the view this way, so the TUI modal and the
+    /// stdout tree are always the same rows.
+    #[must_use]
+    fn kvcache_pane(&self) -> crate::kvpane::KvPane {
+        let settings = crate::settings::active();
+        crate::kvpane::KvPane::new(
+            crate::kvtree::build(self.store.kv_nodes()),
+            crate::kvgc::SweepPolicy::from_settings(&settings.kvcache),
+            // The same set the startup sweep is given. Without it the pane marks
+            // this launch's own chain `⏳ expired` and counts it as reclaimable
+            // whenever its `last_used` is stale, which is exactly the state a
+            // long-lived checkpoint is in.
+            self.active_kv_fingerprints(&self.kv_tiers()),
+            crate::kvmeta::now_secs(),
+        )
+    }
+
+    /// Builds the `/resume` picker over the saved-session listing.
+    ///
+    /// Errors are folded into an empty pane: the picker then says "no session
+    /// matches", which is the same thing an unreadable store means to someone
+    /// looking for something to resume.
+    fn resume_pane(&self) -> crate::resumepane::ResumePane {
+        let entries = self.store.list().unwrap_or_default();
+        let scope = std::env::current_dir()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        crate::resumepane::ResumePane::new(entries, now_secs()).with_scope(scope)
+    }
+
+    /// Re-derives the titles of every saved session, for `/retitle`.
+    ///
+    /// The picker titles rows from the transcript's first real user turn;
+    /// sessions saved before that rule existed are titled after the injected
+    /// agent-instructions block instead, and only a rewrite fixes those.
+    fn retitle_sessions(&self) -> String {
+        match self.store.retitle_all() {
+            Ok(changed) if changed.is_empty() => {
+                "retitle: every session title is current".to_owned()
+            }
+            Ok(changed) => format!("retitle: rewrote {} session titles", changed.len()),
+            Err(e) => format!("retitle failed: {e}"),
+        }
+    }
+
+    /// Preview text for one saved session: its last few turns, plain, for the
+    /// picker's expanded row. An unreadable session says so rather than
+    /// leaving the row stuck on "loading".
+    fn resume_preview(&self, id: &str) -> String {
+        match self.store.load(id) {
+            Ok(s) => {
+                let text =
+                    crate::session::render_history(&s.transcript, RESUME_PREVIEW_TURNS, false);
+                if text.trim().is_empty() {
+                    "(empty session)".to_owned()
+                } else {
+                    text
+                }
+            }
+            Err(e) => format!("preview failed: {e}"),
+        }
+    }
+
+    /// Makes a just-loaded session the live one: swaps it in, drops everything
+    /// scoped to the old session, and replays its history into the log.
+    ///
+    /// Shared by `/switch` and `/resume` (both the argument form and the
+    /// picker), so the three cannot drift on what "replace the session" clears.
+    fn adopt_session(&mut self, s: Session, log: &mut OutputLog, sub: &mut tui::SubPane) {
+        let note = self.load_session_payload(&s);
+        self.session = s;
+        self.broadcast_session_reset(Some(
+            "[session replaced — its history is on the local screen only]",
+        ));
+        self.last_ctx_used = 0;
+        self.checkpoints.clear();
+        self.usage = SessionUsage::default();
+        // Same reason as `/clear`: the pane is the old session's.
+        sub.reset();
+        self.replay_history_into_log(log);
+        if let Some(note) = note {
+            log.push_dim(note);
+        }
+    }
+
+    /// Every fingerprint this launch is using, across every engine it holds and
+    /// including the live session's payload.
+    ///
+    /// One definition, shared by the startup sweep and the `/kvcache` view, so
+    /// the pane cannot report a blob as expired that the sweep will keep.
+    fn active_kv_fingerprints(&self, tiers: &[crate::kvtier::TierSpec]) -> Vec<String> {
+        // Every tier of this launch's chain, not just Tier 1: one sweep now
+        // protects them all, where the two old GCs were per-tier.
+        let mut keep: Vec<String> = tiers.iter().map(|t| t.fingerprint.clone()).collect();
+        if let Some(alt) = self.alt_engines.get(&EngineKey::Local) {
+            keep.extend(
+                self.kv_tiers_for(&alt.model_name())
+                    .into_iter()
+                    .map(|t| t.fingerprint),
+            );
+        }
+        // The session in front of the user is live by definition, however long
+        // it has been since its payload was last loaded. Its node's fingerprint
+        // is the *payload* fingerprint, not the session id: pushing the id here
+        // matched nothing at all, so the payload survived only on recency.
+        keep.push(self.payload_fingerprint_for(&self.session));
+        keep
+    }
+
+    /// Sweeps the cache under the configured policy and reports what it freed.
+    ///
+    /// Given the same active set as the startup sweep and as the pane's own
+    /// verdicts, so `g` in the pane cannot delete a row the pane is showing as
+    /// live. Recency alone would not protect the live chain: a checkpoint that
+    /// has not been reloaded for a month is still the one in use.
+    #[must_use]
+    fn kvcache_sweep(&self) -> String {
+        let policy = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
+        let keep = self.active_kv_fingerprints(&self.kv_tiers());
+        let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let freed = self.store.sweep(&keep, &policy, crate::kvmeta::now_secs());
+        format!("kvcache: reclaimed {}", crate::kvpane::human_bytes(freed))
+    }
+
+    /// [`kvcache_mutate`](Self::kvcache_mutate) flattened to one printable
+    /// line, so both front ends report a failure the same way.
+    #[must_use]
+    fn kvcache_apply(&self, verb: &str, fp_prefix: &str) -> String {
+        self.resolve_kv_prefix(fp_prefix)
+            .and_then(|(idx, fp)| self.kvcache_mutate(verb, idx, &fp))
+            .unwrap_or_else(|e| format!("kvcache: {e}"))
+    }
+
+    /// [`kvcache_mutate`](Self::kvcache_mutate) on an already-resolved index,
+    /// flattened to one printable line. The pane's own path: its rows carry the
+    /// index and the fingerprint, so no prefix matching is involved.
+    #[must_use]
+    fn kvcache_apply_idx(&self, verb: &str, idx: usize, fp: &str) -> String {
+        self.kvcache_mutate(verb, idx, fp)
+            .unwrap_or_else(|e| format!("kvcache: {e}"))
+    }
+
+    /// Resolves a `/kvcache <verb> <fp-prefix>` argument to a scan index into
+    /// [`crate::session::SessionStore::kv_blob_nodes`], paired with the full
+    /// fingerprint found there so the mutation can re-check the identity.
+    ///
+    /// The REPL subcommands keep their fingerprint-prefix interface; only the
+    /// resolution changes, so both front ends act through one index-keyed code
+    /// path. Never guesses: a prefix matching nothing, or more than one blob, is
+    /// refused, because the caller may be about to unlink a file.
+    fn resolve_kv_prefix(&self, fp_prefix: &str) -> Result<(usize, String), String> {
+        if fp_prefix.is_empty() {
+            return Err("usage: /kvcache <pin|unpin|rm> <fingerprint>".to_owned());
+        }
+        let hits: Vec<(usize, String)> = self
+            .store
+            .kv_blob_nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| m.fingerprint.starts_with(fp_prefix))
+            .map(|(i, (_, m))| (i, m.fingerprint.clone()))
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(format!("no cache entry matching {fp_prefix:?}")),
+            _ => Err(format!(
+                "{fp_prefix:?} is ambiguous ({} matches)",
+                hits.len()
+            )),
+        }
+    }
+
+    /// Applies one `/kvcache` mutation to the blob at scan index `idx`,
+    /// returning the line to show. Shared by both front ends so `p`/`d` in the
+    /// pane and `/kvcache pin|rm` in the REPL cannot diverge.
+    ///
+    /// Keyed on the index rather than the fingerprint. A fingerprint does not
+    /// identify a file: a session sidecar records the *payload* fingerprint,
+    /// which never equals the `<id>` the body is named after, so looking the path
+    /// up by fingerprint failed on every session blob and, when a sidecar
+    /// fingerprint happened to equal another body's stem, acted on that other
+    /// file.
+    ///
+    /// `expect_fp` is the fingerprint the caller saw at `idx`, and the index is
+    /// only honoured if the blob there still carries it. An index is a position
+    /// in a scan, and `/kvcache` retakes the scan on every mutation: a blob
+    /// unlinked by a sibling plank, a sub-agent's `persist` or a startup sweep
+    /// between the pane being built and a `d` press shifts every later position
+    /// down one, so the same index would name a *different* body. Refusing is
+    /// the honest answer — the cache changed under the user, and the fix is to
+    /// reopen the pane, not to guess which row was meant.
+    ///
+    /// # Errors
+    /// Returns a message when the index names no blob, when the blob there is
+    /// not the one the caller saw, or when the unlink or sidecar write fails.
+    fn kvcache_mutate(&self, verb: &str, idx: usize, expect_fp: &str) -> Result<String, String> {
+        let scan = self.store.kv_blob_nodes();
+        let Some((path, meta)) = scan.get(idx) else {
+            return Err(format!("cache entry {idx} vanished from disk"));
+        };
+        if meta.fingerprint != expect_fp {
+            return Err(format!(
+                "the cache changed under you (entry {idx} is now {}, not {expect_fp}); reopen /kvcache",
+                meta.fingerprint
+            ));
+        }
+        match verb {
+            "rm" => {
+                // Last check before an irreversible unlink: the body must still
+                // be there, and a readable sidecar must still name the same
+                // blob. A sidecar-less body is fine — the scan's fingerprint is
+                // then synthesized from the file stem, which the check above
+                // already matched.
+                //
+                // This is defence in depth against a concurrent writer, layered
+                // on top of the index/fingerprint check above. It is NOT
+                // exercised by this module's unit test, and it cannot be: the
+                // scan above and this re-check both read the same sidecar in
+                // the same single-threaded call, so nothing can change between
+                // them without a real interleave from another process or
+                // thread. The unit test covers only the index/fingerprint
+                // guard; this one guards a race no single-threaded test can
+                // reach.
+                if !path.exists() {
+                    return Err(format!("{expect_fp} is already gone from disk"));
+                }
+                if let Some(fresh) = crate::kvmeta::load(path)
+                    && fresh.fingerprint != expect_fp
+                {
+                    return Err(format!(
+                        "{} was replaced by {} under you; reopen /kvcache",
+                        expect_fp, fresh.fingerprint
+                    ));
+                }
+                std::fs::remove_file(path).map_err(|e| e.to_string())?;
+                // The sidecar must go too: one left behind is a phantom node in
+                // every later scan.
+                let _ = std::fs::remove_file(crate::kvmeta::sidecar_path(path));
+                Ok(format!(
+                    "kvcache: removed {} ({})",
+                    meta.fingerprint,
+                    crate::kvpane::human_bytes(meta.bytes)
+                ))
+            }
+            verb @ ("pin" | "unpin") => {
+                // Read the sidecar fresh rather than rewriting the snapshot this
+                // scan produced: a concurrent `kv_load` may have bumped `hits`
+                // and `last_used` in between, and writing the stale copy back
+                // would silently revert it.
+                let mut m = crate::kvmeta::load(path).unwrap_or_else(|| meta.clone());
+                m.pinned = verb == "pin";
+                crate::kvmeta::store(path, &m).map_err(|e| e.to_string())?;
+                Ok(format!("kvcache: {verb}ned {}", m.fingerprint))
+            }
+            other => Err(format!("unknown action {other:?}")),
+        }
     }
 
     /// Parses a `/notify [on|off]` argument and applies it; returns the
@@ -3910,7 +4681,7 @@ the original is frozen and listed in /tree"
         } else {
             format!("tag set: {tag}")
         };
-        if !self.session.id.is_empty() {
+        if self.session.is_persisted() {
             self.save_session().map_err(|e| e.to_string())?;
             msg.push_str(" (saved)");
         }
@@ -4078,18 +4849,19 @@ the original is frozen and listed in /tree"
         // read as "abandon the render too".
         crate::interrupt::clear();
         tick("writing the report…".to_owned());
-        let Some(html) = insights::render_html_cancellable(&agg, &narrative, tz, &|| {
-            crate::interrupt::pending()
-        }) else {
+        let at = insights::now_secs();
+        let cancel = crate::interrupt::pending;
+        let Some(html) = insights::render_html_cancellable(&agg, &narrative, tz, at, &cancel)
+        else {
             // Stopped mid-render: nothing is written, so the report the user
             // already had is still on disk, whole.
             crate::interrupt::clear();
             return Ok(Insights::Cancelled);
         };
-        let path = insights::write_report(&root, &html)?;
+        let path = insights::write_report(&root, &html, tz, at)?;
         Ok(Insights::Done {
             path,
-            summary: insights::render_summary(&agg, &narrative, tz),
+            summary: insights::render_summary(&agg, &narrative, tz, at),
         })
     }
 
@@ -4102,6 +4874,50 @@ the original is frozen and listed in /tree"
     fn save_session(&mut self) -> crate::session::Result<String> {
         self.session.cwd = self.tool_ctx.cwd.to_string_lossy().into_owned();
         self.store.save(&mut self.session)
+    }
+
+    /// Renames the live session: the name every later save writes under, on
+    /// disk and in the UI.
+    ///
+    /// Nothing already written is touched. A session saved before the rename
+    /// stays on disk under its old name, so the next save is a logical copy
+    /// rather than a move — which is the point: the old name remains resumable.
+    /// The session is marked dirty so the copy actually gets written, even if
+    /// the rename is the only thing that happened this run.
+    ///
+    /// A name already on disk is not refused: the next save would replace that
+    /// transcript, so `confirm` is asked first and a "no" leaves the session as
+    /// it was. A front end with nothing to ask with (headless) passes a
+    /// confirmer that declines.
+    fn rename_session(
+        &mut self,
+        arg: &str,
+        confirm: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String, String> {
+        use std::fmt::Write as _;
+        let name = crate::session::validate_name(arg)?;
+        let old = self.session.id.clone();
+        if name == old {
+            return Ok(format!("already named {name}"));
+        }
+        if self.store.path_for_id(name).exists()
+            && !confirm(&format!(
+                "a session named {name} is already saved — the next save will overwrite it"
+            ))
+        {
+            return Err("rename cancelled".to_owned());
+        }
+        name.clone_into(&mut self.session.id);
+        self.session.dirty = true;
+        let mut msg = format!("renamed to {name}");
+        if self.store.path_for_id(&old).exists() {
+            let _ = write!(
+                msg,
+                " (the saved {} is left as it was)",
+                crate::session::display_id(&old)
+            );
+        }
+        Ok(msg)
     }
 
     /// Saves the session at exit and returns `(id, path)` so the caller can
@@ -4171,6 +4987,7 @@ the original is frozen and listed in /tree"
             fmt_u64(s.input_tokens),
             fmt_u64(s.output_tokens),
         );
+        self.report_peak_speeds(bold, dim, reset);
         // Only when more than one engine served: with a single one the rows
         // would just repeat the totals a line lower.
         if s.by_engine.len() < 2 {
@@ -4187,11 +5004,47 @@ the original is frozen and listed in /tree"
         }
     }
 
+    /// Prints the peak prefill and generation rates this session reached.
+    ///
+    /// Session-scoped: nothing is stored, so there is no cross-run "best" to
+    /// compare against — a peak from another day was a different engine build
+    /// on a cooler machine.
+    ///
+    /// Silent for engines that never reported a rate — the echo stub, and
+    /// online providers, whose throughput is someone else's network — so a
+    /// provider-only session's exit message is unchanged.
+    fn report_peak_speeds(&self, bold: &str, dim: &str, reset: &str) {
+        let model = self.engine.model_name();
+        let best = crate::speeds::session_best(&model);
+        if best.is_empty() {
+            return;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if best.prefill_tps > 0.0 {
+            parts.push(format!(
+                "prefill {bold}{:.1}{reset} tok/s",
+                best.prefill_tps
+            ));
+        }
+        if best.gen_tps > 0.0 {
+            parts.push(format!("generation {bold}{:.1}{reset} tok/s", best.gen_tps));
+        }
+        if parts.is_empty() {
+            return;
+        }
+        println!(
+            "{dim}peak{reset} {model}  {}",
+            parts.join(&format!("  {dim}·{reset}  ")),
+        );
+    }
+
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
     /// plus the runtime knobs that shape generation — to `~/.plank/repro/`.
-    /// `note` is an optional free-text description of the bug. Read-only: the
-    /// live session is untouched.
-    fn write_repro(&self, note: &str) -> Result<std::path::PathBuf, String> {
+    /// `note` is an optional free-text description of the bug. Read-only as far
+    /// as the live session goes; the only state it touches is the last-edited
+    /// pointer, so a bare `/open` opens the dump that was just generated (the
+    /// file the user most likely wants to read or annotate next).
+    fn write_repro(&mut self, note: &str) -> Result<std::path::PathBuf, String> {
         let rendered = render_transcript(&self.session, &self.system);
         let version = crate::logo::version_label();
         let date = crate::context::current_local_iso_date();
@@ -4208,7 +5061,11 @@ the original is frozen and listed in /tree"
             note: note.trim(),
         };
         let report = crate::repro::build_report(&meta, self.cfg, &rendered);
-        crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)
+        let path = crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)?;
+        // `repro::save` builds its path from `$HOME` (or the already-absolute
+        // cwd), so unlike `openfile::note_edited` there is nothing to resolve.
+        self.last_edited = Some(path.clone());
+        Ok(path)
     }
 
     /// Writes a `/export` transcript dump (issue #66). `arg` is
@@ -4337,6 +5194,7 @@ the original is frozen and listed in /tree"
                         engine,
                         session,
                         label: label.clone(),
+                        task: task.clone(),
                         output: String::new(),
                         pending_calls: Vec::new(),
                         done: false,
@@ -4369,6 +5227,15 @@ the original is frozen and listed in /tree"
         self.emit_sub(crate::worker::UiEvent::Dim(crate::tui::subagents_signpost(
             &labels,
         )));
+        // Open every roster row before the rounds start, not at flush time: the
+        // fan-out buffers its output (see `flush_fanout_panes`), so rows created
+        // only at the flush would all report having taken no time at all.
+        for slot in &slots {
+            self.emit_sub(crate::worker::UiEvent::SubStart {
+                label: slot.label.clone(),
+                task: slot.task.clone(),
+            });
+        }
         self.tool_ctx.subagent_depth += 1;
         self.run_fanout_rounds(&mut slots, width);
         self.tool_ctx.subagent_depth -= 1;
@@ -4456,29 +5323,7 @@ the original is frozen and listed in /tree"
                         slot.done = true;
                     }
                     Ok(pass) => {
-                        // A fan-out slot runs on its own engine, so its tokens
-                        // belong in that engine's row rather than the main
-                        // agent's — and they were never counted at all before
-                        // the breakdown made their absence visible. The usage
-                        // block is the only valid source here: the local
-                        // ctx-delta estimate is keyed to `self.last_ctx_used`,
-                        // which describes the main engine's context, not this
-                        // slot's. Fan-out is provider-only by construction, so
-                        // there is nothing to fall back to.
-                        if let Some(u) = pass.stats.usage {
-                            self.stats.add(
-                                &engine_stats_label(&*slot.engine),
-                                u64::try_from(
-                                    i64::from(u.input_tokens)
-                                        + i64::from(u.cache_read_tokens)
-                                        + i64::from(u.cache_write_tokens),
-                                )
-                                .unwrap_or(0),
-                                u64::try_from(u.output_tokens).unwrap_or(0),
-                            );
-                            self.usage.total.add(u);
-                            self.usage.turns += 1;
-                        }
+                        self.fold_fanout_usage(slot, pass.stats.usage);
                         slot.session.push(Message::assistant(pass.assistant_text));
                         if last_round {
                             slot.done = true;
@@ -4531,6 +5376,40 @@ the original is frozen and listed in /tree"
         }
     }
 
+    /// Folds one fan-out pass's token usage in: into the session breakdown under
+    /// the slot's own engine, into the billed total, and into the slot's roster
+    /// row.
+    ///
+    /// A fan-out slot runs on its own engine, so its tokens belong in that
+    /// engine's row rather than the main agent's — and they were never counted at
+    /// all before the breakdown made their absence visible. The usage block is
+    /// the only valid source here: the local ctx-delta estimate is keyed to
+    /// `self.last_ctx_used`, which describes the main engine's context, not this
+    /// slot's. Fan-out is provider-only by construction, so there is nothing to
+    /// fall back to when `usage` is absent.
+    fn fold_fanout_usage(&mut self, slot: &FanoutSlot, usage: Option<crate::engine::TokenUsage>) {
+        let Some(u) = usage else { return };
+        self.stats.add(
+            &engine_stats_label(&*slot.engine),
+            u64::try_from(
+                i64::from(u.input_tokens)
+                    + i64::from(u.cache_read_tokens)
+                    + i64::from(u.cache_write_tokens),
+            )
+            .unwrap_or(0),
+            u64::try_from(u.output_tokens).unwrap_or(0),
+        );
+        self.usage.total.add(u);
+        self.usage.turns += 1;
+        // Credit the slot's own roster row. Several are open at once here, so
+        // the row has to be named rather than left to "the current run".
+        self.emit_sub(crate::worker::UiEvent::SubTokens {
+            label: Some(slot.label.clone()),
+            prefill: u64::try_from(i64::from(u.input_tokens)).unwrap_or(0),
+            generated: u64::try_from(i64::from(u.output_tokens)).unwrap_or(0),
+        });
+    }
+
     /// Appends each slot's buffered output to the sub-agent pane as one labelled
     /// block, in call order.
     ///
@@ -4539,7 +5418,10 @@ the original is frozen and listed in /tree"
     /// and flushes; the serial path still streams live.
     fn flush_fanout_panes(&mut self, slots: &[FanoutSlot]) {
         for slot in slots {
-            self.emit_sub(crate::worker::UiEvent::SubStart(slot.label.clone()));
+            self.emit_sub(crate::worker::UiEvent::SubStart {
+                label: slot.label.clone(),
+                task: slot.task.clone(),
+            });
             if !slot.output.trim().is_empty() {
                 self.emit_sub(crate::worker::UiEvent::Sub(Box::new(
                     crate::worker::UiEvent::Visible(slot.output.clone()),
@@ -4839,6 +5721,254 @@ the original is frozen and listed in /tree"
         Some(crate::skills::render(skill, arg))
     }
 
+    /// `/frame [id]`: lists openable frame components, or asks for one to be
+    /// opened.
+    ///
+    /// Opening is a *request*, not an action: the frame is owned by the TUI
+    /// event loop, which picks this up on its next tick. That keeps the
+    /// component's lifetime in one place instead of split between the slash
+    /// handler and the loop.
+    fn frame_command(&mut self, arg: &str) -> String {
+        use std::fmt::Write as _;
+
+        // `/frame <id> [face]`: the tail selects which frame a component that
+        // offers several should open.
+        let (id, face) = arg
+            .trim()
+            .split_once(char::is_whitespace)
+            .unwrap_or((arg.trim(), ""));
+        let openable: Vec<(String, String)> = self
+            .tool_ctx
+            .wasm
+            .openable_frames()
+            .into_iter()
+            .map(|(id, plugin)| (id.to_string(), plugin.to_string()))
+            .collect();
+        if openable.is_empty() {
+            return "no wasm frame components are loaded\n".to_string();
+        }
+        if id.is_empty() {
+            let mut out = String::from("openable frames:\n");
+            for (id, plugin) in &openable {
+                let _ = writeln!(out, "  {id} ({plugin})");
+            }
+            out.push_str("open one with: /frame <id>\n");
+            return out;
+        }
+        if !openable.iter().any(|(known, _)| known == id) {
+            return format!("no openable wasm frame '{id}'\n");
+        }
+        self.tool_ctx.wasm.pending_open = Some((id.to_string(), face.to_string()));
+        String::new()
+    }
+
+    /// `/plugins` and its one subcommand, shared by both front ends so the
+    /// plain REPL and the TUI cannot drift.
+    ///
+    /// Bare `/plugins` lists; `/plugins trust <id>` approves a held WASM
+    /// component and loads it immediately. Approval is a deliberate, typed act
+    /// rather than a startup prompt: a modal question before the first turn is
+    /// exactly the wrong moment to ask, and a component the user never uses
+    /// should never have to be answered for at all.
+    /// `/plugins info|disable|enable|reload`: the subcommands that read or
+    /// write the trust store.
+    ///
+    /// Split from [`plugins_command`](Self::plugins_command) because they share
+    /// the home lookup and the store load, and because together they pushed
+    /// that function past the length lint.
+    fn plugins_trust_command(&mut self, verb: &str, arg: Option<&str>) -> String {
+        if verb == "reload" {
+            // Refused rather than half-implemented. A `tool` component's
+            // schemas are in the fingerprinted system prompt, so reloading one
+            // mid-session changes the prompt and invalidates the Tier 1 KV
+            // checkpoint; a reload that silently skipped tool components would
+            // be a command that works differently depending on what the plugin
+            // happens to contribute.
+            return "reload is not supported: a tool component's schemas are part of the \
+                    fingerprinted system prompt, so replacing them mid-session would \
+                    invalidate the KV checkpoint\nrestart plank to pick up changed \
+                    components\n"
+                .to_string();
+        }
+        let Some(id) = arg else {
+            return format!("usage: /plugins {verb} <component-id>\n");
+        };
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return "no HOME, so there is no trust store\n".to_string();
+        };
+        let plank_home = home.join(".plank");
+        if verb == "info" {
+            let trust = crate::wasmreg::TrustStore::load(&plank_home);
+            return match self.tool_ctx.wasm.registry.describe(id, &trust) {
+                Some(text) => text,
+                None => format!("no wasm component '{id}'\n"),
+            };
+        }
+        let off = verb == "disable";
+        let mut trust = crate::wasmreg::TrustStore::load(&plank_home);
+        match trust.set_disabled(id, off) {
+            // Deliberately effective next start rather than now: unloading a
+            // live component would take its tools out of the system prompt
+            // mid-session, which invalidates the Tier 1 KV checkpoint — the
+            // same reason `reload` refuses above.
+            Ok(()) => format!(
+                "{} '{id}'; it takes effect on the next start\n",
+                if off { "disabled" } else { "enabled" }
+            ),
+            Err(e) => format!("{e}\n"),
+        }
+    }
+
+    fn plugins_command(&mut self, arg: &str) -> String {
+        let mut words = arg.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("install"), Some(path)) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so there is nowhere to install to\n".to_string();
+                };
+                let src = std::path::PathBuf::from(path);
+                // A URL downloads and extracts first; both routes converge on
+                // the same local install, so the overwrite refusal and the
+                // first-load trust prompt are identical either way.
+                let installed = if path.starts_with("http://") || path.starts_with("https://") {
+                    crate::plugins::install_from_url(path, &home)
+                } else {
+                    crate::plugins::install(&src, &home)
+                };
+                match installed {
+                    Ok(dest) => format!(
+                        "installed to {}\nit is loaded on the next start; a wasm component \
+                         also needs /plugins trust <id>\n",
+                        dest.display()
+                    ),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("install"), None) => "usage: /plugins install <directory|url>\n\
+                 a url must be a .tar.gz over https (or http to loopback)\n"
+                .to_string(),
+            (Some("remove"), Some(name)) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so nothing is installed\n".to_string();
+                };
+                match crate::plugins::uninstall(name, &home) {
+                    // The trust entry is deliberately left behind: it is keyed
+                    // by the component's hash, so reinstalling the same bytes
+                    // is the same component and does not need re-approving,
+                    // while different bytes re-prompt as they always would.
+                    Ok(dir) => format!(
+                        "removed {}\nthis session keeps what it already loaded; it is gone \
+                         on the next start\n",
+                        dir.display()
+                    ),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("remove"), None) => "usage: /plugins remove <name>\n".to_string(),
+            (Some("trust"), Some(id)) => {
+                // The session already knows the home it was built with; asking
+                // the environment again here is how the two would drift.
+                let project = self.tool_ctx.cwd.clone();
+                match self.tool_ctx.wasm.approve(id, &project) {
+                    Ok(name) => format!("approved and loaded wasm component '{name}'\n"),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("trust"), None) => "usage: /plugins trust <component-id>\n".to_string(),
+            // A publisher key is accepted once and then applies to everything
+            // it signs, which is the point of having one: without this there is
+            // no way to get a key into the store, and a signature can only ever
+            // read as "signed by someone unknown".
+            (Some("publisher"), Some(arg)) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so there is nowhere to record a publisher\n".to_string();
+                };
+                // A path or the base64 line itself: `minisign -G` prints the
+                // line for pasting, and a key file is what it writes.
+                let text = std::fs::read_to_string(arg).unwrap_or_else(|_| arg.to_string());
+                match crate::wasmsig::PublicKey::parse(&text) {
+                    Ok(key) => {
+                        let encoded = text
+                            .lines()
+                            .map(str::trim)
+                            .rfind(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
+                            .unwrap_or("")
+                            .to_string();
+                        let mut trust = crate::wasmreg::TrustStore::load(&home.join(".plank"));
+                        match trust.add_publisher(&key, &encoded) {
+                            Ok(()) => format!(
+                                "trusting publisher {}\nsigned updates from it will not re-prompt; \
+                                 capability changes still will\n",
+                                key.key_id_hex()
+                            ),
+                            Err(e) => format!("cannot record the publisher: {e}\n"),
+                        }
+                    }
+                    Err(e) => format!("not a minisign public key: {e}\n"),
+                }
+            }
+            (Some("publisher"), None) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so no publishers are recorded\n".to_string();
+                };
+                let trust = crate::wasmreg::TrustStore::load(&home.join(".plank"));
+                if trust.publishers().is_empty() {
+                    "no trusted publishers\nusage: /plugins publisher <key-file|base64-key>\n"
+                        .to_string()
+                } else {
+                    let mut out = String::from("trusted publishers:\n");
+                    for id in trust.publishers().keys() {
+                        out.push_str("  ");
+                        out.push_str(id);
+                        out.push('\n');
+                    }
+                    out
+                }
+            }
+            // The trust-store subcommands live in their own function: they
+            // share a home-directory lookup and a store load, and together they
+            // pushed `plugins_command` past the function-length lint.
+            (Some(verb @ ("info" | "disable" | "enable" | "reload")), rest) => {
+                self.plugins_trust_command(verb, rest)
+            }
+            (Some(other), _) => format!("unknown /plugins subcommand: {other}\n"),
+            (None, _) => {
+                let mut out = crate::plugins::render_list(&self.tool_ctx.plugins);
+                out.push_str(&crate::wasmreg::render_held(&self.tool_ctx.wasm.registry));
+                out
+            }
+        }
+    }
+
+    /// Resolves `/name args` against this session's WASM `command` components.
+    ///
+    /// Tried only after skills and templates, so a component can never shadow
+    /// a built-in or a user's own extension — the same precedence the slash
+    /// menu shows. `None` means no component owns the name.
+    fn wasm_command(
+        &mut self,
+        cmd: &str,
+        arg: &str,
+    ) -> Option<Result<crate::wasmreg::CmdOutput, String>> {
+        let name = cmd.strip_prefix('/')?;
+        // Either spelling: `/arcade:matrix` always, `/matrix` when the bare
+        // name was not already claimed by a built-in, a skill or a template.
+        if !self
+            .tool_ctx
+            .wasm
+            .registry
+            .commands()
+            .iter()
+            .any(|(_, c)| c.alias == name || c.name == name)
+        {
+            return None;
+        }
+        // Split borrow: the registry drives the call and the host executes it,
+        // and they live in the same struct.
+        let wasm = &mut self.tool_ctx.wasm;
+        Some(wasm.registry.run_command(&mut *wasm.host, name, arg))
+    }
+
     /// Resolves an unrecognized `/name args` against the user's extensions:
     /// skills first, then prompt templates (issue #67). `None` means no
     /// match — the caller reports an unknown command; `Some(Err)` is a
@@ -4929,20 +6059,21 @@ impl TuiInput {
             stash: String::new(),
             popup: None,
             slash: None,
-            slash_catalog: crate::slashmenu::catalog(&[], &[]),
+            slash_catalog: crate::slashmenu::catalog(&[], &[], &[]),
             worker: None,
             mcp_extra: Vec::new(),
         }
     }
 
-    /// Replaces the `/` menu's candidate list, folding this session's skills
-    /// and templates in beside the built-ins.
+    /// Replaces the `/` menu's candidate list, folding this session's skills,
+    /// templates and WASM commands in beside the built-ins.
     fn set_slash_catalog(
         &mut self,
         skills: &[crate::skills::Skill],
         templates: &[crate::templates::Template],
+        wasm: &[(&str, &crate::wasmreg::CommandSpec)],
     ) {
-        self.slash_catalog = crate::slashmenu::catalog(skills, templates);
+        self.slash_catalog = crate::slashmenu::catalog(skills, templates, wasm);
     }
 
     /// The prompt as the renderer needs it: text, cursor, and selection, all
@@ -5511,7 +6642,11 @@ impl Agent<'_> {
         let rem = ui_remote.as_deref();
         let mut input = TuiInput::new();
         input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
-        input.set_slash_catalog(&self.skills, &self.templates);
+        input.set_slash_catalog(
+            &self.skills,
+            &self.templates,
+            &self.tool_ctx.wasm.registry.commands(),
+        );
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
 
@@ -5548,6 +6683,11 @@ impl Agent<'_> {
         // arrive.
         let mut arcade = crate::arcade::Arcade::new();
         let mut arcade_last = Instant::now();
+        // An open WASM frame, and its own frame clock. Kept beside the arcade
+        // rather than inside it: a component is not a face the arcade knows
+        // about, and folding it in would mean `Arcade` holding a registry.
+        let mut wasm_frame: Option<crate::wasmreg::OpenFrame> = None;
+        let mut wasm_frame_last = Instant::now();
         // When the user was last heard from, for `ui.screensaver`. Only real
         // input counts: a poll that times out is exactly the idleness the
         // screensaver is waiting for. A running turn never reaches this loop,
@@ -5582,6 +6722,12 @@ impl Agent<'_> {
         // The interactive `/config` modal, when open; it intercepts all keys
         // and renders over the frame until Esc (save) or q/Ctrl-C (cancel).
         let mut config_form: Option<crate::configform::ConfigForm> = None;
+        // The `/kvcache` lineage pane, when open; like `/config` it intercepts
+        // all keys and renders over the frame until Esc/q/Ctrl-C closes it.
+        let mut kv_pane: Option<crate::kvpane::KvPane> = None;
+        // The `/resume` session picker, when open; it owns every key until it
+        // resumes a session or is cancelled.
+        let mut resume_pane: Option<crate::resumepane::ResumePane> = None;
         // Images pasted (clipboard or file path) awaiting the next submit;
         // attached to the message as file references the model's tools can
         // read. Always empty while IMAGES_ENABLED is off.
@@ -5608,9 +6754,68 @@ impl Agent<'_> {
                 arcade_last = Instant::now();
                 arcade.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
             }
+            // A `/frame <id>` from the last tick's slash handling.
+            // Two ways in: a `/frame` the user typed, or a component's own
+            // command asking to open its frame — which is how one module
+            // holding many faces gives each of them a command.
+            let pending = self
+                .tool_ctx
+                .wasm
+                .pending_open
+                .take()
+                .or_else(|| self.tool_ctx.wasm.registry.take_pending_frame());
+            if let Some((id, face)) = pending {
+                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
+                match self.tool_ctx.wasm.open_frame(
+                    &id,
+                    &face,
+                    w,
+                    h.saturating_sub(1),
+                    arcade_seed(),
+                ) {
+                    Ok(open) => {
+                        wasm_frame = Some(open);
+                        wasm_frame_last = Instant::now();
+                        // The component owns the pointer while it is up, for
+                        // the same reason the arcade does.
+                        arcade_hover_reporting(true);
+                    }
+                    Err(e) => log.push_dim(e),
+                }
+            }
+            if let Some(open) = wasm_frame.as_mut() {
+                let dt = wasm_frame_last.elapsed();
+                wasm_frame_last = Instant::now();
+                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
+                let now_ms = u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis()),
+                )
+                .unwrap_or(0);
+                let dt_ms = u64::try_from(dt.as_millis()).unwrap_or(u64::MAX);
+                // A step that fails closes the frame and says why: a
+                // full-screen component that can no longer say what to draw
+                // would otherwise sit there looking like a hang.
+                if let Err(e) =
+                    self.tool_ctx
+                        .wasm
+                        .step_frame(open, dt_ms, w, h.saturating_sub(1), now_ms)
+                {
+                    log.push_dim(e);
+                    wasm_frame = None;
+                    arcade_hover_reporting(false);
+                }
+            }
             input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
             input.pump_popup();
-            let mut status = self.idle_status_text();
+            // Republished per tick, like the status text: `/new`, `/switch` and
+            // `/resume` all change the name under the loop's feet.
+            tui::set_session_name(&self.session.id);
+            // Width-aware so a contributed cell cannot push the built-in
+            // segments off the line; see `build_status_text_within`.
+            let cols = terminal.size().map_or(80, |s| s.width) as usize;
+            let mut status = self.idle_status_text(cols);
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
             }
@@ -5619,22 +6824,25 @@ impl Agent<'_> {
             // closure: a Ctrl-O pressed while idle has to be visible here too.
             let sub_active = sub_pane.active;
             // Owned so the draw closure does not hold a borrow of `sub_pane`
-            // alongside the mutable borrow of its view.
+            // alongside the mutable borrow of its view. The roster is snapshotted
+            // for the same reason.
             let sub_title: Option<String> = if sub_active {
-                sub_pane.label.clone()
+                sub_pane.label().map(str::to_owned)
             } else {
                 None
             };
-            let idle_status = if let (true, Some(label)) = (sub_active, sub_pane.label.as_deref()) {
-                format!("[sub-agent: {label}] {status}")
-            } else {
-                status
+            let idle_status = match sub_title.as_deref() {
+                Some(label) => format!("[sub-agent: {label}] {status}"),
+                None => status,
             };
-            let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) = if sub_active {
-                (&sub_pane.log, &mut sub_pane.view)
-            } else {
-                (&log, &mut view)
-            };
+            let roster = sub_pane.roster_view(tui::roster_clock_ms());
+            let roster_rows = roster.height();
+            let selected_row = sub_pane.cursor.checked_sub(1).filter(|_| sub_active);
+            let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
+                match selected_row.and_then(|i| sub_pane.runs.get_mut(i)) {
+                    Some(run) => (&run.log, &mut run.view),
+                    None => (&log, &mut view),
+                };
             let completed = terminal
                 .draw(|f| {
                     // A `/btw` panel left open from an earlier turn keeps the
@@ -5651,6 +6859,7 @@ impl Agent<'_> {
                             &idle_status,
                             draw_view,
                             &task_view,
+                            &roster,
                         );
                     } else {
                         tui::draw(
@@ -5662,20 +6871,33 @@ impl Agent<'_> {
                             selection,
                             &task_view,
                             sub_title.as_deref(),
+                            &roster,
                         );
                     }
                     if let Some(m) = &input.slash {
-                        tui::draw_slash_menu(f, input.buf.text(), m);
+                        tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
                     }
                     if let Some(p) = &input.popup {
-                        tui::draw_popup(f, input.buf.text(), p);
+                        tui::draw_popup(f, input.buf.text(), p, roster_rows);
                     }
                     if let Some(form) = &config_form {
                         tui::draw_config(f, form);
                     }
+                    if let Some(pane) = &kv_pane {
+                        tui::draw_kvcache(f, pane);
+                    }
+                    if let Some(pane) = &resume_pane {
+                        tui::draw_resume(f, pane);
+                    }
                     // Drawn last: the arcade covers the whole frame.
                     if arcade.is_open() {
                         tui::draw_arcade(f, &arcade);
+                    }
+                    // And a WASM frame covers it in turn — the two are never
+                    // open at once, but ordering them makes that a fact about
+                    // the code rather than an assumption about the callers.
+                    if let Some(open) = &wasm_frame {
+                        tui::draw_wasm_frame(f, open);
                     }
                     remote_capture(rem, f);
                 })
@@ -5694,18 +6916,69 @@ impl Agent<'_> {
             // modal is on screen — a screensaver over a dialog would hide a
             // question the user still has to answer.
             if !arcade.is_open()
+                && wasm_frame.is_none()
                 && config_form.is_none()
+                && kv_pane.is_none()
+                && resume_pane.is_none()
                 && let Some(after) = crate::settings::active().ui.screensaver.duration()
                 && last_activity.elapsed() >= after
             {
                 let (w, h) = terminal
                     .size()
                     .map_or((80, 23), |sz| (sz.width, sz.height.saturating_sub(1)));
-                arcade.open_screensaver(arcade_seed(), w, h);
+                // Three cases, in the order a user would expect them to win:
+                // a pinned plugin face, a pinned built-in face, and only then
+                // the random rotation — which is the one place installed
+                // screensavers mix with the faces plank ships.
+                //
+                // The rotation weighs *faces*, not plugins: a component
+                // offering three does not get a third of the rain's share.
+                let seed = arcade_seed();
+                let settings = crate::settings::active();
+                let pinned = settings
+                    .ui
+                    .screensaver_face_plugin
+                    .as_deref()
+                    .and_then(|addr| self.tool_ctx.wasm.resolve_screensaver_face(addr));
+                let chosen = match pinned {
+                    Some(face) => Some(face),
+                    None if settings.ui.screensaver_face
+                        == crate::arcade::ScreensaverFace::Random =>
+                    {
+                        self.tool_ctx
+                            .wasm
+                            .pick_idle_face(seed, crate::arcade::ScreensaverFace::BUILT_IN)
+                    }
+                    // A pinned built-in face: not a rotation, and not this
+                    // code's business.
+                    None => None,
+                };
+                if let Some((id, face)) = chosen {
+                    match self.tool_ctx.wasm.open_frame(&id, &face, w, h, seed) {
+                        Ok(mut open) => {
+                            open.screensaver = true;
+                            wasm_frame = Some(open);
+                            wasm_frame_last = Instant::now();
+                            arcade_hover_reporting(true);
+                            continue;
+                        }
+                        // A component that will not open must not cost the
+                        // user their screensaver: fall through to a face.
+                        Err(e) => log.push_dim(e),
+                    }
+                }
+                arcade.open_screensaver(arcade_seed());
                 arcade_last = Instant::now();
             }
 
-            let poll = if arcade.is_open() {
+            // An open easter egg *or* an open WASM frame wants the shared
+            // animation tick; the idle 200 ms poll renders either at five
+            // frames a second. Worse than the visible stutter: the frame delta
+            // is measured from real elapsed time and then clamped to
+            // `MAX_STEP_MS`, so at that rate half of every second is simply
+            // dropped from the simulation and the motion runs slow as well as
+            // rough.
+            let poll = if arcade.is_open() || wasm_frame.is_some() {
                 Duration::from_millis(crate::anim::TICK_MS)
             } else {
                 Duration::from_millis(200)
@@ -5731,12 +7004,22 @@ impl Agent<'_> {
                                 &mut input,
                                 &mut btw_panel,
                                 &mut config_form,
+                                &mut kv_pane,
+                                &mut resume_pane,
                                 &mut arcade,
                                 &mut sub_pane,
                             ) {
                                 input.history.save(&hist_path).ok();
                                 remote_abandon(rem);
                                 return Ok(crt_frame);
+                            }
+                            // `/goal` arms a loop instead of running one: it
+                            // cannot start a turn from inside `tui_slash`, which
+                            // has no terminal handles of its own. `self.goal` is
+                            // `None` at every prompt, so this means exactly
+                            // "`/goal` just started one".
+                            if self.goal.is_some() {
+                                run = true;
                             }
                         } else {
                             r.bus.broadcast(UiEvent::UserEcho(line.clone()));
@@ -5780,6 +7063,49 @@ impl Agent<'_> {
             // button the user could not see.
             if arcade.is_screensaver() && from_user {
                 arcade.close();
+                continue;
+            }
+            // Same rule for a component the idle rotation put up: any activity
+            // dismisses it, and the waking event is consumed rather than acted
+            // on. A component opened by `/frame` is *not* dismissed here — the
+            // user asked for that one and owns when it closes.
+            if wasm_frame.as_ref().is_some_and(|f| f.screensaver) && from_user {
+                if let Some(open) = &wasm_frame
+                    && let Some(line) = self.tool_ctx.wasm.close_frame(open)
+                {
+                    log.push_dim(line);
+                }
+                wasm_frame = None;
+                arcade_hover_reporting(false);
+                continue;
+            }
+            // An open WASM frame takes the mouse on the same terms as the
+            // arcade below it: the host already turns on mouse reporting when a
+            // frame opens, so without this branch every event it asked for was
+            // delivered and dropped.
+            if wasm_frame.is_some() && !matches!(ev, Event::Key(_)) {
+                if let (Event::Mouse(m), Some(open)) = (&ev, wasm_frame.as_ref()) {
+                    let (w, h) = terminal
+                        .size()
+                        .map_or((80, 23), |s| (s.width, s.height.saturating_sub(1)));
+                    if let Some(mouse) = tui::frame_mouse_event(m, w, h) {
+                        match self.tool_ctx.wasm.frame_mouse(open, &mouse) {
+                            Ok(crate::wasmreg::FrameOutcome::Stay) => {}
+                            Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
+                                if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
+                                    log.push_dim(line);
+                                }
+                                wasm_frame = None;
+                                arcade_hover_reporting(false);
+                            }
+                            Err(e) => {
+                                log.push_dim(e);
+                                wasm_frame = None;
+                                arcade_hover_reporting(false);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             // An open easter egg takes the mouse (wheel, click and drag steer
@@ -5939,6 +7265,27 @@ impl Agent<'_> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // An open component owns every key, on the same terms as the
+            // arcade below it.
+            if let Some(open) = &wasm_frame {
+                let code = tui::key_code_name(key);
+                match self.tool_ctx.wasm.frame_key(open, &code) {
+                    Ok(crate::wasmreg::FrameOutcome::Stay) => {}
+                    Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
+                        if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
+                            log.push_dim(line);
+                        }
+                        wasm_frame = None;
+                        arcade_hover_reporting(false);
+                    }
+                    Err(e) => {
+                        log.push_dim(e);
+                        wasm_frame = None;
+                        arcade_hover_reporting(false);
+                    }
+                }
+                continue;
+            }
             // An open easter egg owns every key until Esc/q/Ctrl-C closes it.
             if arcade.is_open() {
                 if let crate::arcade::Outcome::Close(line) = arcade.handle_key(key) {
@@ -5973,6 +7320,83 @@ impl Agent<'_> {
                 }
                 continue;
             }
+            // The `/kvcache` pane, when open, owns every key until it closes.
+            if let Some(pane) = kv_pane.as_mut() {
+                match pane.handle_key(key) {
+                    crate::kvpane::Outcome::Stay => {}
+                    crate::kvpane::Outcome::Close => kv_pane = None,
+                    // Pin and unpin only rewrite a sidecar's `pinned` flag, and
+                    // the pane already flipped its own copy for the display.
+                    // Rebuilding here would throw away the user's folds and
+                    // cursor; the expired markers and the footer's reclaimable
+                    // figure used to go stale as a result, so the pane now
+                    // re-derives both from its effective pin state on every
+                    // draw instead.
+                    crate::kvpane::Outcome::Pin(idx, fp) => {
+                        log.push_dim(self.kvcache_apply_idx("pin", idx, &fp));
+                    }
+                    crate::kvpane::Outcome::Unpin(idx, fp) => {
+                        log.push_dim(self.kvcache_apply_idx("unpin", idx, &fp));
+                    }
+                    // These two change what is on disk, so the pane has to be
+                    // rebuilt or it would keep offering rows that are gone.
+                    crate::kvpane::Outcome::Delete(idx, fp) => {
+                        log.push_dim(self.kvcache_apply_idx("rm", idx, &fp));
+                        kv_pane = Some(self.kvcache_pane());
+                    }
+                    crate::kvpane::Outcome::Sweep => {
+                        log.push_dim(self.kvcache_sweep());
+                        kv_pane = Some(self.kvcache_pane());
+                    }
+                }
+                continue;
+            }
+            // The `/resume` picker, likewise: every key is the pane's until it
+            // hands back a session or closes.
+            if let Some(pane) = resume_pane.as_mut() {
+                match pane.handle_key(key) {
+                    crate::resumepane::Outcome::Stay => {}
+                    crate::resumepane::Outcome::Close => resume_pane = None,
+                    crate::resumepane::Outcome::Resume(id) => {
+                        resume_pane = None;
+                        match self.store.load(&id) {
+                            Ok(s) => self.adopt_session(s, &mut log, &mut sub_pane),
+                            Err(e) => log.push_plain(format!("resume failed: {e}")),
+                        }
+                    }
+                    // Rename and delete both change the listing under the pane,
+                    // so it is rebuilt rather than left showing a stale row.
+                    crate::resumepane::Outcome::Rename(id, new) => {
+                        if let Err(e) = self.store.rename(&id, &new) {
+                            log.push_plain(format!("rename failed: {e}"));
+                        }
+                        resume_pane = Some(self.resume_pane());
+                    }
+                    crate::resumepane::Outcome::Delete(id) => {
+                        if let Err(e) = self.store.delete(&id) {
+                            log.push_plain(format!("delete failed: {e}"));
+                        }
+                        resume_pane = Some(self.resume_pane());
+                    }
+                    // The pane already asked twice. The live session is not
+                    // spared: it is a saved session like any other, and it
+                    // saves itself again on exit if it is worth keeping.
+                    crate::resumepane::Outcome::WipeAll => {
+                        match self.store.delete_all() {
+                            Ok(n) => log.push_plain(format!("deleted {n} saved sessions")),
+                            Err(e) => log.push_plain(format!("wipe failed: {e}")),
+                        }
+                        resume_pane = Some(self.resume_pane());
+                    }
+                    crate::resumepane::Outcome::LoadPreview(id) => {
+                        let text = self.resume_preview(&id);
+                        if let Some(p) = resume_pane.as_mut() {
+                            p.set_preview(&id, text);
+                        }
+                    }
+                }
+                continue;
+            }
             // Any keystroke dismisses the mouse selection highlight (the text
             // was already copied on mouse release).
             selection = None;
@@ -5992,10 +7416,18 @@ impl Agent<'_> {
             // into word-wise operations.
             let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
-                // Ctrl-O switches between the main transcript and the most
-                // recent sub-agent's output, while idle as well as mid-turn.
-                KeyCode::Char('o') if ctrl => {
-                    if !sub_pane.toggle() {
+                // `←` on an empty prompt reaches into the sub-agent roster below
+                // the status bar: it reveals the cursor, then walks up the rows
+                // (toward `main`). `→` walks back down, Enter expands the
+                // selected agent's output, Esc leaves. With text in the prompt
+                // the arrows stay cursor motion, so typing is never hijacked.
+                KeyCode::Left | KeyCode::Right
+                    if input.buf.text().is_empty()
+                        && !word_mod
+                        && (sub_pane.selecting || key.code == KeyCode::Left) =>
+                {
+                    let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                    if !sub_pane.move_cursor(delta) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
                     // A selection belongs to the pane it was dragged over, so it
@@ -6003,6 +7435,14 @@ impl Agent<'_> {
                     // would be painted over the other pane's text. (Every key
                     // already clears it above; kept here so the invariant is
                     // stated where the switch happens.)
+                    selection = None;
+                }
+                KeyCode::Enter if sub_pane.selecting && input.buf.text().is_empty() => {
+                    // On the `main` row there is nothing to expand: leave the
+                    // roster instead, which is what the row means.
+                    if !sub_pane.expand() {
+                        sub_pane.collapse();
+                    }
                     selection = None;
                 }
                 KeyCode::Char('c') if ctrl => {
@@ -6067,6 +7507,9 @@ impl Agent<'_> {
                 KeyCode::Down => input.history_move(1),
                 // Esc while idle dismisses a `/btw` panel left open from an
                 // earlier turn (the only way it ever closes).
+                // Esc leaves the roster before it closes a `/btw` panel: the
+                // roster is the thing the user is looking at when both are up.
+                KeyCode::Esc if sub_pane.collapse() => {}
                 KeyCode::Esc if btw_panel.is_some() => btw_panel = None,
                 // Shift+Enter inserts a newline instead of submitting.
                 // Terminals without the kitty keyboard protocol cannot
@@ -6106,7 +7549,10 @@ impl Agent<'_> {
                     input.slash = None;
                     input.hist_idx = None;
                     view.follow = true;
-                    sub_pane.view.follow = true;
+                    // A submitted prompt is about the main conversation: leave
+                    // the roster and re-pin every pane to its newest output.
+                    sub_pane.collapse();
+                    sub_pane.follow_all();
                     if line.is_empty() && attachments.is_empty() {
                         continue;
                     }
@@ -6154,10 +7600,28 @@ impl Agent<'_> {
                             &mut input,
                             &mut btw_panel,
                             &mut config_form,
+                            &mut kv_pane,
+                            &mut resume_pane,
                             &mut arcade,
                             &mut sub_pane,
                         ) {
                             break;
+                        }
+                        // `/goal` arms a loop instead of running one: it cannot
+                        // start a turn from inside `tui_slash`, which has no
+                        // terminal handles of its own. `self.goal` is `None` at
+                        // every prompt (both loops clear it before returning),
+                        // so this means exactly "`/goal` just started one".
+                        if self.goal.is_some() {
+                            self.tui_turn(
+                                terminal,
+                                &mut log,
+                                &mut view,
+                                &mut input,
+                                &mut btw_panel,
+                                &mut arcade,
+                                &mut sub_pane,
+                            )?;
                         }
                     } else {
                         // The engine is text-only: attach pasted images as
@@ -6268,6 +7732,7 @@ impl Agent<'_> {
                         None,
                         &tui::TaskView::default(),
                         None,
+                        &tui::RosterView::default(),
                     );
                 });
                 self.dirty = false;
@@ -6358,10 +7823,47 @@ impl Agent<'_> {
         )
     }
 
-    /// Drops superseded Tier 2 checkpoints for this project once the current
-    /// one is known good; they can never be read again and are large.
+    /// Display material for the KV metadata sidecars. Cosmetic only — nothing
+    /// here is key material, so a wrong value can never invalidate a cache.
     ///
-    /// Every *live* Tier 1 fingerprint is kept, not just the main engine's. A
+    /// The MCP names mirror the tier split [`kv_tiers_for`](Self::kv_tiers_for)
+    /// keys on: global servers belong to Tier 1, project-local ones to Tier 2.
+    /// The `AGENTS.md`/`CLAUDE.md` paths are recovered from the `# From:`
+    /// markers `context::ContextContent` writes into the discovered text —
+    /// discovery keeps only the concatenated content, and adding a path list to
+    /// it would touch the value that hashes into Tier 2.
+    fn tier_labels(&self) -> crate::kvtier::TierLabels {
+        let agents_files = self
+            .context_content
+            .agents_md_content
+            .as_deref()
+            .map(|text| {
+                text.lines()
+                    .filter_map(|l| l.strip_prefix("# From: "))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::kvtier::TierLabels {
+            think_mode: self.think.name().to_owned(),
+            trusted_len: self.trusted_system_len,
+            global_mcp: crate::tools::mcp::global_eligible_names(None),
+            project_path: self.tool_ctx.cwd.display().to_string(),
+            agents_files,
+            local_mcp: crate::tools::mcp::local_server_names(None),
+        }
+    }
+
+    /// Runs the TTL + pin sweep over the whole KV cache once this launch's
+    /// tiers are known good.
+    ///
+    /// Nothing is deleted for being superseded any more: a blob dies only when
+    /// it has gone unused past its role's TTL, is unpinned, is not in this
+    /// launch's chain, and has no surviving child. That is what lets several
+    /// system prompts — a model or reasoning-level switch each fork one —
+    /// coexist instead of costing a full re-prefill each way.
+    ///
+    /// Every *live* Tier 1 fingerprint is passed, not just the main engine's. A
     /// `provider: local` sub-agent has its own — keyed on the local model, not
     /// on the provider's — and collecting against the main engine's alone
     /// deleted it on every launch, which is why the sub-agent re-prefilled its
@@ -6370,31 +7872,10 @@ impl Agent<'_> {
     /// keep and the whole directory of system checkpoints went, including ones
     /// belonging to ordinary local sessions.
     fn gc_kv_tiers(&self, tiers: &[crate::kvtier::TierSpec]) {
-        let mut keep: Vec<String> = tiers
-            .iter()
-            .filter(|t| t.kind == crate::kvtier::TierKind::System)
-            .map(|t| t.fingerprint.clone())
-            .collect();
-        if let Some(alt) = self.alt_engines.get(&EngineKey::Local) {
-            keep.extend(
-                self.kv_tiers_for(&alt.model_name())
-                    .into_iter()
-                    .filter(|t| t.kind == crate::kvtier::TierKind::System)
-                    .map(|t| t.fingerprint),
-            );
-        }
-        if !keep.is_empty() {
-            let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
-            let _removed = self.store.gc_system_checkpoints(&keep);
-        }
-        if let Some(t) = tiers
-            .iter()
-            .find(|t| t.kind == crate::kvtier::TierKind::ProjectStable)
-        {
-            let _removed = self
-                .store
-                .gc_project_checkpoints(&self.tool_ctx.cwd, &t.fingerprint);
-        }
+        let keep = self.active_kv_fingerprints(tiers);
+        let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let policy = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
+        let _freed = self.store.sweep(&keep, &policy, crate::kvmeta::now_secs());
     }
 
     /// Re-establishes the warm KV prefix after the transcript is reset by
@@ -6422,12 +7903,14 @@ impl Agent<'_> {
         // that emits no events, so without this the indicator would never
         // appear in the common (checkpoint present) case.
         on_progress();
+        let labels = self.tier_labels();
         let _ = crate::kvtier::warm(
             &mut *self.engine,
             Some(&self.store),
             &tiers,
             &mut |_| on_progress(),
             &mut |_| {},
+            &labels,
         );
     }
 
@@ -6460,6 +7943,7 @@ impl Agent<'_> {
             return;
         };
         let tiers = self.kv_tiers_for(&engine.model_name());
+        let labels = self.tier_labels();
         if let Some(system) = tiers
             .first()
             .filter(|t| t.kind == crate::kvtier::TierKind::System)
@@ -6470,6 +7954,7 @@ impl Agent<'_> {
                 std::slice::from_ref(system),
                 on_event,
                 on_stage,
+                &labels,
             );
             // Set even on failure: the on-demand restore would fail the same
             // way, and retrying it per dispatch buys nothing.
@@ -6490,6 +7975,7 @@ impl Agent<'_> {
         // and event callbacks both need it and only one of them may hold the
         // terminal mutably; the stage callback only records the label, and the
         // prefill events that follow immediately paint it.
+        let labels = self.tier_labels();
         let stage = std::cell::Cell::new(crate::kvtier::TierKind::System.warm_label());
         crate::kvtier::warm(
             &mut *self.engine,
@@ -6506,9 +7992,11 @@ impl Agent<'_> {
                         tui::draw_warm(f, p.done, p.total, p.tps, stage.get(), notice.as_deref());
                     });
                 }
-                EngineEvent::Text(_) => {}
+                // Warm never speculates, so Spec cannot arrive here.
+                EngineEvent::Text(_) | EngineEvent::Spec(_) => {}
             },
             &mut |kind| stage.set(kind.warm_label()),
+            &labels,
         )
         .map_err(|e| e.to_string())?;
         // The sub-agent's local engine gets the same treatment on the same
@@ -6555,6 +8043,7 @@ impl Agent<'_> {
         // Which tier is prefilling, and the label last printed for it: each
         // stage announces itself once, so the note names the work actually
         // running rather than always the system prompt.
+        let labels = self.tier_labels();
         let stage = std::cell::Cell::new(crate::kvtier::TierKind::System.warm_label());
         let mut shown: Option<&'static str> = None;
         let mut announced = 0usize;
@@ -6592,9 +8081,11 @@ impl Agent<'_> {
                         }
                     }
                 }
-                EngineEvent::Prefill(_) | EngineEvent::Text(_) => {}
+                // Warm never speculates, so Spec cannot arrive here.
+                EngineEvent::Prefill(_) | EngineEvent::Text(_) | EngineEvent::Spec(_) => {}
             },
             &mut |kind| stage.set(kind.warm_label()),
+            &labels,
         )
         .map_err(|e| e.to_string())?;
         // Erase the transient "Updating…" note. Only when a single stage
@@ -6617,9 +8108,9 @@ impl Agent<'_> {
         Ok(())
     }
 
-    fn idle_status_text(&mut self) -> String {
+    fn idle_status_text(&mut self, cols: usize) -> String {
         let st = self.idle_status();
-        status::build_status_text(&st, false, true)
+        status::build_status_text_within(&st, false, true, cols)
     }
 
     /// The between-turns status snapshot: idle, with the context gauge for the
@@ -6632,6 +8123,7 @@ impl Agent<'_> {
             ctx_size: self.engine.ctx_size(),
             power_percent: self.power_percent,
             think: self.think,
+            spec: self.last_spec,
             ..Status::default()
         }
     }
@@ -6655,8 +8147,39 @@ impl Agent<'_> {
     /// One TUI turn: runs the generate → tools loop on a worker thread while
     /// the UI thread keeps the terminal live (typing, scrolling, interrupts),
     /// then feeds user lines queued during the turn into follow-up turns.
+    ///
+    /// Wraps [`Self::tui_turn_inner`] purely to enforce the `self.goal`
+    /// invariant: whenever this returns, the front end is back at the prompt,
+    /// so a live goal must not survive — including on an `Err` propagated out
+    /// of any fallible step in the body. Doing it here rather than at each
+    /// `?` (or at the call sites that swallow the error) makes the invariant
+    /// hold by construction: a future error path added inside the body cannot
+    /// forget it.
     #[allow(clippy::too_many_arguments)]
     fn tui_turn(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        log: &mut OutputLog,
+        view: &mut tui::OutputView,
+        input: &mut TuiInput,
+        btw: &mut BtwPanel,
+        arcade: &mut crate::arcade::Arcade,
+        sub: &mut tui::SubPane,
+    ) -> Result<(), String> {
+        let r = self.tui_turn_inner(terminal, log, view, input, btw, arcade, sub);
+        if r.is_err() {
+            self.goal = None;
+        }
+        r
+    }
+
+    /// The body of [`Self::tui_turn`]; callers must go through `tui_turn`,
+    /// which owns clearing `self.goal` on an error out of here.
+    #[allow(clippy::too_many_arguments)]
+    // Flat turn/leftover/goal loop; splitting it would only scatter the shared
+    // per-iteration bindings across helpers.
+    #[allow(clippy::too_many_lines)]
+    fn tui_turn_inner(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
         log: &mut OutputLog,
@@ -6742,6 +8265,91 @@ impl Agent<'_> {
             let leftover = shared.take_queued();
             carry_btw = shared.take_btw();
             if leftover.is_empty() && carry_btw.is_empty() {
+                // A live goal is another kind of "leftover": adjudicate, and on
+                // CONTINUE re-enter the loop as if a queued line had arrived.
+                // The mirror of `run_goal_loop`/`drive_goal_loop` on the plain
+                // path (CLAUDE.md) — including its invariant that `self.goal`
+                // is `None` on *every* exit, error returns included (the
+                // `tui_turn` wrapper enforces that for the whole body).
+                //
+                // Reached only when `leftover` is empty: a line the user typed
+                // during a goal turn runs its follow-up turn ahead of this hook,
+                // without a banner and without `next_iteration()`. The goal
+                // resumes on the round after, so nothing is lost — but it does
+                // mean `--max N` bounds adjudications, not turns.
+                if self.goal.is_some() {
+                    let iters = self
+                        .goal
+                        .as_ref()
+                        .expect("goal is live in this branch")
+                        .iters_done();
+                    // Esc reaches the TUI through the turn's shared flag as well
+                    // as the process-wide one, and aborts the whole goal rather
+                    // than only the turn that saw it. Checked before the
+                    // adjudication, as on the plain path: a user who pressed Esc
+                    // should not then wait out another generation.
+                    let interrupted = shared.interrupt.load(Ordering::Relaxed)
+                        || crate::interrupt::pending()
+                        || self.last_turn_interrupted;
+                    let settled = if interrupted {
+                        Some((crate::goal::Outcome::Interrupted, String::new()))
+                    } else {
+                        // `live` was captured for this loop iteration and is
+                        // passed by reference, so the turn's own `run_worker_ui`
+                        // call left it usable; no need to re-capture.
+                        let adj = run_worker_ui(
+                            terminal,
+                            log,
+                            view,
+                            input,
+                            btw,
+                            arcade,
+                            sub,
+                            shared,
+                            bus_ref,
+                            rem,
+                            None,
+                            &live,
+                            |tx| self.adjudicate_worker(&tx, shared),
+                        )
+                        .and_then(|inner| inner);
+                        // Both the UI-side and worker-side errors land here;
+                        // `tui_turn`'s wrapper clears the goal on any `Err` out
+                        // of this body, so `?` is safe.
+                        let adj = adj?;
+                        // Re-checked: an Esc pressed *during* the adjudication
+                        // only makes it `keep_going`, which on the last
+                        // iteration would otherwise read as a cap rather than
+                        // as the abort the user asked for.
+                        if shared.interrupt.load(Ordering::Relaxed)
+                            || crate::interrupt::pending()
+                            || self.last_turn_interrupted
+                        {
+                            Some((crate::goal::Outcome::Interrupted, String::new()))
+                        } else {
+                            let at_cap = self
+                                .goal
+                                .as_ref()
+                                .expect("goal is live in this branch")
+                                .at_cap();
+                            crate::goal::Outcome::from_verdict(adj.verdict)
+                                .or(at_cap.then_some(crate::goal::Outcome::Cap))
+                                .map(|o| (o, adj.reason))
+                        }
+                    };
+                    if let Some((outcome, reason)) = settled {
+                        self.goal = None;
+                        log.push_dim(crate::goal::closing(outcome, iters, &reason));
+                    } else {
+                        let (iter, max) = {
+                            let g = self.goal.as_mut().expect("goal is live in this branch");
+                            (g.next_iteration(), g.max_iters())
+                        };
+                        log.push_dim(crate::goal::banner(iter, max));
+                        run_main = true;
+                        continue;
+                    }
+                }
                 // Closing line, before anything switches to idle: `turn_started`
                 // covers the whole user turn — every generate/tools round, plus
                 // any leftover-queued follow-ups this loop absorbed — not the
@@ -6750,6 +8358,7 @@ impl Agent<'_> {
                 //
                 // Blank line first: the footer is a boundary marker, and butted
                 // against the reply's last line it reads as part of it.
+                self.refresh_wasm_segments();
                 log.push_plain("");
                 log.push_spans(vec![ratatui::text::Span::styled(
                     tui::turn_footer(turn_started.elapsed()),
@@ -6765,6 +8374,12 @@ impl Agent<'_> {
                 // Turn over: the front end is back at the prompt.
                 crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
+                // Mirrored from the plain path: a component must not observe a
+                // different number of turns depending on which front end the
+                // user happens to be running. The token count is not available
+                // here — this path reports elapsed time only — so the field is
+                // sent as -1 rather than as a plausible-looking zero.
+                self.fire_turn_end(-1, turn_started.elapsed());
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -6865,6 +8480,53 @@ impl Agent<'_> {
         Ok((bound, token))
     }
 
+    /// Applies `/grant [session]`: hands remote control to a client that asked
+    /// for it and is waiting on the local operator's say-so. Bare `/grant`
+    /// answers the oldest waiting request; `/grant <id>` picks one out by
+    /// session id, which is what the request notice prints.
+    ///
+    /// Returns the lines to show. Granting is the local user giving up the
+    /// controller slot, so it is deliberately explicit and never implicit.
+    fn grant_lines(&mut self, arg: &str) -> Vec<String> {
+        let Some(remote) = &self.remote else {
+            return vec!["/grant: remote control is not on (see /rc)".to_owned()];
+        };
+        let Ok(mut policy) = remote.control.lock() else {
+            return vec!["/grant: control policy is poisoned".to_owned()];
+        };
+        let arg = arg.trim();
+        let granted = if arg.is_empty() {
+            policy.grant_next()
+        } else {
+            match arg.parse::<u64>() {
+                Ok(session) if policy.pending().contains(&session) => {
+                    policy.grant(session);
+                    Some(session)
+                }
+                Ok(session) => {
+                    return vec![format!(
+                        "/grant: remote session {session} is not waiting for control"
+                    )];
+                }
+                Err(_) => {
+                    return vec![format!("/grant: {arg:?} is not a session id")];
+                }
+            }
+        };
+        drop(policy);
+        match granted {
+            Some(session) => {
+                // The client learns from its own connection thread, which
+                // notices the role change and sends a `control` frame.
+                let line =
+                    format!("[remote session {session} now holds control — /rc off to end it]");
+                remote.bus.broadcast(UiEvent::Dim(line.clone()));
+                vec![line]
+            }
+            None => vec!["/grant: no remote session is waiting for control".to_owned()],
+        }
+    }
+
     /// Stops the remote-control server and clears the bridge. Connected clients
     /// get a `bye` first. Returns whether a server was running. The token dies
     /// with the server, so an old link is refused by the next one.
@@ -6880,23 +8542,32 @@ impl Agent<'_> {
 
     /// Applies a `/remote-control` toggle and returns the lines to show. `cmd`
     /// is the invoked command name (`/remote-control` or `/rc`), used to name
-    /// the command in error messages. `arg` is `""` (toggle), `"on"`, or
+    /// the command in error messages. `arg` is `""` (toggle), `"on"`, `"ask"`, or
     /// `"off"` (case-insensitive); anything else reports usage.
     ///
     /// Starting from here always uses an ephemeral loopback port, so the command
-    /// never collides with another plank or a stale listener, and always sets
-    /// `allow_control`: the operator typing the command is the consent that a
-    /// remote-side allow flag would otherwise encode.
+    /// never collides with another plank or a stale listener.
+    ///
+    /// `on` sets `allow_control`: the operator typing the command is the consent
+    /// that a remote-side allow flag would otherwise encode, and it is what makes
+    /// the printed link usable while the local TUI holds the slot. `ask` is the
+    /// same bridge without that consent — an attaching client mirrors output but
+    /// must ask, and each request waits for a local `/grant`. Use it when the
+    /// link may reach someone you would rather approve one turn at a time.
     fn remote_toggle_lines(&mut self, cmd: &str, arg: &str) -> Vec<String> {
+        let mut allow_control = true;
         let want_on = if arg.is_empty() {
             !self.remote_is_on()
         } else if arg.eq_ignore_ascii_case("on") {
+            true
+        } else if arg.eq_ignore_ascii_case("ask") {
+            allow_control = false;
             true
         } else if arg.eq_ignore_ascii_case("off") {
             false
         } else {
             return vec![format!(
-                "{cmd}: unknown argument {arg:?} (use on, off, or no argument)"
+                "{cmd}: unknown argument {arg:?} (use on, ask, off, or no argument)"
             )];
         };
         if !want_on {
@@ -6906,13 +8577,23 @@ impl Agent<'_> {
                 vec!["remote control is already off".to_owned()]
             };
         }
-        match self.remote_on(crate::remote::LOOPBACK_EPHEMERAL, None, true) {
+        // `remote_on` is idempotent, so `ask` against a live bridge returns the
+        // existing one — whose policy was fixed when it started. Only claim the
+        // ask-mode behavior when this call is what created the server.
+        let fresh = !self.remote_is_on();
+        match self.remote_on(crate::remote::LOOPBACK_EPHEMERAL, None, allow_control) {
             Ok((addr, token)) => {
                 let port = addr.port();
-                vec![
+                let mut lines = vec![
                     format!("remote control on — {}", Self::remote_link(addr, &token)),
                     format!("tunnel:  ssh -L {port}:localhost:{port} user@thishost"),
-                ]
+                ];
+                if fresh && !allow_control {
+                    lines.push(
+                        "clients mirror only — each control request waits for /grant".to_owned(),
+                    );
+                }
+                lines
             }
             Err(e) => vec![format!("{cmd}: could not start: {e}")],
         }
@@ -6945,7 +8626,7 @@ impl Agent<'_> {
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
             let _ = tx.send(UiEvent::Dim(w));
         }) {
-            let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+            let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
             return Ok(());
         }
         let compact_interrupt =
@@ -7058,7 +8739,9 @@ impl Agent<'_> {
             if !out.calls.is_empty() {
                 let observations = self.run_tool_calls(&out.calls);
                 self.sync_tasks_after_dispatch();
-                for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
+                let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
+                crate::openfile::note_edited(&mut self.last_edited, &previews, &self.tool_ctx.cwd);
+                for preview in previews {
                     let _ = tx.send(UiEvent::EditCard(preview));
                 }
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
@@ -7078,7 +8761,7 @@ impl Agent<'_> {
                 }
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
-                    let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+                    let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);
@@ -7103,6 +8786,34 @@ impl Agent<'_> {
             }
             return Ok(());
         }
+    }
+
+    /// Worker-thread mirror of [`Self::adjudicate_plain`]: one generation, no
+    /// tool dispatch, output routed through the turn's UI channel.
+    ///
+    /// Like the plain path, the prompt and the reply both stay in the
+    /// transcript: popping them would truncate the session behind the engine's
+    /// live KV and force a warm reset every iteration.
+    ///
+    /// `is_main: false` keeps this out of the main-pass machinery — an
+    /// adjudication is never preempted by a `/btw` and never resumes a frozen
+    /// reply.
+    fn adjudicate_worker(
+        &mut self,
+        tx: &Sender<UiEvent>,
+        shared: &TurnShared,
+    ) -> Result<crate::goal::Adjudication, String> {
+        self.session
+            .push(Message::user(crate::goal::ADJUDICATION_PROMPT));
+        let prompt = render_transcript(&self.session, &self.system);
+        let out = self.worker_generate(tx, shared, &prompt, Instant::now(), false)?;
+        self.session
+            .push(Message::assistant(out.assistant_text.clone()));
+        // Work instead of a verdict, or a cut-off pass: neither settles a goal.
+        if out.interrupted || !out.calls.is_empty() {
+            return Ok(crate::goal::Adjudication::keep_going());
+        }
+        Ok(crate::goal::parse_verdict(&out.assistant_text))
     }
 
     /// Answers queued `/btw` side questions FIFO at a generation boundary
@@ -7289,11 +9000,17 @@ impl Agent<'_> {
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         let think = self.think;
+        // Bound before the event closure, which cannot borrow `self` while
+        // `self.engine` is generating.
+        let model_name = self.engine.model_name();
         // Prompt tokens already in context; generated tokens add onto this so
         // the ctx gauge moves while the model streams.
         let prompt_tokens = self.engine.count_tokens(prompt);
         let mut assistant_text = String::new();
         let mut gen_count = 0;
+        // Carried across events so every published status keeps showing the
+        // running figures, not just the one built by a Spec event.
+        let mut spec = crate::engine::SpecStats::default();
         let verb = status::random_verb_index();
         let start = Instant::now();
 
@@ -7316,6 +9033,7 @@ impl Agent<'_> {
                     gen_count += 1;
                     let secs = start.elapsed().as_secs_f64();
                     Status {
+                        spec,
                         state: WorkerState::Generating,
                         generated: gen_count,
                         prefill_label: verb,
@@ -7333,27 +9051,38 @@ impl Agent<'_> {
                         ..Status::default()
                     }
                 }
-                EngineEvent::Prefill(p) => Status {
-                    // See the plain-REPL path: a completed prefill is the
-                    // sampling wait, not prefilling (#64 follow-up).
-                    state: if p.is_complete() {
-                        WorkerState::Generating
-                    } else {
-                        WorkerState::Prefill
-                    },
-                    prefill_done: p.done,
-                    prefill_total: p.total,
-                    prefill_label: verb,
-                    prefill_tps: p.tps,
-                    elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                    ctx_used: prompt_tokens,
-                    ctx_size,
-                    power_percent: power,
-                    think,
-                    ..Status::default()
-                },
+                EngineEvent::Prefill(p) => {
+                    // Every sample feeds the peak; see the plain path.
+                    crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
+                    Status {
+                        // See the plain-REPL path: a completed prefill is the
+                        // sampling wait, not prefilling (#64 follow-up).
+                        state: if p.is_complete() {
+                            WorkerState::Generating
+                        } else {
+                            WorkerState::Prefill
+                        },
+                        prefill_done: p.done,
+                        prefill_total: p.total,
+                        prefill_label: verb,
+                        prefill_tps: p.tps,
+                        elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                        ctx_used: prompt_tokens,
+                        ctx_size,
+                        power_percent: power,
+                        think,
+                        ..Status::default()
+                    }
+                }
                 // Warm-up-only signal; never emitted mid-turn.
                 EngineEvent::Notice(_) => return,
+                // Counters only: the footer picks them up on the next status a
+                // token produces, so a Spec event does not itself force a
+                // repaint on every speculative step.
+                EngineEvent::Spec(s) => {
+                    spec = s;
+                    return;
+                }
             };
             let _ = tx.send(UiEvent::Status(status));
         };
@@ -7584,7 +9313,7 @@ impl Agent<'_> {
                             progress.summarizing(summary.len());
                         }
                         EngineEvent::Prefill(p) => progress.prefill(p.done, p.total),
-                        EngineEvent::Notice(_) => {}
+                        EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                     }
                     sink.redraw();
                 },
@@ -7683,6 +9412,8 @@ impl Agent<'_> {
         input: &mut TuiInput,
         btw: &mut BtwPanel,
         config_form: &mut Option<crate::configform::ConfigForm>,
+        kv_pane: &mut Option<crate::kvpane::KvPane>,
+        resume_pane: &mut Option<crate::resumepane::ResumePane>,
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) -> bool {
@@ -7696,28 +9427,67 @@ impl Agent<'_> {
             // the model. They take over the screen until Esc, and resume where
             // they were left unless the argument asks for a new game.
             _ if crate::arcade::enabled() && crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
-                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                 let fresh = crate::arcade::Arcade::wants_new(arg);
                 let resuming = !fresh && arcade.has_parked(cmd);
                 arcade_hover_reporting(true);
-                arcade.open(cmd, fresh, arcade_seed(), w, h);
+                arcade.open(cmd, fresh, arcade_seed());
                 arcade.sound.set(crate::arcade::Sound::wanted(arg));
                 if resuming {
                     log.push_dim(format!("{cmd}: resumed where you left off"));
                 }
             }
+            // `tui_slash` returns `bool` and has no terminal handles of its own,
+            // so it can only *arm* the loop; the call sites in `tui_loop` see
+            // `self.goal` set and start the first turn.
+            "/goal" => match crate::goal::parse_command(arg) {
+                Ok((goal, max)) => {
+                    self.goal = Some(crate::goal::GoalLoop::new(&goal, max));
+                    self.session
+                        .push(Message::user(crate::goal::kickoff_message(&goal)));
+                    let (iter, m) = {
+                        let g = self.goal.as_mut().expect("just set");
+                        (g.next_iteration(), g.max_iters())
+                    };
+                    log.push_dim(crate::goal::banner(iter, m));
+                }
+                Err(usage) => log.push_dim(usage),
+            },
             "/config" => {
                 // Open the interactive modal; the run loop drives it and
                 // persists on close. `arg` is ignored (the form edits everything).
-                *config_form = Some(crate::configform::ConfigForm::new(
+                // The form cycles through contributed faces as well as the
+                // built-ins, so it is handed what this session actually loaded.
+                let faces = self
+                    .tool_ctx
+                    .wasm
+                    .screensaver_faces()
+                    .into_iter()
+                    .map(|f| f.address)
+                    .collect();
+                let plugin_fields = self
+                    .tool_ctx
+                    .wasm
+                    .registry
+                    .declared_config()
+                    .into_iter()
+                    .map(|(id, option)| crate::configform::PluginField { id, option })
+                    .collect();
+                *config_form = Some(crate::configform::ConfigForm::with_contributions(
                     crate::settings::active().clone(),
+                    faces,
+                    plugin_fields,
                 ));
             }
             "/new" | "/clear" => {
                 self.session = Session::new();
+                // A new session, a new name — minted here for the same reason
+                // `new_agent` mints one at launch (see `SessionStore::mint_id`).
+                self.session.id = self.store.mint_id();
                 self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
-                self.context_content = ContextContent::new();
+                // Same merged roster the launch path advertises, so /clear
+                // cannot silently drop plugin-contributed agents from it.
+                self.context_content = ContextContent::new_with_agents(&self.agents);
                 push_session_context(&mut self.session, &self.context_content);
                 // Scaffolding only — not activity worth a resume point (see
                 // `save_for_exit`); a real turn re-dirties it.
@@ -7749,7 +9519,17 @@ impl Agent<'_> {
                     ))));
                     let (l, v) = (&*log, &mut *view);
                     let _ = terminal.draw(|f| {
-                        tui::draw(f, l, None, "", v, None, &tui::TaskView::default(), None);
+                        tui::draw(
+                            f,
+                            l,
+                            None,
+                            "",
+                            v,
+                            None,
+                            &tui::TaskView::default(),
+                            None,
+                            &tui::RosterView::default(),
+                        );
                     });
                 });
                 log.set_progress(None);
@@ -7823,13 +9603,24 @@ impl Agent<'_> {
             }
             "/save" => match self.save_session() {
                 Ok(id) => {
-                    log.push_plain(format!("saved session {}", &id[..8]));
+                    log.push_plain(format!("saved session {}", crate::session::display_id(&id)));
                     if let Some(note) = self.save_session_payload() {
                         log.push_dim(note);
                     }
                 }
                 Err(e) => log.push_plain(format!("save failed: {e}")),
             },
+            "/rename" => {
+                // The panel borrows the log and view the arm otherwise only
+                // writes to, so the confirmer is built here and the result
+                // reported after it is done.
+                let mut confirm = |q: &str| run_confirm_panel(terminal, &*log, view, q);
+                let outcome = self.rename_session(arg, &mut confirm);
+                match outcome {
+                    Ok(msg) => log.push_plain(msg),
+                    Err(e) => log.push_plain(format!("rename failed: {e}")),
+                }
+            }
             "/list" => match self.store.list() {
                 Ok(entries) => {
                     for line in
@@ -7841,54 +9632,19 @@ impl Agent<'_> {
                 Err(e) => log.push_plain(format!("list failed: {e}")),
             },
             "/switch" => match self.store.load(arg) {
-                Ok(s) => {
-                    let note = self.load_session_payload(&s);
-                    self.session = s;
-                    self.broadcast_session_reset(Some(
-                        "[session replaced — its history is on the local screen only]",
-                    ));
-                    self.last_ctx_used = 0;
-                    self.checkpoints.clear();
-                    self.usage = SessionUsage::default();
-                    // Same reason as `/clear`: the pane is the old session's.
-                    sub.reset();
-                    self.replay_history_into_log(log);
-                    if let Some(note) = note {
-                        log.push_dim(note);
-                    }
-                }
+                Ok(s) => self.adopt_session(s, log, sub),
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
             "/del" => match self.store.delete(arg) {
                 Ok(id) => log.push_plain(format!("deleted session {}", &id[..8])),
                 Err(e) => log.push_plain(format!("delete failed: {e}")),
             },
+            "/retitle" => log.push_plain(self.retitle_sessions()),
+            // A bare `/resume` opens the picker; with an argument it resumes
+            // that session outright, exactly as the plain REPL does.
             "/resume" => match self.resume_pick(arg) {
-                Ok(None) => match self.store.list() {
-                    Ok(entries) => log.push_ansi(&crate::session::render_resume_list(
-                        &entries,
-                        now_secs(),
-                        true,
-                        RESUME_LIST_LIMIT,
-                    )),
-                    Err(e) => log.push_plain(format!("resume failed: {e}")),
-                },
-                Ok(Some(s)) => {
-                    let note = self.load_session_payload(&s);
-                    self.session = s;
-                    self.broadcast_session_reset(Some(
-                        "[session replaced — its history is on the local screen only]",
-                    ));
-                    self.last_ctx_used = 0;
-                    self.checkpoints.clear();
-                    self.usage = SessionUsage::default();
-                    // Same reason as `/clear`: the pane is the old session's.
-                    sub.reset();
-                    self.replay_history_into_log(log);
-                    if let Some(note) = note {
-                        log.push_dim(note);
-                    }
-                }
+                Ok(None) => *resume_pane = Some(self.resume_pane()),
+                Ok(Some(s)) => self.adopt_session(s, log, sub),
                 Err(e) => log.push_plain(format!("resume failed: {e}")),
             },
             "/tag" => {
@@ -7956,8 +9712,28 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/kvcache" => {
+                if arg.is_empty() {
+                    *kv_pane = Some(self.kvcache_pane());
+                } else {
+                    // Subcommands work in the TUI too, for scripted use.
+                    for line in self.kvcache_text_command(arg).lines() {
+                        log.push_plain(line.to_owned());
+                    }
+                }
+            }
             "/skills" => {
                 for line in crate::skills::render_list(&self.skills).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/frame" => {
+                for line in self.frame_command(arg).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/plugins" => {
+                for line in self.plugins_command(arg).lines() {
                     log.push_plain(line.to_owned());
                 }
             }
@@ -7986,6 +9762,11 @@ impl Agent<'_> {
                     log.push_plain(line);
                 }
             }
+            "/grant" => {
+                for line in self.grant_lines(arg) {
+                    log.push_plain(line);
+                }
+            }
             "/btw" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
@@ -8009,6 +9790,7 @@ impl Agent<'_> {
                     log.push_dim("usage: /export [md|html] [path]".to_owned());
                 }
             },
+            "/open" => self.tui_open(arg, log, terminal),
             "/insights" => {
                 // The scan and the model calls both take long enough to look
                 // like a hang, so each progress note is pinned in the prompt's
@@ -8037,6 +9819,7 @@ impl Agent<'_> {
                                     None,
                                     &tui::TaskView::default(),
                                     None,
+                                    &tui::RosterView::default(),
                                 );
                             });
                         }
@@ -8133,7 +9916,7 @@ impl Agent<'_> {
                     let fork_at =
                         self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
                     log.push_dim(tui::subagent_signpost(&label));
-                    sub.begin(label);
+                    sub.begin(label, &task, tui::roster_clock_ms());
                     sub.adopt_turn = true;
                     let outcome = match alt {
                         None => self.tui_turn(terminal, log, view, input, btw, arcade, sub),
@@ -8142,7 +9925,7 @@ impl Agent<'_> {
                         }),
                     };
                     sub.adopt_turn = false;
-                    sub.end();
+                    sub.end(tui::roster_clock_ms());
                     if let Err(e) = outcome {
                         // Restore the transcript even when the turn errored.
                         self.finish_subagent_fork(fork_at, &task);
@@ -8173,10 +9956,188 @@ impl Agent<'_> {
                     }
                 }
                 Some(Err(e)) => log.push_plain(e),
-                None => log.push_plain(format!("unknown command: {cmd}")),
+                None => match self.wasm_command(cmd, arg) {
+                    Some(Ok(out)) => {
+                        for line in &out.print {
+                            log.push_plain(line.clone());
+                        }
+                        if let Some(text) = out.inject {
+                            input.buf.set_text(text);
+                        }
+                        if let Some(prompt) = out.prompt {
+                            log.push_spans(tui::user_echo_spans(&prompt));
+                            self.session.push(Message::user(prompt));
+                            if let Err(e) =
+                                self.tui_turn(terminal, log, view, input, btw, arcade, sub)
+                            {
+                                log.push_plain(format!("{cmd} failed: {e}"));
+                            }
+                        }
+                    }
+                    Some(Err(e)) => log.push_plain(e),
+                    None => log.push_plain(format!("unknown command: {cmd}")),
+                },
             },
         }
         true
+    }
+
+    /// Handles `/open [path]`: edits a file in the built-in editor and writes
+    /// it back on accept.
+    ///
+    /// Every refusal is a log line and no editor launch, so a typo cannot
+    /// create a file and a binary file cannot be mangled by the `String`
+    /// buffer. Unlike the Ctrl-G prompt path this ignores
+    /// `settings.ui.builtin_editor`: `/open` *is* the built-in editor command,
+    /// and there is no `$EDITOR` fallback to fall back to.
+    #[cfg(feature = "builtin_editor")]
+    fn tui_open(
+        &mut self,
+        arg: &str,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) {
+        let path = match crate::openfile::resolve_open_target(
+            arg,
+            self.last_edited.as_deref(),
+            &self.tool_ctx.cwd,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                log.push_plain(e);
+                return;
+            }
+        };
+        let initial = match crate::openfile::load(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                log.push_plain(e);
+                return;
+            }
+        };
+        let display = path.display().to_string();
+        // miniedit takes the raw terminal, exactly like a child process, so the
+        // TUI has to be fully torn down and put back around it.
+        let edited =
+            with_tui_suspended(terminal, || crate::miniedit::edit_file(&display, &initial));
+        // The accept/cancel/no-op decision lives in `openfile` so it can be
+        // unit-tested; this arm only performs it.
+        let edited = match edited {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                log.push_plain(format!("/open failed: {e}"));
+                return;
+            }
+        };
+        // `edited` is already the accept/cancel/no-op decision: miniedit's
+        // `State::accepted_text` returns `None` for a file accepted without
+        // any change, using its own `is_modified` (which compares against
+        // the buffer's own read-back-at-construction `original`) rather than
+        // a seed computed independently here. That is the only way this
+        // comparison can't drift from what the buffer's write path actually
+        // does — including line-ending normalization the old seed-based
+        // comparison did not model.
+        match edited {
+            Some(text) => match crate::openfile::save(&path, &text) {
+                Ok(()) => log.push_plain(crate::openfile::wrote_message(&display, &text)),
+                // The pointer is still set below: a failed save leaves the
+                // file as the obvious thing to reopen and retry.
+                Err(e) => log.push_plain(format!("save failed: {e}")),
+            },
+            None => {
+                log.push_dim(crate::openfile::unchanged_message(&display));
+            }
+        }
+        // Even a cancel points the pointer here: this is the file the user was
+        // last looking at, so the next bare `/open` should reopen it.
+        self.last_edited = Some(path);
+    }
+
+    /// Without the built-in editor compiled in there is nothing for `/open` to
+    /// open: the command deliberately has no `$EDITOR` fallback.
+    #[cfg(not(feature = "builtin_editor"))]
+    fn tui_open(
+        &mut self,
+        _arg: &str,
+        log: &mut OutputLog,
+        _terminal: &mut ratatui::DefaultTerminal,
+    ) {
+        log.push_plain(
+            "/open needs the built-in editor (build with --features builtin_editor)".to_owned(),
+        );
+    }
+}
+
+/// Asks a yes/no question at the plain-stdout prompt and returns the answer.
+/// Only an explicit yes counts; a closed or unreadable stdin declines, which is
+/// what keeps a piped run from silently agreeing to overwrite something.
+fn confirm_on_stdin(question: &str) -> bool {
+    // A piped stdin is somebody else's protocol stream (the headless front end
+    // reads prompts off it): asking there would both go unanswered and eat a
+    // line. Declining is the safe answer.
+    if !std::io::stdin().is_terminal() {
+        println!("{question} — declined (stdin is not a terminal)");
+        return false;
+    }
+    print!("{question}\noverwrite it? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+/// Asks a yes/no question in the TUI, reusing the `ask` tool's option panel
+/// ([`tui::draw_ask`]) so a slash command's confirmation looks like every other
+/// question plank asks. Blocks the loop until answered; Escape and Ctrl-C both
+/// decline, since declining is the safe answer for every caller.
+fn run_confirm_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    question: &str,
+) -> bool {
+    use crate::tools::ask::{AskOption, AskRequest, AskState};
+    let req = AskRequest {
+        question: question.to_owned(),
+        header: "Overwrite".to_owned(),
+        options: vec![
+            AskOption {
+                label: "Keep it".to_owned(),
+                description: "cancel the rename and leave both sessions alone".to_owned(),
+            },
+            AskOption {
+                label: "Overwrite".to_owned(),
+                description: "adopt the name; the next save replaces the saved session".to_owned(),
+            },
+        ],
+        multi: false,
+    };
+    // Cursor starts on the first option, so the safe answer is the one a stray
+    // Enter picks.
+    let mut state = AskState::new(req.options.len(), false);
+    loop {
+        if terminal
+            .draw(|f| tui::draw_ask(f, log, &req, &state, "", view, &tui::TaskView::default()))
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(Some(Event::Key(key))) = next_event(None, Duration::from_millis(100)) else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => state.move_up(),
+            KeyCode::Down => state.move_down(),
+            KeyCode::Enter => return state.cursor == 1,
+            KeyCode::Esc => return false,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            _ => {}
+        }
     }
 }
 
@@ -8395,6 +10356,28 @@ fn run_worker_ui<T: Send>(
     })
 }
 
+/// How long an unacknowledged interrupt waits before a second Ctrl-C is taken
+/// as a force quit.
+///
+/// Long enough that the two presses of an ordinary double-tap cannot trigger
+/// it, short enough that a genuinely wedged turn is escapable without the user
+/// reaching for `kill`.
+const FORCE_QUIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Last resort when the worker will not stop: restore the terminal and leave.
+///
+/// This exits the *process*, not the turn. The worker runs on a scoped thread
+/// borrowing the agent, so it cannot be abandoned and the scope cannot be left
+/// while it lives — meaning no destructor here can run and the in-flight turn
+/// is lost. That is the deal a force quit makes; it beats a wedged terminal,
+/// and with the stream idle timeout in [`crate::remote`] it should never be
+/// reached in the network-drop case that motivated it.
+fn force_quit() -> ! {
+    ratatui::restore();
+    eprintln!("plank: force quit — the turn was abandoned and not saved.");
+    std::process::exit(130);
+}
+
 /// Handles Esc / Ctrl-C during a worker job, with meaning that depends on the
 /// `/btw` panel state:
 /// - a side answer is **streaming** (`btw_active`): cancel it (interrupt) and
@@ -8468,6 +10451,10 @@ fn busy_ui_loop(
     // True while the progress line is showing the compaction bar, so it is
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
+    // When the main-task interrupt was raised, so an interrupt the worker never
+    // acknowledges can escalate to a force quit. `None` whenever no interrupt
+    // is outstanding.
+    let mut interrupt_at: Option<Instant> = None;
     // Wall-clock pacing for an easter egg opened mid-turn, same as the idle
     // loop: render events arrive irregularly, so the frame delta has to be
     // measured rather than inferred from the poll timeout.
@@ -8517,10 +10504,17 @@ fn busy_ui_loop(
                     log.set_progress(
                         status::progress_segment(&st, false).map(|p| tui::progress_line(&p)),
                     );
+                    // The snapshot describes whichever pass the engine is
+                    // running, so while a lone sub-agent holds it, it is that
+                    // sub-agent's — and the only live token count its roster row
+                    // can have. `record_usage` only reports a pass once it is
+                    // done, which for a long local pass is minutes of a blank
+                    // column.
+                    sub.note_status(&st);
                     // While the sub-agent pane is on screen the status line
                     // must say so, or the user cannot tell which transcript
                     // they are reading.
-                    if let (true, Some(label)) = (sub.active, sub.label.as_deref()) {
+                    if let (true, Some(label)) = (sub.active, sub.label()) {
                         status_line = format!("[sub-agent: {label}] {status_line}");
                     }
                 }
@@ -8548,9 +10542,22 @@ fn busy_ui_loop(
                 // The signpost line is emitted by the worker as an ordinary
                 // `Dim`, so it reaches remote clients too; these arms only
                 // move the pane's state (and stand aside for an adopted run).
-                UiEvent::SubStart(label) => sub.on_sub_start(label),
-                UiEvent::SubEnd => sub.on_sub_end(),
-                UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
+                UiEvent::SubStart { label, task } => {
+                    sub.on_sub_start(label, &task, tui::roster_clock_ms());
+                }
+                UiEvent::SubEnd => sub.on_sub_end(tui::roster_clock_ms()),
+                // Addressed to the current run. Before any run has started there
+                // is no buffer to write to, so it falls back to the transcript
+                // rather than dropping the output on the floor.
+                UiEvent::Sub(inner) => match sub.current_log_mut() {
+                    Some(sub_log) => worker::apply(sub_log, *inner),
+                    None => worker::apply(log, *inner),
+                },
+                UiEvent::SubTokens {
+                    label,
+                    prefill,
+                    generated,
+                } => sub.add_tokens(label.as_deref(), prefill, generated),
                 // Addressed to the panel per event, so it lands there even
                 // while the main task streams into the main log beside it.
                 UiEvent::Btw(inner) => {
@@ -8564,8 +10571,8 @@ fn busy_ui_loop(
                 ev => {
                     if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                         worker::apply(btw_log, ev);
-                    } else if sub.adopt_turn {
-                        worker::apply(&mut sub.log, ev);
+                    } else if let (true, Some(sub_log)) = (sub.adopt_turn, sub.current_log_mut()) {
+                        worker::apply(sub_log, ev);
                     } else {
                         worker::apply(log, ev);
                     }
@@ -8599,14 +10606,33 @@ fn busy_ui_loop(
             }
             None => {}
         }
-        let sub_active = sub.active;
-        // Owned for the same reason: `sub.view` is borrowed mutably below.
-        let sub_title: Option<String> = if sub_active { sub.label.clone() } else { None };
-        let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) = if sub_active {
-            (&sub.log, &mut sub.view)
+        // An interrupt the worker has not acknowledged within the grace period
+        // means it is wedged somewhere that cannot poll the flag. Say so, and
+        // name the way out — otherwise the UI looks identical to a hang.
+        let stuck = interrupt_at.is_some_and(|t: Instant| t.elapsed() >= FORCE_QUIT_GRACE);
+        let status_line: std::borrow::Cow<'_, str> = if stuck {
+            std::borrow::Cow::Owned(format!(
+                "{status_line}  [interrupt pending — Ctrl-C again to force quit]"
+            ))
         } else {
-            (log, view)
+            std::borrow::Cow::Borrowed(status_line.as_str())
         };
+        let sub_active = sub.active;
+        // Owned for the same reason: the selected run's view is borrowed mutably
+        // below, so nothing else may hold a borrow of the pane across the draw.
+        let sub_title: Option<String> = if sub_active {
+            sub.label().map(str::to_owned)
+        } else {
+            None
+        };
+        let roster = sub.roster_view(tui::roster_clock_ms());
+        let roster_rows = roster.height();
+        let selected_row = sub.cursor.checked_sub(1).filter(|_| sub_active);
+        let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
+            match selected_row.and_then(|i| sub.runs.get_mut(i)) {
+                Some(run) => (&run.log, &mut run.view),
+                None => (log, view),
+            };
         terminal
             .draw(|f| {
                 // The `/btw` split is about the main task, so it steps aside
@@ -8621,6 +10647,7 @@ fn busy_ui_loop(
                         &status_line,
                         draw_view,
                         &task_view,
+                        &roster,
                     );
                 } else {
                     tui::draw(
@@ -8632,13 +10659,14 @@ fn busy_ui_loop(
                         None,
                         &task_view,
                         sub_title.as_deref(),
+                        &roster,
                     );
                 }
                 if let Some(m) = &input.slash {
-                    tui::draw_slash_menu(f, input.buf.text(), m);
+                    tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
                 }
                 if let Some(p) = &input.popup {
-                    tui::draw_popup(f, input.buf.text(), p);
+                    tui::draw_popup(f, input.buf.text(), p, roster_rows);
                 }
                 // Drawn last, over the live turn. Translucent by default here,
                 // so the model's output keeps streaming legibly underneath.
@@ -8659,9 +10687,19 @@ fn busy_ui_loop(
                     UiEvent::BtwBegin => btw_active = true,
                     UiEvent::BtwEnd => btw_active = false,
                     UiEvent::MainRollback => log.truncate_to(main_checkpoint),
-                    UiEvent::SubStart(label) => sub.on_sub_start(label),
-                    UiEvent::SubEnd => sub.on_sub_end(),
-                    UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
+                    UiEvent::SubStart { label, task } => {
+                        sub.on_sub_start(label, &task, tui::roster_clock_ms());
+                    }
+                    UiEvent::SubEnd => sub.on_sub_end(tui::roster_clock_ms()),
+                    UiEvent::Sub(inner) => match sub.current_log_mut() {
+                        Some(sub_log) => worker::apply(sub_log, *inner),
+                        None => worker::apply(log, *inner),
+                    },
+                    UiEvent::SubTokens {
+                        label,
+                        prefill,
+                        generated,
+                    } => sub.add_tokens(label.as_deref(), prefill, generated),
                     // Addressed to the panel per event, so a multiplexed aside
                     // lands there while the main task streams into the log.
                     UiEvent::Btw(inner) => {
@@ -8672,8 +10710,10 @@ fn busy_ui_loop(
                     ev => {
                         if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                             worker::apply(btw_log, ev);
-                        } else if sub.adopt_turn {
-                            worker::apply(&mut sub.log, ev);
+                        } else if let (true, Some(sub_log)) =
+                            (sub.adopt_turn, sub.current_log_mut())
+                        {
+                            worker::apply(sub_log, ev);
                         } else {
                             worker::apply(log, ev);
                         }
@@ -8731,22 +10771,57 @@ fn busy_ui_loop(
                 // Backspace/Delete into word-wise operations.
                 let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
-                    // Ctrl-O switches between the main transcript and the
-                    // sub-agent pane; mid-turn is exactly when it matters.
-                    KeyCode::Char('o') if ctrl => {
-                        if !sub.toggle() {
+                    // The roster keys, mirroring the idle loop — mid-turn is
+                    // exactly when reaching into a running agent matters.
+                    KeyCode::Left | KeyCode::Right
+                        if input.buf.text().is_empty()
+                            && !word_mod
+                            && (sub.selecting || key.code == KeyCode::Left) =>
+                    {
+                        let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                        if !sub.move_cursor(delta) {
                             log.push_dim("[no sub-agent has run yet]");
                         }
                     }
+                    KeyCode::Enter if sub.selecting && input.buf.text().is_empty() => {
+                        if !sub.expand() {
+                            sub.collapse();
+                        }
+                    }
+                    // Esc leaves the roster before it interrupts the turn: the
+                    // roster is what the user is looking at, and an accidental
+                    // interrupt here would be expensive.
+                    KeyCode::Esc if sub.collapse() => {}
                     KeyCode::Esc => {
                         close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
+                        // Arms the escalation the same way Ctrl-C does, so an
+                        // interrupt raised with Esc can still be escaped from.
+                        if interrupt_at.is_none() && shared.interrupt.load(Ordering::Relaxed) {
+                            interrupt_at = Some(Instant::now());
+                        }
                     }
                     KeyCode::Char('c') if ctrl => {
                         // Ctrl-C clears a partly-typed line first; on an empty
                         // line it acts like Esc (cancel answer / close panel /
                         // interrupt the model).
                         if input.buf.text().is_empty() {
+                            // Escalation: a second Ctrl-C, once the first has
+                            // gone unacknowledged past the grace period, is the
+                            // only way out of a worker wedged somewhere it
+                            // cannot poll the interrupt flag. It cannot be a
+                            // graceful shutdown — the worker is a *scoped*
+                            // thread holding `&mut Agent`, so the scope cannot
+                            // be left while it runs and there is no safe way to
+                            // abandon it.
+                            if interrupt_at
+                                .is_some_and(|t: Instant| t.elapsed() >= FORCE_QUIT_GRACE)
+                            {
+                                force_quit();
+                            }
                             close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
+                            if interrupt_at.is_none() && shared.interrupt.load(Ordering::Relaxed) {
+                                interrupt_at = Some(Instant::now());
+                            }
                         } else {
                             input.buf.clear();
                         }
@@ -8797,7 +10872,7 @@ fn busy_ui_loop(
                                 log.push_dim("[/btw — answering now]");
                             }
                             view.follow = true;
-                            sub.view.follow = true;
+                            sub.follow_all();
                         } else if let Some(out) = line
                             .starts_with('/')
                             .then(|| line.split_whitespace().next().unwrap_or(&line))
@@ -8810,7 +10885,7 @@ fn busy_ui_loop(
                             log.push_spans(tui::user_echo_spans(&line));
                             log.push_ansi(&out);
                             view.follow = true;
-                            sub.view.follow = true;
+                            sub.follow_all();
                         } else if let Some(cmd) = arcade_command(&line) {
                             // The whole point of these is the waiting, so they
                             // are the commands that *do* run mid-turn.
@@ -8819,9 +10894,8 @@ fn busy_ui_loop(
                             let arg = line[cmd.len()..].trim();
                             let fresh = crate::arcade::Arcade::wants_new(arg);
                             let resuming = !fresh && arcade.has_parked(cmd);
-                            let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                             arcade_hover_reporting(true);
-                            arcade.open(cmd, fresh, arcade_seed(), w, h);
+                            arcade.open(cmd, fresh, arcade_seed());
                             arcade.sound.set(crate::arcade::Sound::wanted(arg));
                             arcade.veil();
                             if resuming {
@@ -8838,7 +10912,7 @@ fn busy_ui_loop(
                             log.push_dim("[queued — joins the conversation at the next step]");
                             shared.push_queued(line);
                             view.follow = true;
-                            sub.view.follow = true;
+                            sub.follow_all();
                         }
                     }
                     KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
@@ -8961,18 +11035,80 @@ fn print_footer(st: &Status, color: bool) {
     }
 }
 
+/// Loads the skills and templates the session addresses by name, then folds
+/// every plugin collision warning — `earlier` (agents and MCP, computed
+/// upstream) plus these two — onto the plugin set and prints it.
+///
+/// The set is the accumulator because it is what `/plugins` renders, and these
+/// warnings are only knowable once the contributions are merged, which is after
+/// `main()` has already printed the load-time ones.
+fn load_named_contributions(
+    tool_ctx: &mut ToolContext,
+    mut earlier: Vec<String>,
+) -> (Vec<crate::skills::Skill>, Vec<crate::templates::Template>) {
+    let (skills, skill_warnings) =
+        crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    let (templates, template_warnings) =
+        crate::plugins::templates_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    earlier.extend(skill_warnings);
+    earlier.extend(template_warnings);
+    for w in &earlier {
+        eprintln!("plugin warning: {w}");
+    }
+    tool_ctx.plugins.add_warnings(earlier);
+    (skills, templates)
+}
+
+// Session construction is a long straight line of independent wiring steps —
+// engine, session, plugins, MCP, hooks, sandbox, prompt — each a couple of
+// lines with no branching. Splitting it would mean threading a dozen
+// half-built values through helpers that exist only to satisfy the line count.
+#[allow(clippy::too_many_lines)]
 fn new_agent(
     mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     show_footer: bool,
     local_engine: Option<Box<dyn Engine>>,
+    plugins: crate::plugins::PluginSet,
 ) -> Result<Agent<'_>, String> {
     let store = SessionStore::open(SessionStore::default_dir()).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut trace = Trace::open(cfg.trace_path.as_deref()).map_err(|e| e.to_string())?;
     let mut session = Session::new();
-    // Collect context at session start
-    let context_content = ContextContent::new();
+    // Name the session up front rather than at save time: the TUI shows it on
+    // the rule above the prompt from the first frame, and the name it shows has
+    // to be the one the file ends up under.
+    session.id = store.mint_id();
+    // Loaded before the session context because the model-visible roster rides
+    // in it: the roster the model sees has to be the same merged list
+    // `set_roster` publishes and `/agent` lists, or a plugin-contributed agent
+    // is dispatchable by the user and invisible to the model. Still built well
+    // before `build_system_prompt_parts` below, which is what the `agent`
+    // tool's `name` enum — and hence the fingerprinted prompt prefix — reads.
+    // `--minimal-prompt` shortcuts every contribution below: the roster rides
+    // in the prompt (the `agent` tool's `name` enum), so an empty one is part of
+    // making the prompt small.
+    let minimal = cfg.minimal_prompt;
+    let (agents, agent_warnings) = if minimal {
+        (Vec::new(), Vec::new())
+    } else {
+        crate::plugins::agents_with_plugins(&cwd, &plugins)
+    };
+    // Every collision the reconciliation reports is accumulated here and
+    // folded onto the plugin set below, so `/plugins` shows it beside the
+    // load-time warnings instead of it being computed and dropped. The set is
+    // the accumulator because it is the thing `/plugins` renders and the one
+    // object both front-ends already reach through `tool_ctx`.
+    let mut contribution_warnings = agent_warnings;
+    // Collect context at session start. Under `--minimal-prompt` this is the
+    // single biggest saving after the tool schemas — git status, AGENTS.md,
+    // memory and the date are several thousand characters before the user has
+    // typed anything.
+    let context_content = if minimal {
+        ContextContent::default()
+    } else {
+        ContextContent::new_with_agents(&agents)
+    };
     // Inject context into the session transcript
     trace.text("context", &context_content.combined());
     push_session_context(&mut session, &context_content);
@@ -8982,14 +11118,46 @@ fn new_agent(
     // `save_for_exit`.)
     session.dirty = false;
     let mut tool_ctx = ToolContext::new(cwd);
+    // Built once in `main()` against the session's real working directory
+    // (post-`--chdir`/`--worktree` resolution happens below) and threaded in
+    // here rather than rebuilt, so this set and `main()`'s agree and its
+    // warnings are printed exactly once.
+    tool_ctx.plugins = plugins;
     // `--worktree` already created the worktree and moved the process into it,
     // so `cwd` above is the worktree; adopting the session it left behind is
     // what lets `ExitWorktree` find its way back out.
     tool_ctx.worktree = crate::worktree::take_startup_session();
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
-    tool_ctx.mcp = crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref());
-    tool_ctx.hooks = crate::hooks::load_default(&tool_ctx.cwd);
+    let (mcp, mcp_warnings) = if minimal {
+        (Vec::new(), Vec::new())
+    } else {
+        crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref(), &tool_ctx.plugins)
+    };
+    tool_ctx.mcp = mcp;
+    contribution_warnings.extend(mcp_warnings);
+    // Before the system prompt is composed, deliberately: a `tool` component
+    // changes the tool list, which changes the prompt, which changes the Tier 1
+    // fingerprint. Activating after that point would build a checkpoint for a
+    // prompt the session does not actually use.
+    {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let plank_home = home.as_ref().map(|h| h.join(".plank"));
+        let project = tool_ctx.cwd.clone();
+        // Built with the home *before* activation, not after: the runtime is
+        // what owns a component's `state` directory, and a host constructed
+        // without one would leave every component's storage unavailable for
+        // the whole session.
+        tool_ctx.wasm = crate::wasmreg::Session::new(plank_home.as_deref());
+        // A `tool` component adds tool specs to the prompt, so activation is
+        // skipped rather than activated-and-ignored: the host is still built so
+        // component storage is reachable if something asks.
+        if !minimal {
+            let warnings = tool_ctx.wasm.activate(&tool_ctx.plugins.clone(), &project);
+            contribution_warnings.extend(warnings);
+        }
+    }
+    tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     for w in &tool_ctx.hooks.warnings {
         eprintln!("{w}");
     }
@@ -9016,21 +11184,33 @@ fn new_agent(
             matches!(answer.trim(), "y" | "Y" | "yes")
         }));
     }
-    // Loaded before the system prompt because the roster is part of it: the
+    // Published before the system prompt because the roster is part of it: the
     // `agent` tool's `name` enum advertises which definitions the model may
     // select. Definitions are on-disk files, stable across a session, so they
     // belong inside the fingerprinted prefix — editing one correctly
     // invalidates `sysprompt.kv` rather than being silently ignored.
-    let agents = crate::agents::load_default(&tool_ctx.cwd);
+    //
     // Publishes the names so the input line can colour `/subagent:<name>` by
     // whether the name resolves, three call layers below anything that holds
     // the definitions themselves.
     crate::agents::set_roster(&agents);
-    let system = sysprompt::build_system_prompt_parts(
+    // Component tool names are resolved against everything already claimed —
+    // built-ins and MCP — *before* the prompt is composed, because the exposed
+    // name is what goes into it. A rename after this point would put one name
+    // in the prompt and dispatch another.
+    {
+        let taken = sysprompt::tool_names(&tool_ctx.mcp);
+        let warnings = tool_ctx.wasm.registry.resolve_tool_names(&taken);
+        contribution_warnings.extend(warnings);
+    }
+    let wasm_tools = tool_ctx.wasm.registry.tools();
+    let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
         &tool_ctx.mcp,
+        &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
     );
+    drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
     // anything, so `｜DSML｜` in the prompt's examples prefills as the model's
     // own token rather than as spelled-out BPE pieces.
@@ -9058,8 +11238,14 @@ fn new_agent(
     }
     let trusted_system_len = system.trusted_len;
     let system = system.text;
-    let skills = crate::skills::load_default(&tool_ctx.cwd);
-    let templates = crate::templates::load_default(&tool_ctx.cwd);
+    let (skills, templates) = if minimal {
+        // Skills are not enumerated in the prompt (the `skill` tool lists them
+        // on demand), so this is about not reading them off disk and not
+        // offering what this session deliberately has no access to.
+        (Vec::new(), Vec::new())
+    } else {
+        load_named_contributions(&mut tool_ctx, contribution_warnings)
+    };
     // The `skill` tool resolves names against the same set the slash command
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);
@@ -9081,13 +11267,16 @@ fn new_agent(
         show_footer,
         editor_owns_footer: false,
         last_ctx_used: 0,
+        last_spec: crate::engine::SpecStats::default(),
         last_turn_interrupted: false,
+        goal: None,
         context_content,
         skills,
         templates,
         agents,
         isolation_seq: 0,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
+        last_edited: None,
         remote: None,
         remote_server: None,
         ui_remote: None,
@@ -9118,8 +11307,9 @@ pub fn run_interactive(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
+    plugins: crate::plugins::PluginSet,
 ) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, true, local_engine)?;
+    let mut agent = new_agent(engine, cfg, true, local_engine, plugins)?;
 
     // Seed the notification enable flag once, before either front-end loop
     // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
@@ -9409,8 +11599,9 @@ pub fn run_non_interactive(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
+    plugins: crate::plugins::PluginSet,
 ) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, false, local_engine)?;
+    let mut agent = new_agent(engine, cfg, false, local_engine, plugins)?;
     // Seed the notification enable flag once, mirroring `run_interactive`, so
     // headless/non-interactive runs also honor `ui.notifications`.
     crate::notify::set_mode(crate::settings::active().ui.notifications);
@@ -9612,6 +11803,79 @@ mod tests {
             agent.sub_sink
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/rename` retargets later saves without disturbing what is already on
+    /// disk: the old file stays resumable and the new name becomes a copy.
+    #[test]
+    fn rename_session_leaves_the_saved_copy_alone() {
+        let dir = scratch_dir("rename-session");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.id = agent.store.mint_id();
+        let minted = agent.session.id.clone();
+        agent.session.push(Message::user("first turn"));
+        assert_eq!(agent.save_session().unwrap(), minted);
+
+        // Nothing to overwrite, so the confirmer must not be consulted.
+        let mut never = |_q: &str| -> bool { panic!("no confirmation expected here") };
+        let msg = agent.rename_session("  parser-hunt  ", &mut never).unwrap();
+        assert_eq!(agent.session.id, "parser-hunt", "trimmed and adopted");
+        assert!(msg.contains(&minted), "the old name is reported: {msg}");
+        assert!(agent.session.dirty, "the copy still has to be written");
+        assert!(
+            agent.store.path_for_id(&minted).exists(),
+            "the already-saved session is untouched"
+        );
+        assert!(
+            !agent.store.path_for_id("parser-hunt").exists(),
+            "and nothing is written until the next save"
+        );
+
+        // The copy is a real second session, with the transcript so far.
+        assert_eq!(agent.save_session().unwrap(), "parser-hunt");
+        assert_eq!(agent.store.load(&minted).unwrap().transcript.len(), 1);
+        assert_eq!(agent.store.load("parser-hunt").unwrap().transcript.len(), 1);
+
+        // A name already on disk asks before taking it, and a "no" changes
+        // nothing at all.
+        let mut asked = String::new();
+        let mut decline = |q: &str| {
+            asked = q.to_owned();
+            false
+        };
+        let err = agent.rename_session(&minted, &mut decline).unwrap_err();
+        assert_eq!(err, "rename cancelled");
+        assert!(
+            asked.contains("overwrite"),
+            "the question explains: {asked}"
+        );
+        assert_eq!(agent.session.id, "parser-hunt", "the rename is a no-op");
+
+        // A "yes" takes the name; the file is still only replaced by a save.
+        let mut accept = |_: &str| true;
+        assert!(agent.rename_session(&minted, &mut accept).is_ok());
+        assert_eq!(agent.session.id, minted);
+        agent.session.push(Message::user("second turn"));
+        assert_eq!(agent.save_session().unwrap(), minted);
+        assert_eq!(
+            agent.store.load(&minted).unwrap().transcript.len(),
+            2,
+            "the overwritten file now holds the live transcript"
+        );
+
+        // Renaming to the current name says so instead of asking anything.
+        assert!(
+            agent
+                .rename_session(&minted, &mut never)
+                .unwrap()
+                .contains("already named")
+        );
+
+        // A path separator never reaches the filesystem.
+        assert!(agent.rename_session("../escape", &mut never).is_err());
+        assert!(agent.rename_session("", &mut never).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10419,12 +12683,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -10683,6 +12950,142 @@ mod tests {
             token_of(&on),
             "a fresh activation mints a new token"
         );
+        agent.remote_off();
+    }
+
+    /// `/rc ask` starts the same bridge without pre-authorizing control, which
+    /// is the only way a request reaches the local operator at all: plain `/rc`
+    /// seeds `allow_control`, so every request is a silent grant and `/grant`
+    /// would have nothing to answer.
+    #[test]
+    fn rc_ask_starts_a_bridge_that_withholds_control() {
+        let dir = scratch_dir("rc-ask-withholds-control");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let lines = agent.remote_toggle_lines("/rc", "ask");
+        assert!(agent.remote_is_on());
+        assert!(
+            lines.iter().any(|l| l.contains("/grant")),
+            "ask mode says requests wait for a grant: {lines:?}"
+        );
+
+        let state = agent.remote.clone().expect("bridge installed");
+        let outcome = state.control.lock().expect("policy").request(4);
+        assert_eq!(
+            outcome,
+            crate::remote::control::RequestOutcome::NeedsLocalGrant,
+            "ask mode must not hand control over on its own"
+        );
+        agent.remote_off();
+    }
+
+    #[test]
+    fn grant_hands_control_to_the_waiting_session() {
+        let dir = scratch_dir("grant-hands-control");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.remote_toggle_lines("/rc", "ask");
+        let state = agent.remote.clone().expect("bridge installed");
+        state.control.lock().expect("policy").request(4);
+
+        let lines = agent.grant_lines("");
+        assert!(
+            lines.iter().any(|l| l.contains("session 4")),
+            "names the session it granted: {lines:?}"
+        );
+        assert!(
+            state.control.lock().expect("policy").remote_can_control(4),
+            "the waiting session now holds control"
+        );
+        agent.remote_off();
+    }
+
+    /// The operator sees the grant in the log the same way any other session
+    /// event arrives, and so does every attached mirror.
+    #[test]
+    fn grant_announces_itself_on_the_bus() {
+        let dir = scratch_dir("grant-announces");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.remote_toggle_lines("/rc", "ask");
+        let state = agent.remote.clone().expect("bridge installed");
+        state.control.lock().expect("policy").request(4);
+        let sub = state.bus.subscribe();
+
+        agent.grant_lines("");
+
+        let seen: Vec<_> = sub.try_iter().map(|s| s.event).collect();
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("session 4"))),
+            "the grant reached the bus: {seen:?}"
+        );
+        agent.remote_off();
+    }
+
+    #[test]
+    fn grant_with_an_explicit_session_id_picks_that_one() {
+        let dir = scratch_dir("grant-explicit-id");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.remote_toggle_lines("/rc", "ask");
+        let state = agent.remote.clone().expect("bridge installed");
+        {
+            let mut policy = state.control.lock().expect("policy");
+            policy.request(4);
+            policy.request(9);
+        }
+
+        agent.grant_lines("9");
+
+        let policy = state.control.lock().expect("policy");
+        assert!(
+            policy.remote_can_control(9),
+            "granted the id that was asked for"
+        );
+        assert!(!policy.remote_can_control(4));
+        drop(policy);
+        agent.remote_off();
+    }
+
+    /// Each refusal names what went wrong rather than failing silently: nothing
+    /// waiting, an id that is not waiting, a bad id, and no bridge at all.
+    #[test]
+    fn grant_explains_every_way_it_can_decline() {
+        let dir = scratch_dir("grant-declines");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let no_bridge = agent.grant_lines("");
+        assert!(
+            no_bridge.iter().any(|l| l.contains("/rc")),
+            "points at how to start one: {no_bridge:?}"
+        );
+
+        agent.remote_toggle_lines("/rc", "ask");
+        let nothing_waiting = agent.grant_lines("");
+        assert!(
+            nothing_waiting
+                .iter()
+                .any(|l| l.contains("no remote session")),
+            "{nothing_waiting:?}"
+        );
+
+        let state = agent.remote.clone().expect("bridge installed");
+        state.control.lock().expect("policy").request(4);
+        let wrong_id = agent.grant_lines("5");
+        assert!(
+            wrong_id.iter().any(|l| l.contains("not waiting")),
+            "{wrong_id:?}"
+        );
+        let not_a_number = agent.grant_lines("banana");
+        assert!(
+            not_a_number.iter().any(|l| l.contains("not a session id")),
+            "{not_a_number:?}"
+        );
+        // None of the refusals moved control off the local user.
+        assert!(!state.control.lock().expect("policy").remote_can_control(4));
         agent.remote_off();
     }
 
@@ -11426,6 +13829,7 @@ mod tests {
             &cfg,
             false,
             Some(Box::new(local)),
+            crate::plugins::PluginSet::default(),
         )
         .expect("an agent");
 
@@ -11645,6 +14049,9 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.session.id = "deadbeef".repeat(5);
+        // `replay_history_into_log` replays only a persisted session, and
+        // `created_at` is what marks one (see `Session::is_persisted`).
+        agent.session.created_at = 1;
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant(
             "<think>pondering</think>Here is **bold** text.\n",
@@ -11713,6 +14120,9 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.session.id = "deadbeef".repeat(5);
+        // `replay_history_into_log` replays only a persisted session, and
+        // `created_at` is what marks one (see `Session::is_persisted`).
+        agent.session.created_at = 1;
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant(concat!(
             "<think>I should list the directory",
@@ -12600,12 +15010,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -12629,6 +15042,45 @@ mod tests {
              from engine events (got {ticks} ticks)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_usage_is_where_the_footer_learns_the_speculation_figures() {
+        // Regression: the update lived beside two of the three
+        // `last_ctx_used` assignments, and the TUI worker — the one front-end
+        // with a footer to render it — was the path left out, so `--dspark`
+        // showed nothing. `record_usage` is the only call all three paths
+        // share, so the invariant is pinned here.
+        let dir = std::env::temp_dir().join(format!("plank-spec-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::AgentConfig::default();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        assert!(
+            !agent.idle_status().spec.active(),
+            "clean session shows none"
+        );
+
+        let spec = crate::engine::GenerationStats {
+            spec: crate::engine::SpecStats {
+                steps: 10,
+                committed: 30,
+                drafted: 40,
+            },
+            ..Default::default()
+        };
+        agent.record_usage(&spec);
+        let st = agent.idle_status();
+        assert!(st.spec.active());
+        assert!((st.spec.tokens_per_step() - 3.0).abs() < 1e-9);
+
+        // A later non-speculating pass must not blank the figure: it describes
+        // the engine, and a turn that did not speculate says nothing new.
+        agent.record_usage(&crate::engine::GenerationStats::default());
+        assert!(
+            (agent.idle_status().spec.tokens_per_step() - 3.0).abs() < 1e-9,
+            "a plain pass wiped the last speculating turn's figures"
+        );
     }
 
     #[test]
@@ -12660,12 +15112,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -12885,6 +15340,259 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A real session payload, stored the way a launch stores one, and mutated
+    /// through the exact path the `/kvcache` pane uses.
+    ///
+    /// Every earlier fixture built session nodes by hand with
+    /// `fingerprint == <file stem>`, which is why this was invisible for twelve
+    /// scoped reviews: a genuine [`crate::session::KvKey::Session`] sidecar
+    /// records the *payload* fingerprint, so the old code — pick a node by
+    /// sidecar fingerprint, then find its path by the stem-derived one — failed
+    /// on every session blob with "vanished from disk", and on a coincidental
+    /// match acted on a different body entirely.
+    #[test]
+    fn kvcache_mutations_act_on_a_real_session_payload() {
+        let dir = scratch_dir("kvcache-session-mutate");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        let fp = agent.payload_fingerprint_for(&agent.session);
+        assert_ne!(
+            fp, agent.session.id,
+            "the sidecar fingerprint is not the file stem — that is the whole bug"
+        );
+        let key = crate::session::KvKey::Session {
+            id: agent.session.id.clone(),
+            fp: fp.clone(),
+        };
+        agent
+            .store
+            .kv_store_labeled(
+                &key,
+                &crate::kvcache::KVCache::new(
+                    vec![1, 2, 3],
+                    crate::ds4tokens::TokenTranscript::new(),
+                ),
+                None,
+                "m",
+                &crate::kvmeta::KvLabel::Session {
+                    name: agent.session.id.clone(),
+                    title: "t".to_owned(),
+                },
+            )
+            .unwrap();
+        let path = agent.store.kv_path(&key);
+        assert!(path.exists());
+
+        // The pane names the blob by its scan index, which resolves straight
+        // back to this path.
+        let rows = agent.kvcache_pane().rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let idx = rows[0].idx.expect("the row names a blob");
+        let row_fp = rows[0]
+            .fingerprint
+            .clone()
+            .expect("the row carries the blob's identity");
+        assert_eq!(row_fp, fp, "the row's identity is the sidecar fingerprint");
+        // FIX C: the handle `/kvcache rm` wants is now on screen.
+        assert!(
+            rows[0].detail.starts_with(&fp[..8]),
+            "the session row shows a typeable fingerprint prefix: {:?}",
+            rows[0].detail
+        );
+
+        // A load bumps `hits`, and pinning must not revert that snapshot.
+        assert!(agent.store.kv_load(&key).is_some());
+        let hits = crate::kvmeta::load(&path).expect("a sidecar").hits;
+        assert_eq!(hits, 1);
+
+        let line = agent.kvcache_apply_idx("pin", idx, &row_fp);
+        assert!(line.contains("pinned"), "{line}");
+        let meta = crate::kvmeta::load(&path).expect("a sidecar");
+        assert!(meta.pinned, "pin took effect on disk");
+        assert_eq!(meta.hits, hits, "pin must not revert a concurrent hit bump");
+
+        let line = agent.kvcache_apply_idx("unpin", idx, &row_fp);
+        assert!(line.contains("unpinned"), "{line}");
+        assert!(!crate::kvmeta::load(&path).expect("a sidecar").pinned);
+
+        // The REPL's prefix interface resolves to the same index, and still
+        // refuses what it cannot pin down.
+        assert_eq!(agent.resolve_kv_prefix(&fp[..8]), Ok((idx, fp.clone())));
+        // An index whose identity no longer matches is refused, never guessed.
+        let line = agent.kvcache_apply_idx("rm", idx, "0000000000000000000000000000000000000000");
+        assert!(line.contains("changed under you"), "{line}");
+        assert!(path.exists(), "a refused mutation touches nothing");
+        assert!(agent.resolve_kv_prefix("zzzzzzzz").is_err(), "no match");
+        assert!(agent.resolve_kv_prefix("").is_err(), "no argument");
+
+        let line = agent.kvcache_apply("rm", &fp[..8]);
+        assert!(line.contains("removed"), "{line}");
+        assert!(!path.exists(), "rm unlinked the body");
+        assert!(
+            !crate::kvmeta::sidecar_path(&path).exists(),
+            "and its sidecar"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan index is not stable across scans, so a mutation must re-check the
+    /// identity the pane showed rather than trusting the position.
+    ///
+    /// The pane is built over several blobs; an earlier one then disappears —
+    /// exactly what a second plank's startup sweep, or a sub-agent's `persist`,
+    /// does between the pane being drawn and the user pressing `d`/`y`. Every
+    /// later index now names its neighbour, so an unchecked delete unlinks a body
+    /// the user never selected. The mutation must refuse and say the cache moved.
+    #[test]
+    fn a_mutation_is_refused_when_the_scan_shifted_under_the_pane() {
+        let dir = scratch_dir("kvcache-index-shift");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Five system blobs, named so the sorted scan order is a19f0..a19f4.
+        let keys: Vec<crate::session::KvKey> = (0..5)
+            .map(|i| crate::session::KvKey::System {
+                fp: format!("a19f{i}"),
+            })
+            .collect();
+        for key in &keys {
+            agent
+                .store
+                .kv_store_labeled(
+                    key,
+                    &crate::kvcache::KVCache::new(
+                        vec![7u8; 64],
+                        crate::ds4tokens::TokenTranscript::new(),
+                    ),
+                    None,
+                    "m",
+                    &crate::kvmeta::KvLabel::Unknown,
+                )
+                .unwrap();
+        }
+        // The pane's view of the world: index and identity per row.
+        let seen: Vec<(usize, String)> = agent
+            .kvcache_pane()
+            .rows()
+            .into_iter()
+            .filter_map(|r| Some((r.idx?, r.fingerprint?)))
+            .collect();
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        // Sorting `kv_blob_paths` is what makes this positional claim a claim at
+        // all: under `read_dir` order the indices were filesystem-hash order.
+        let mut by_idx = seen.clone();
+        by_idx.sort_by_key(|(i, _)| *i);
+        assert_eq!(
+            by_idx
+                .iter()
+                .map(|(_, fp)| fp.as_str())
+                .collect::<Vec<&str>>(),
+            vec!["a19f0", "a19f1", "a19f2", "a19f3", "a19f4"],
+            "the scan is sorted by path, so index order is reproducible"
+        );
+
+        // A sibling process removes the blob the pane called index 1. Nothing
+        // tells the open pane, and every later index now names its neighbour.
+        let gone = agent.store.kv_path(&keys[1]);
+        std::fs::remove_file(&gone).unwrap();
+        std::fs::remove_file(crate::kvmeta::sidecar_path(&gone)).unwrap();
+
+        // The user presses `d` then `y` on the row the pane built for index 3.
+        let (idx, fp) = seen
+            .iter()
+            .find(|(i, _)| *i == 3)
+            .cloned()
+            .expect("a row at index 3");
+        assert_eq!(fp, "a19f3");
+        let line = agent.kvcache_apply_idx("rm", idx, &fp);
+        // Either guard may speak first — the index check, or the pre-unlink
+        // sidecar re-check behind it. Both refuse and both say to reopen.
+        assert!(
+            line.contains("reopen /kvcache"),
+            "the mutation must refuse, not guess: {line}"
+        );
+        // The body index 3 now names — a19f4 — is untouched, and so is the one
+        // the user actually selected.
+        for key in [&keys[3], &keys[4]] {
+            assert!(
+                agent.store.kv_path(key).exists(),
+                "{} was unlinked by a shifted index",
+                agent.store.kv_path(key).display()
+            );
+        }
+        // Pin takes the same check.
+        let line = agent.kvcache_apply_idx("pin", idx, &fp);
+        assert!(line.contains("reopen /kvcache"), "{line}");
+        assert!(
+            !crate::kvmeta::load(&agent.store.kv_path(&keys[4]))
+                .expect("a sidecar")
+                .pinned,
+            "a refused pin wrote nothing"
+        );
+        // Re-resolving against the current scan works, which is what reopening
+        // the pane does.
+        let (idx, fp) = agent.resolve_kv_prefix("a19f3").expect("still present");
+        let line = agent.kvcache_apply_idx("rm", idx, &fp);
+        assert!(line.contains("removed"), "{line}");
+        assert!(!agent.store.kv_path(&keys[3]).exists());
+        assert!(agent.store.kv_path(&keys[4]).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live session's payload is protected by being *active*, not by
+    /// recency. Its node's fingerprint is the payload fingerprint, so pushing
+    /// the session id into the keep set — as the launch sweep used to — matched
+    /// nothing at all.
+    #[test]
+    fn the_live_sessions_payload_survives_a_sweep_from_the_far_future() {
+        let dir = scratch_dir("kvcache-live-payload");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        let fp = agent.payload_fingerprint_for(&agent.session);
+        let key = crate::session::KvKey::Session {
+            id: agent.session.id.clone(),
+            fp: fp.clone(),
+        };
+        agent
+            .store
+            .kv_store_labeled(
+                &key,
+                &crate::kvcache::KVCache::new(
+                    vec![1, 2, 3],
+                    crate::ds4tokens::TokenTranscript::new(),
+                ),
+                None,
+                "m",
+                &crate::kvmeta::KvLabel::Unknown,
+            )
+            .unwrap();
+        let path = agent.store.kv_path(&key);
+
+        // The keep set `gc_kv_tiers` sweeps with. `gc_kv_tiers` itself reads the
+        // wall clock, so the future clock goes to the sweep it delegates to.
+        let keep = agent.active_kv_fingerprints(&agent.kv_tiers());
+        assert!(
+            keep.contains(&fp),
+            "the payload fingerprint must be in the keep set, not the session id"
+        );
+        assert!(!keep.contains(&agent.session.id));
+        let refs: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 1,
+            ttl_tier_secs: 1,
+            max_bytes: 0,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        assert_eq!(agent.store.sweep(&refs, &policy, future), 0);
+        assert!(path.exists(), "the live session's payload is active");
+        // And it is only the keep set sparing it: dropped from the active set,
+        // the same sweep collects it.
+        assert!(agent.store.sweep(&[], &policy, future) > 0);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The GC keeps every live Tier 1, not just the main engine's. Collecting
     /// against one fingerprint deleted the alt local engine's checkpoint on
     /// every launch — so it re-prefilled its system prompt every single run —
@@ -12917,10 +15625,18 @@ mod tests {
         let (main_fp, alt_fp) = (fp(&main_tiers), fp(&alt_tiers));
         assert_ne!(main_fp, alt_fp, "different models, different Tier 1");
 
-        // Both engines' checkpoints on disk, plus a stale third.
+        // Both engines' checkpoints on disk, plus a long-idle third. Every one
+        // of the three gets a `last_used = 0` sidecar, so all three are past the
+        // tier TTL and *only* membership in the keep-set can save one. Written
+        // fresh, they would be spared by TTL freshness alone and the test would
+        // pass even with the keep-set gutted — which is exactly the regression
+        // it exists to catch.
         let key = |fp: &str| crate::session::KvKey::System { fp: fp.to_owned() };
-        for f in [&main_fp, &alt_fp, &"stale".to_string()] {
-            std::fs::write(agent.store.kv_path(&key(f)), b"x").unwrap();
+        for f in [main_fp.as_str(), alt_fp.as_str(), "stale"] {
+            let path = agent.store.kv_path(&key(f));
+            std::fs::write(&path, b"x").unwrap();
+            let meta = crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::System, f, 1, 0);
+            crate::kvmeta::store(&path, &meta).unwrap();
         }
 
         agent.gc_kv_tiers(&main_tiers);
@@ -13097,12 +15813,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13276,12 +15995,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13360,12 +16082,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13431,12 +16156,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13525,12 +16253,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13879,11 +16610,22 @@ mod tests {
 
     /// Installs `n` remote definitions named `a0..`, each with its own key
     /// variable and a pre-seeded fan-out-capable engine.
-    fn install_parallel_defs(agent: &mut Agent<'_>, engines: &[(&str, u64, bool)]) -> Vec<String> {
+    ///
+    /// `tag` must be unique per test. The key variables are process-global, and
+    /// the test binary runs these tests on parallel threads: sharing one set of
+    /// names meant one test's `clear_vars` could unset a variable a sibling was
+    /// mid-fan-out on, which cost that sibling its engine and failed it at
+    /// random.
+    fn install_parallel_defs(
+        agent: &mut Agent<'_>,
+        tag: &str,
+        engines: &[(&str, u64, bool)],
+    ) -> Vec<String> {
         let mut vars = Vec::new();
+        let tag = tag.to_ascii_uppercase().replace('-', "_");
         for (i, (reply, delay_ms, fail)) in engines.iter().enumerate() {
             let name = format!("a{i}");
-            let var = format!("PLANK_TEST_FANOUT_{i}");
+            let var = format!("PLANK_TEST_FANOUT_{tag}_{i}");
             unsafe { std::env::set_var(&var, "sk-test") };
             let mut def = remote_def(&name, &var);
             // Distinct models so each slot gets its own cache key.
@@ -13925,6 +16667,7 @@ mod tests {
         // Slot 0 finishes last, so completion order is the reverse of call order.
         let vars = install_parallel_defs(
             &mut agent,
+            "order",
             &[("slow done\n", 120, false), ("fast done\n", 0, false)],
         );
         let calls = vec![
@@ -13944,7 +16687,11 @@ mod tests {
         let dir = scratch_dir("fanout-panic");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars = install_parallel_defs(&mut agent, &[("", 0, false), ("ok text\n", 0, false)]);
+        let vars = install_parallel_defs(
+            &mut agent,
+            "panic",
+            &[("", 0, false), ("ok text\n", 0, false)],
+        );
         // Turn slot 0 into a panicking engine, keeping its cache key.
         let key = EngineKey::Provider(
             crate::remote::provider::ProviderKind::Anthropic,
@@ -14014,6 +16761,87 @@ mod tests {
     }
 
     #[test]
+    fn a_subagents_report_carries_its_answer_and_not_its_thinking() {
+        use crate::session::Message;
+
+        // The report becomes a tool observation in the parent's transcript. A
+        // transcript keeps thinking verbatim, so the raw text carries the
+        // sub-agent's reasoning — handing that over makes the report read as a
+        // muddle the parent then re-verifies by hand.
+        let msgs = vec![
+            Message::user("count the characters"),
+            Message::assistant(
+                "<think>the script says XXXVIII, but let me reconsider — \
+                 maybe XXXIIX? no, that is not how it works</think>\
+                 38 = XXXVIII, 7 characters.",
+            ),
+        ];
+        let report = last_assistant_text(&msgs).expect("a report");
+        assert_eq!(report, "38 = XXXVIII, 7 characters.");
+        assert!(!report.contains("script says"), "{report}");
+        assert!(!report.contains("<think>"), "{report}");
+    }
+
+    #[test]
+    fn a_report_that_is_only_thinking_falls_back_to_an_earlier_answer() {
+        use crate::session::Message;
+
+        // A pass that produced nothing but reasoning must not blank the report:
+        // the emptiness test runs *after* the strip, so the scan keeps walking
+        // back to the last thing the sub-agent actually said.
+        let msgs = vec![
+            Message::assistant("the earlier answer"),
+            Message::user("<tool_result>ok</tool_result>"),
+            Message::assistant("<think>still deciding</think>"),
+        ];
+        assert_eq!(
+            last_assistant_text(&msgs).as_deref(),
+            Some("the earlier answer")
+        );
+
+        // An interrupted run leaves the block unterminated; everything after an
+        // unclosed `<think>` is thinking by definition.
+        assert_eq!(
+            strip_thinking("said it<think>cut off mid-thought"),
+            "said it"
+        );
+        assert_eq!(strip_thinking("<think>only thinking"), "");
+        assert_eq!(strip_thinking("plain prose"), "plain prose");
+        assert_eq!(
+            strip_thinking("<think>a</think>one<think>b</think>two"),
+            "onetwo",
+            "every block goes, not just the first"
+        );
+    }
+
+    #[test]
+    fn the_serial_agent_tool_credits_its_roster_row_per_pass() {
+        // The row's spend comes from `record_usage`, which fires once per pass
+        // inside the sub-agent. `ScriptedEngine` reports no tokens at all, so
+        // this pins the *addressing* — unnamed, i.e. the current run — rather
+        // than a count; the tally itself is engine-supplied.
+        let dir = scratch_dir("agent-tool-subtokens");
+        let cfg = test_cfg();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        let _ = agent.run_agent_tool(&agent_call("do a thing", None));
+        let events: Vec<crate::worker::UiEvent> = rx.try_iter().collect();
+        let labels: Vec<&Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::worker::UiEvent::SubTokens { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert!(!labels.is_empty(), "a pass credits the row: {events:?}");
+        assert!(
+            labels.iter().all(|l| l.is_none()),
+            "the serial path has one run open, so the row is not named: {labels:?}"
+        );
+    }
+
+    #[test]
     fn fanout_flushes_one_labelled_pane_block_per_slot_in_call_order() {
         let dir = scratch_dir("fanout-pane");
         let cfg = test_cfg();
@@ -14023,6 +16851,7 @@ mod tests {
         // Slot 0 finishes last, so a naive implementation would flush out of order.
         let vars = install_parallel_defs(
             &mut agent,
+            "pane",
             &[("slow text\n", 120, false), ("fast text\n", 0, false)],
         );
         let calls = vec![
@@ -14051,20 +16880,25 @@ mod tests {
         let labels: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
-                crate::worker::UiEvent::SubStart(l) => Some(l.as_str()),
+                crate::worker::UiEvent::SubStart { label, .. } => Some(label.as_str()),
                 _ => None,
             })
             .collect();
+        // Every slot's roster row is opened before the rounds run, so the rows
+        // are visible (and their clocks honest) while the fan-out works; the
+        // buffered output is then flushed under the same labels, in call order
+        // rather than completion order. `SubPane::begin` resumes a row it has
+        // already opened, so the repeat is not a second row.
         assert_eq!(
             labels,
-            vec!["a0", "a1"],
-            "one block per slot, in call order rather than completion order"
+            vec!["a0", "a1", "a0", "a1"],
+            "rows opened up front, then flushed in call order"
         );
         let ends = events
             .iter()
             .filter(|e| matches!(e, crate::worker::UiEvent::SubEnd))
             .count();
-        assert_eq!(ends, labels.len(), "every block is closed");
+        assert_eq!(ends, 2, "every flushed block is closed");
         clear_vars(&vars);
     }
 
@@ -14073,8 +16907,11 @@ mod tests {
         let dir = scratch_dir("fanout-fail");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars =
-            install_parallel_defs(&mut agent, &[("", 0, true), ("sibling done\n", 0, false)]);
+        let vars = install_parallel_defs(
+            &mut agent,
+            "fail",
+            &[("", 0, true), ("sibling done\n", 0, false)],
+        );
         let calls = vec![
             agent_call("broken", Some("a0")),
             agent_call("working", Some("a1")),
@@ -14095,7 +16932,8 @@ mod tests {
         let dir = scratch_dir("fanout-mixed");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false), ("y\n", 0, false)]);
+        let vars =
+            install_parallel_defs(&mut agent, "mixed", &[("x\n", 0, false), ("y\n", 0, false)]);
         let calls = vec![
             agent_call("work", Some("a0")),
             ToolCall {
@@ -14120,7 +16958,7 @@ mod tests {
         let dir = scratch_dir("fanout-local");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false)]);
+        let vars = install_parallel_defs(&mut agent, "local", &[("x\n", 0, false)]);
         agent.agents.push(named_def("local", true));
         let calls = vec![agent_call("a", Some("a0")), agent_call("b", Some("local"))];
         assert!(
@@ -14136,7 +16974,11 @@ mod tests {
         let dir = scratch_dir("fanout-width1");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false), ("y\n", 0, false)]);
+        let vars = install_parallel_defs(
+            &mut agent,
+            "width1",
+            &[("x\n", 0, false), ("y\n", 0, false)],
+        );
         let mut settings = crate::settings::Settings::default();
         settings.agents.max_parallel = 1;
         crate::settings::install_for_test(settings);
@@ -14157,7 +16999,11 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.session.push(Message::user("parent question"));
         let before = agent.session.transcript.len();
-        let vars = install_parallel_defs(&mut agent, &[("r0\n", 0, false), ("r1\n", 0, false)]);
+        let vars = install_parallel_defs(
+            &mut agent,
+            "cleanroom",
+            &[("r0\n", 0, false), ("r1\n", 0, false)],
+        );
         let calls = vec![
             agent_call("task zero", Some("a0")),
             agent_call("task one", Some("a1")),
@@ -14297,6 +17143,235 @@ mod tests {
             "alt engine returned to the cache"
         );
         unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// The verdict reply the adjudication pass is scripted to return.
+    fn verdict_reply(token: &str, reason: &str) -> String {
+        format!("GOAL_VERDICT: {token}\nGOAL_REASON: {reason}\n")
+    }
+
+    #[test]
+    fn goal_stops_on_the_first_attained_verdict() {
+        let dir = scratch_dir("goal-attained");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![
+                    "did the work\n".to_string(),
+                    verdict_reply("ATTAINED", "all tests pass"),
+                ],
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent
+            .slash("/goal make the tests pass")
+            .expect("/goal runs");
+        assert!(agent.goal.is_none(), "the loop clears its own state");
+        // Two generations: one turn, one adjudication.
+        assert_eq!(prompts.lock().expect("lock").len(), 2);
+        // The adjudication exchange stays in the transcript (KV prefix stability).
+        let transcript = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("GOAL_VERDICT: ATTAINED"),
+            "verdict reply was popped: {transcript}"
+        );
+        assert!(
+            transcript.contains("make the tests pass"),
+            "kickoff missing: {transcript}"
+        );
+    }
+
+    #[test]
+    fn goal_stops_at_the_iteration_cap() {
+        let dir = scratch_dir("goal-cap");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                // Alternating turn/adjudication replies for two iterations.
+                replies: vec![
+                    "step one\n".to_string(),
+                    verdict_reply("CONTINUE", "more to do"),
+                    "step two\n".to_string(),
+                    verdict_reply("CONTINUE", "still more"),
+                ],
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent
+            .slash("/goal --max 2 keep going forever")
+            .expect("/goal runs");
+        assert!(agent.goal.is_none(), "the loop clears its own state");
+        assert_eq!(
+            prompts.lock().expect("lock").len(),
+            4,
+            "two turns and two adjudications"
+        );
+    }
+
+    /// Mirror of the TUI hook's second interrupt check: a Ctrl-C landing
+    /// *during* the adjudication must end the goal there, not buy the user
+    /// another full iteration (and not be reported as a cap).
+    #[test]
+    fn goal_stops_on_an_interrupt_during_the_adjudication() {
+        let dir = scratch_dir("goal-interrupt-adjudication");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![
+                    "step one\n".to_string(),
+                    verdict_reply("CONTINUE", "more to do"),
+                    "step two\n".to_string(),
+                    verdict_reply("CONTINUE", "still more"),
+                ],
+                // Pass 1 is the first adjudication.
+                interrupt_at: Some(1),
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent
+            .slash("/goal --max 2 keep going forever")
+            .expect("/goal runs");
+        assert!(agent.goal.is_none(), "the loop clears its own state");
+        // Documents intent rather than guarding it: `interrupt_at` is a
+        // per-engine knob and raises no process-wide flag, so this cannot
+        // fail. The real regression guard is the prompt count below — the
+        // second iteration only runs if the interrupt went unnoticed.
+        assert!(
+            !crate::interrupt::pending(),
+            "a goal must not return to the prompt with an interrupt pending, \
+or the user's next message aborts before its first token"
+        );
+        assert_eq!(
+            prompts.lock().expect("lock").len(),
+            2,
+            "the second iteration must not run after a mid-adjudication Ctrl-C"
+        );
+    }
+
+    #[test]
+    fn goal_without_an_objective_prints_usage_and_runs_nothing() {
+        let dir = scratch_dir("goal-usage");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec!["should never run\n".to_string()],
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.slash("/goal").expect("/goal handles a bare call");
+        assert!(agent.goal.is_none());
+        assert!(
+            prompts.lock().expect("lock").is_empty(),
+            "no generation should have run"
+        );
+    }
+
+    /// `run_turn`'s `?` must not leave `self.goal` set behind it: the field's
+    /// invariant is that it is `None` whenever the front end is back at the
+    /// prompt, error return included.
+    #[test]
+    fn goal_clears_its_state_even_when_a_turn_errors() {
+        let dir = scratch_dir("goal-error");
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                fail_with: Some("provider exploded".to_string()),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let err = agent.slash("/goal make the tests pass");
+        assert!(err.is_err(), "the engine failure must propagate: {err:?}");
+        assert!(
+            agent.goal.is_none(),
+            "goal state must clear even on an error return"
+        );
+    }
+
+    /// The TUI's `tui_turn` hook needs a live terminal, but its worker-side
+    /// adjudication does not: this covers the piece that decides the loop, and
+    /// pins the no-pop rule that keeps the KV prefix stable.
+    #[test]
+    fn worker_adjudication_parses_the_verdict_and_keeps_the_exchange() {
+        let dir = scratch_dir("goal-worker-adjudicate");
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![verdict_reply("NEEDS_USER", "which database?")],
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        // `_rx` must outlive the call: dropping it makes every `tx.send` fail.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let shared = TurnShared::default();
+        let adj = agent
+            .adjudicate_worker(&tx, &shared)
+            .expect("adjudication runs");
+        assert_eq!(adj.verdict, crate::goal::Verdict::NeedsUser);
+        assert_eq!(adj.reason, "which database?");
+        let transcript = render_transcript(&agent.session, &agent.system);
+        assert!(
+            transcript.contains("GOAL_VERDICT: NEEDS_USER"),
+            "verdict reply was popped: {transcript}"
+        );
+    }
+
+    /// An adjudication that answers with *work* instead of a verdict settles
+    /// nothing: a reply carrying a DSML tool call degrades to `Continue`, even
+    /// when it also spells a terminal token out.
+    #[test]
+    fn worker_adjudication_with_tool_calls_keeps_going() {
+        let dir = scratch_dir("goal-worker-adjudicate-tools");
+        let cfg = test_cfg();
+        let reply = concat!(
+            "GOAL_VERDICT: ATTAINED\n",
+            "GOAL_REASON: let me just check\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![reply.to_string()],
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let shared = TurnShared::default();
+        let adj = agent
+            .adjudicate_worker(&tx, &shared)
+            .expect("adjudication runs");
+        assert_eq!(adj.verdict, crate::goal::Verdict::Continue);
+        assert_eq!(adj.reason, "");
     }
 
     /// The main loop acts on the report: `/subagent` runs a parent turn as soon
@@ -14620,7 +17695,7 @@ mod tests {
             "first event should be the Dim signpost: {got:?}"
         );
         assert!(
-            matches!(got.get(1), Some(crate::worker::UiEvent::SubStart(_))),
+            matches!(got.get(1), Some(crate::worker::UiEvent::SubStart { .. })),
             "second event should be SubStart: {got:?}"
         );
         assert!(
@@ -14688,12 +17763,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -14776,12 +17854,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -14923,12 +18004,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -14992,12 +18076,15 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,

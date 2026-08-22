@@ -8,10 +8,10 @@
 //!
 //! | Tier | Content | Key | Storage |
 //! |------|---------|-----|---------|
-//! | 1 | system prompt (+ global MCP tool defs, incl. cached ones) | `fp1 = sha(model ‖ system)` | `sysprompt-*.kv` (model-global) |
-//! | 2 | project-stable context: `AGENTS.md`/`CLAUDE.md` set, memory, **local** MCP tool defs | `fp2 = tier(fp1, stable-hash ‖ local tool defs)` | `<project-key>/project-<fp2>.kv` |
+//! | 1 | system prompt (+ global MCP tool defs, incl. cached ones) | `fp1 = sha(model ‖ system)` | `sysprompt-<fp1>.kv_raw` (model-global) |
+//! | 2 | project-stable context: `AGENTS.md`/`CLAUDE.md` set, memory, **local** MCP tool defs | `fp2 = tier(fp1, stable-hash ‖ local tool defs)` | `<project-key>/project-<fp2>.kv_raw` |
 //! | 3 | session-volatile context: git status, date, hook output | — | never cached |
-//! | 4 | conversation turns | `tier(fp2, transcript)` | `<session>.payload` |
+//! | 4 | conversation turns | `tier(fp2, transcript)` | `<session>.kv_raw` |
 //!
 //! Tier 1's text depends on the set of global MCP servers **present in
 //! `~/.plank/.mcp.json`**, not the set that successfully handshook: a global
@@ -80,6 +80,12 @@ pub struct TierSpec {
     pub kind: TierKind,
     /// Chained fingerprint `sha(parent ‖ NUL ‖ material)`.
     pub fingerprint: String,
+    /// Fingerprint of the tier this one extends, or `None` for Tier 1.
+    ///
+    /// Redundant with `fingerprint` in principle — a chained fingerprint
+    /// already embeds its parent's — but a hash cannot be inverted, so the
+    /// lineage a `/kvcache` tree draws has to be recorded explicitly.
+    pub parent: Option<String>,
     /// The text this tier contributes, injected as its own user message so the
     /// tier boundary falls on a clean chat-template message boundary.
     pub text: String,
@@ -99,7 +105,7 @@ impl TierSpec {
 /// Tier 1's fingerprint: `sha1(model ‖ NUL ‖ think ‖ NUL ‖ trusted_len ‖ NUL ‖ system)`.
 ///
 /// The single definition of the system-prompt checkpoint key, shared by the
-/// engine (which writes `sysprompt-*.kv` with it) and by the tier planner
+/// engine (which writes `sysprompt-*.kv_raw` with it) and by the tier planner
 /// (which chains `fp2` off it). Keeping one implementation is what guarantees
 /// the two never disagree and silently invalidate the whole chain.
 ///
@@ -170,6 +176,53 @@ fn tier2_material(stable_hash: &str, local_tool_defs: &str) -> Vec<u8> {
     data
 }
 
+/// Display material for the metadata sidecars [`warm`] writes.
+///
+/// Purely cosmetic — none of it is key material, and changing any field must
+/// never change a fingerprint. It exists because `plan` derives tiers from an
+/// already-hashed `fp1` and so cannot name the model, reasoning level, or MCP
+/// servers behind the prefix it is planning.
+#[derive(Debug, Clone, Default)]
+pub struct TierLabels {
+    /// Reasoning level the system prompt was fingerprinted under.
+    pub think_mode: String,
+    /// Byte offset where trusted control text stops in the system prompt.
+    pub trusted_len: usize,
+    /// Global MCP servers whose tool defs entered Tier 1.
+    pub global_mcp: Vec<String>,
+    /// Absolute path of the project Tier 2 belongs to.
+    pub project_path: String,
+    /// `AGENTS.md`/`CLAUDE.md` files that fed Tier 2's stable context.
+    pub agents_files: Vec<String>,
+    /// Project-local MCP servers whose tool defs entered Tier 2.
+    pub local_mcp: Vec<String>,
+}
+
+/// The `/kvcache` display label for a tier.
+///
+/// The MCP names are split by tier on purpose: a global server's tool defs are
+/// Tier 1 material and a project-local server's are Tier 2, so a local name
+/// appearing on a system label would mean the segregation this module enforces
+/// had broken.
+#[must_use]
+fn tier_label(kind: TierKind, labels: &TierLabels) -> crate::kvmeta::KvLabel {
+    match kind {
+        TierKind::System => crate::kvmeta::KvLabel::System {
+            think_mode: labels.think_mode.clone(),
+            trusted_len: labels.trusted_len,
+            global_mcp: labels.global_mcp.clone(),
+        },
+        TierKind::ProjectStable => crate::kvmeta::KvLabel::Project {
+            project_path: labels.project_path.clone(),
+            agents_files: labels.agents_files.clone(),
+            local_mcp: labels.local_mcp.clone(),
+        },
+        // Tier 3 is never cacheable, so this arm is unreachable through `warm`'s
+        // store path; it exists so the match is total.
+        TierKind::SessionVolatile => crate::kvmeta::KvLabel::Unknown,
+    }
+}
+
 /// Builds the tier list, ordered most-stable-first, with Tier 1 (the system
 /// prompt) leading it.
 ///
@@ -196,6 +249,7 @@ pub fn plan(
     let mut tiers = vec![TierSpec {
         kind: TierKind::System,
         fingerprint: fp1.to_owned(),
+        parent: None,
         text: system.to_owned(),
         key: Some(KvKey::System { fp: fp1.to_owned() }),
     }];
@@ -224,6 +278,7 @@ pub fn plan(
                 fp: fp.clone(),
             }),
             fingerprint: fp.clone(),
+            parent: Some(fp1.to_owned()),
             text: stable.to_owned(),
         });
         fp
@@ -234,6 +289,10 @@ pub fn plan(
         tiers.push(TierSpec {
             kind: TierKind::SessionVolatile,
             fingerprint: tier_fingerprint(&fp2, volatile.as_bytes()),
+            // `fp2` has already collapsed to `fp1` when there is no Tier 2, so
+            // this names Tier 2 when one exists and Tier 1 when it does not —
+            // never a tier absent from the list.
+            parent: Some(fp2.clone()),
             text: volatile.to_owned(),
             key: None,
         });
@@ -276,6 +335,48 @@ impl Restored {
     }
 }
 
+/// Instruments one tier's restore decision, gated behind `PLANK_DEBUG_SYSPROMPT`.
+///
+/// The investigation aid for cache churn: two launches leave two diffable
+/// prompt dumps plus a running record of which tier resumed and why. It was
+/// lost when the tier walk replaced `warm_system_prompt` — the one path it hung
+/// off — and its absence is felt every time a "why did it re-prefill?" report
+/// arrives, because [`Restored`] only says what happened to the tier that was
+/// asked about, and only in memory.
+///
+/// The system tier's *text* is dumped, keyed by the first 8 of its fingerprint,
+/// so two launches that disagree can be diffed byte-for-byte. Best-effort
+/// throughout: this must never fail a warm-up.
+fn debug_trace_tier(store: Option<&SessionStore>, tier: &TierSpec, outcome: &str) {
+    if std::env::var_os("PLANK_DEBUG_SYSPROMPT").is_none() {
+        return;
+    }
+    let fp = tier.key.as_ref().map_or("", KvKey::signature);
+    let fp8 = &fp[..fp.len().min(8)];
+    let dump = store.map(|s| {
+        let kind = format!("{:?}", tier.kind).to_ascii_lowercase();
+        let path = s.dir().join(format!("sysprompt-debug-{kind}-{fp8}.txt"));
+        let _ = std::fs::write(&path, &tier.text);
+        path
+    });
+    let line = format!(
+        "pid={} tier={:?} outcome={outcome} fp={fp} text_len={} dump={}\n",
+        std::process::id(),
+        tier.kind,
+        tier.text.len(),
+        dump.as_ref()
+            .map_or_else(String::new, |p| p.display().to_string()),
+    );
+    if let Some(store) = store {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(store.dir().join("sysprompt-debug.log"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+    eprint!("[sysprompt-debug] {line}");
+}
+
 /// Restores `tier`'s checkpoint into `engine`, or leaves the engine cold.
 ///
 /// The restore leg of [`warm`] without its prefill leg, for callers that must
@@ -299,19 +400,24 @@ pub fn restore(
     tier: &TierSpec,
 ) -> Result<Restored, EngineError> {
     let Some((key, store)) = tier.key.as_ref().zip(store) else {
+        debug_trace_tier(None, tier, Restored::NoKey.reason());
         return Ok(Restored::NoKey);
     };
     let Some(cache) = store.kv_load(key) else {
-        return Ok(if store.kv_path(key).exists() {
+        let outcome = if store.kv_path(key).exists() {
             Restored::Unreadable
         } else {
             Restored::NoCheckpoint
-        });
+        };
+        debug_trace_tier(Some(store), tier, outcome.reason());
+        return Ok(outcome);
     };
     engine.warm_reset(&tier.text)?;
     if engine.set_kv(&cache).is_err() {
+        debug_trace_tier(Some(store), tier, Restored::EngineRefused.reason());
         return Ok(Restored::EngineRefused);
     }
+    debug_trace_tier(Some(store), tier, Restored::Yes.reason());
     // Same reason as the `i < resume` branch in `warm`: the engine's cumulative
     // token buffer must describe the whole restored prefix, or the next sync
     // sees a common prefix shorter than the buffer and throws the restored KV
@@ -339,6 +445,11 @@ pub fn restore(
 /// prefilled (never for a restored tier), so a front end can name the stage its
 /// progress bar is actually covering — see [`TierKind::warm_label`].
 ///
+/// `labels` supplies the human-readable display material recorded in each
+/// persisted tier's metadata sidecar (see [`TierLabels`]). It is cosmetic: no
+/// part of it is key material, so a wrong or empty field can never invalidate a
+/// checkpoint.
+///
 /// # Errors
 /// Returns [`EngineError`] only when the engine itself fails to restore or
 /// prefill. Cache IO failures are best-effort and never propagate.
@@ -348,6 +459,7 @@ pub fn warm(
     tiers: &[TierSpec],
     on_event: &mut dyn FnMut(EngineEvent),
     on_stage: &mut dyn FnMut(TierKind),
+    labels: &TierLabels,
 ) -> Result<bool, EngineError> {
     let Some(system) = tiers.first().filter(|t| t.kind == TierKind::System) else {
         return Ok(false);
@@ -363,12 +475,15 @@ pub fn warm(
             .zip(store)
             .and_then(|(key, store)| store.kv_load(key))
         else {
+            debug_trace_tier(store, t, "no checkpoint loaded for this fingerprint");
             continue;
         };
         if engine.set_kv(&cache).is_ok() {
+            debug_trace_tier(store, t, "resumed here");
             resume = i + 1;
             break;
         }
+        debug_trace_tier(store, t, "engine refused the checkpoint");
         // Keyed correctly but the bytes would not load into this build: say so
         // and keep walking upward rather than trusting them.
         on_event(EngineEvent::Notice(
@@ -418,7 +533,29 @@ pub fn warm(
             continue;
         }
         on_stage(t.kind);
-        prefilled |= engine.warm_sync(on_event)?;
+        // Warming is where a cold session does its heaviest prefill — the
+        // system prompt and project context — so the peak prefill rate is
+        // mostly earned here rather than in a turn's own short suffix.
+        // Recorded at the one chokepoint every front-end shares.
+        let model = engine.model_name();
+        // Buffered rather than recorded live: a tier served from a KV
+        // checkpoint still reports its token count against an elapsed of
+        // almost nothing, which reads as thousands of tok/s — a number no
+        // model produces, and one a peak would never let go of. `warm_sync`
+        // only says whether it really prefilled once it returns.
+        let mut samples: Vec<(i32, f64)> = Vec::new();
+        let did_prefill = engine.warm_sync(&mut |ev| {
+            if let EngineEvent::Prefill(p) = &ev {
+                samples.push((p.done, p.tps));
+            }
+            on_event(ev);
+        })?;
+        if did_prefill {
+            for (done, tps) in samples {
+                crate::speeds::note_prefill_progress(&model, done, tps);
+            }
+        }
+        prefilled |= did_prefill;
         if let Some(key) = &t.key
             && let Some(store) = store
             && let Some(cache) = engine.get_kv()
@@ -429,7 +566,13 @@ pub fn warm(
             // C-side common-prefix probe does the real matching, exactly as the
             // older transcript-less checkpoint format did. Do not start
             // trusting `cache.transcript()` for these.
-            let _ = store.kv_store(key, &cache);
+            let _ = store.kv_store_labeled(
+                key,
+                &cache,
+                t.parent.as_deref(),
+                &model,
+                &tier_label(t.kind, labels),
+            );
         }
     }
     // Refresh the sidecar only after a Tier 1 rebuild actually completed: a
@@ -713,6 +856,105 @@ mod tests {
         expect.extend_from_slice(b"sys");
         assert_eq!(a, crate::session::sha1_hex(&expect));
     }
+
+    #[test]
+    fn each_tier_records_its_parent_fingerprint() {
+        let tiers = plan(
+            "fp1-system",
+            "system text",
+            "stable context",
+            "volatile context",
+            "local defs",
+            Some(std::path::Path::new("/tmp/plank-lineage")),
+        );
+        let sys = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::System)
+            .expect("plan always emits Tier 1 first");
+        assert!(sys.parent.is_none(), "the system tier is the root");
+        let proj = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::ProjectStable)
+            .expect("a project tier exists when there is stable text");
+        assert_eq!(proj.parent.as_deref(), Some("fp1-system"));
+        let vol = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::SessionVolatile)
+            .expect("a volatile tier exists when there is volatile text");
+        assert_eq!(
+            vol.parent.as_deref(),
+            Some(proj.fingerprint.as_str()),
+            "Tier 3 chains off Tier 2, not off Tier 1"
+        );
+    }
+
+    #[test]
+    fn the_volatile_tier_chains_off_tier_1_when_there_is_no_stable_text() {
+        // `plan` collapses fp2 to fp1 when `stable` is empty and emits no Tier 2,
+        // so Tier 3's recorded parent must follow that collapse rather than naming
+        // a tier that does not exist.
+        let tiers = plan("fp1-system", "system text", "", "volatile", "", None);
+        assert!(
+            !tiers.iter().any(|t| t.kind == TierKind::ProjectStable),
+            "no stable text means no Tier 2"
+        );
+        let vol = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::SessionVolatile)
+            .expect("volatile tier present");
+        assert_eq!(vol.parent.as_deref(), Some("fp1-system"));
+    }
+
+    #[test]
+    fn a_local_mcp_name_never_reaches_a_system_label() {
+        // The audit surface for MCP segregation: global tool defs are Tier 1
+        // material, project-local ones are Tier 2. A local name on a system label
+        // would mean that split had broken.
+        let labels = TierLabels {
+            think_mode: "max".into(),
+            trusted_len: 12,
+            global_mcp: vec!["global-srv".into()],
+            project_path: "/Users/x/Code/plank".into(),
+            agents_files: vec!["AGENTS.md".into()],
+            local_mcp: vec!["local-srv".into()],
+        };
+        match tier_label(TierKind::System, &labels) {
+            crate::kvmeta::KvLabel::System {
+                think_mode,
+                trusted_len,
+                global_mcp,
+            } => {
+                assert_eq!(think_mode, "max");
+                assert_eq!(trusted_len, 12);
+                assert_eq!(global_mcp, vec!["global-srv".to_owned()]);
+                assert!(
+                    !global_mcp.iter().any(|n| n == "local-srv"),
+                    "a project-local server must never appear on a system label"
+                );
+            }
+            other => panic!("expected a System label, got {other:?}"),
+        }
+        match tier_label(TierKind::ProjectStable, &labels) {
+            crate::kvmeta::KvLabel::Project {
+                project_path,
+                agents_files,
+                local_mcp,
+            } => {
+                assert_eq!(project_path, "/Users/x/Code/plank");
+                assert_eq!(agents_files, vec!["AGENTS.md".to_owned()]);
+                assert_eq!(local_mcp, vec!["local-srv".to_owned()]);
+                assert!(
+                    !local_mcp.iter().any(|n| n == "global-srv"),
+                    "a global server must never appear on a project label"
+                );
+            }
+            other => panic!("expected a Project label, got {other:?}"),
+        }
+        assert!(matches!(
+            tier_label(TierKind::SessionVolatile, &labels),
+            crate::kvmeta::KvLabel::Unknown
+        ));
+    }
 }
 
 /// Records what a warm walk asked the engine to do, so the walk's logic can be
@@ -798,7 +1040,9 @@ impl crate::engine::Engine for SpyEngine {
 
 #[cfg(test)]
 mod warm_tests {
-    use super::{Restored, TierKind, TierSpec, plan, restore, system_fingerprint, warm};
+    use super::{
+        Restored, TierKind, TierLabels, TierSpec, plan, restore, system_fingerprint, warm,
+    };
     use std::path::Path;
 
     use super::SpyEngine;
@@ -838,7 +1082,15 @@ mod warm_tests {
 
         // Seed the checkpoint the way a local-main session would, then re-run:
         // now it restores, still without prefilling.
-        warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers[..1],
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
         let mut e = SpyEngine {
             supports_kv: true,
             ..Default::default()
@@ -857,6 +1109,62 @@ mod warm_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The `PLANK_DEBUG_SYSPROMPT` trace hung off `warm_system_prompt` and was
+    /// lost when the tier walk replaced that path, so the one tool for
+    /// diagnosing cache churn silently did nothing. It now covers every tier
+    /// decision on both legs of the walk.
+    #[test]
+    fn the_sysprompt_debug_trace_records_every_tier_decision() {
+        let (store, dir) = spy_store("sysprompt-debug");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        // SAFETY: the trace is read through `var_os` only, and no other test
+        // touches this variable.
+        unsafe { std::env::set_var("PLANK_DEBUG_SYSPROMPT", "1") };
+        // Cold: every tier misses. Then warm again, so the second walk resumes
+        // from a checkpoint the first one wrote.
+        for _ in 0..2 {
+            warm(
+                &mut e,
+                Some(&store),
+                &tiers,
+                &mut |_| {},
+                &mut |_| {},
+                &TierLabels::default(),
+            )
+            .unwrap();
+        }
+        unsafe { std::env::remove_var("PLANK_DEBUG_SYSPROMPT") };
+
+        let log = std::fs::read_to_string(dir.join("sysprompt-debug.log")).expect("no debug log");
+        assert!(
+            log.contains("outcome=no checkpoint loaded for this fingerprint"),
+            "the cold walk's misses are not recorded: {log}"
+        );
+        assert!(
+            log.contains("outcome=resumed here"),
+            "the second walk's resume point is not recorded: {log}"
+        );
+        assert!(log.contains("tier=System"), "{log}");
+        // The prompt text itself is dumped, keyed by fingerprint, so two
+        // launches that disagree can be diffed.
+        let dumps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("sysprompt-debug-system-"))
+            .collect();
+        assert_eq!(dumps.len(), 1, "{dumps:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&dumps[0])).unwrap(),
+            "SYSTEM"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The system checkpoint is what a sub-agent sidechain restores, and a
     /// one-tier walk is the only thing that writes it — so assert the *file*,
     /// not just that a prefill happened. Nothing else in the suite would notice
@@ -870,7 +1178,17 @@ mod warm_tests {
             ..Default::default()
         };
 
-        assert!(warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap());
+        assert!(
+            warm(
+                &mut e,
+                Some(&store),
+                &tiers[..1],
+                &mut |_| {},
+                &mut |_| {},
+                &TierLabels::default()
+            )
+            .unwrap()
+        );
 
         let key = tiers[0].key.as_ref().expect("system tier is cacheable");
         assert!(
@@ -901,6 +1219,7 @@ mod warm_tests {
             &tiers[..1],
             &mut |_| {},
             &mut |_| {},
+            &TierLabels::default(),
         )
         .unwrap();
         assert_eq!(first.synced, vec![None], "the first launch pays for it");
@@ -915,6 +1234,7 @@ mod warm_tests {
             &tiers[..1],
             &mut |_| {},
             &mut |_| {},
+            &TierLabels::default(),
         )
         .unwrap();
 
@@ -942,7 +1262,15 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut seed, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut seed,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
         let sys_key = tiers[0].key.as_ref().unwrap();
         let _ = std::fs::remove_file(store.kv_path(sys_key));
         assert!(!store.kv_path(sys_key).exists());
@@ -951,7 +1279,15 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
 
         assert!(
             !store.kv_path(sys_key).exists(),
@@ -996,7 +1332,15 @@ mod warm_tests {
         assert_eq!(e.reset_to, None, "and the engine is still untouched");
 
         // Readable, but this engine will not take it.
-        warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers[..1],
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
         let mut fussy = SpyEngine {
             supports_kv: true,
             refuse_kv: true,
@@ -1022,7 +1366,17 @@ mod warm_tests {
             ..Default::default()
         };
 
-        assert!(warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap());
+        assert!(
+            warm(
+                &mut e,
+                Some(&store),
+                &tiers,
+                &mut |_| {},
+                &mut |_| {},
+                &TierLabels::default()
+            )
+            .unwrap()
+        );
         assert_eq!(e.reset_to.as_deref(), Some("SYSTEM"));
         // System tier syncs with no appended message; the rest append their text.
         assert_eq!(
@@ -1051,9 +1405,14 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |k| {
-            cold.push(k);
-        })
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |k| cold.push(k),
+            &TierLabels::default(),
+        )
         .unwrap();
         assert_eq!(
             cold,
@@ -1076,9 +1435,14 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |k| {
-            warm_stages.push(k);
-        })
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |k| warm_stages.push(k),
+            &TierLabels::default(),
+        )
         .unwrap();
         assert_eq!(warm_stages, vec![TierKind::SessionVolatile]);
         assert_ne!(
@@ -1113,6 +1477,7 @@ mod warm_tests {
                 }
             },
             &mut |_| {},
+            &TierLabels::default(),
         )
         .unwrap();
         assert!(notices.is_empty(), "first run has nothing to compare");
@@ -1137,6 +1502,7 @@ mod warm_tests {
                 }
             },
             &mut |_| {},
+            &TierLabels::default(),
         )
         .unwrap();
         assert_eq!(notices.len(), 1, "one notice for the changed prompt");
@@ -1176,6 +1542,7 @@ mod warm_tests {
                 }
             },
             &mut |_| {},
+            &TierLabels::default(),
         )
         .unwrap();
         assert_eq!(notices.len(), 1, "a hit explains nothing");
@@ -1209,7 +1576,15 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
 
         // Deepest cacheable tier wins: the project checkpoint, not the system one.
         assert_eq!(
@@ -1249,7 +1624,15 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
 
         // Premise: the project tier really was restored, so tiers 0 and 1 are
         // the "skipped" ones this test is about.
@@ -1289,7 +1672,15 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
 
         assert_eq!(e.restored, vec![vec![10]], "fall back to the system tier");
         assert_eq!(e.synced, vec![Some("agents".into()), Some("git".into())]);
@@ -1307,7 +1698,15 @@ mod warm_tests {
             ..Default::default()
         };
 
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
         assert_eq!(e.synced, vec![None, Some("agents".into())]);
         assert!(store.kv_load(tiers[0].key.as_ref().unwrap()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1335,7 +1734,15 @@ mod warm_tests {
             ..Default::default()
         };
 
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
         let t0 = store.kv_load(tiers[0].key.as_ref().unwrap()).unwrap();
         let t1 = store.kv_load(tiers[1].key.as_ref().unwrap()).unwrap();
         assert!(

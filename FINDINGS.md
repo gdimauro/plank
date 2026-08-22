@@ -637,6 +637,90 @@ test` and review the diff before committing.
 
 ## Part 2 — Environment & tooling
 
+- **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`
+  is mirrored field-for-field by `ffi::Ds4EngineOptions`, and the mirror is
+  positional: a field added mid-struct in the C shifts everything after it and
+  the mismatch is silent — no compile error, just an engine configured from the
+  wrong bytes. Re-read the C struct top to bottom on every bump. `build.rs`
+  carries its own copy of the Makefile's `CORE_OBJS` list, so a new translation
+  unit there (`ds4_tp.o`, `ds4_layer_pack.o` arrived together) surfaces only as
+  undefined symbols at link time. And the prompt constants drift: `cargo test
+  --test c_parity` is the check, `PLANK_REGEN_FIXTURES=1` the fix, but only
+  after confirming the C's new text is text plank should actually be sending.
+- **Speculation needs its own entry point; the option struct is not enough.**
+  Everything `--dspark` touches in `ds4_engine_open_internal` and
+  `ds4_session_create` is allocation and setup: the support GGUF loads,
+  target-hidden capture turns on for layers 40-42, drafts get prepared. The
+  accept/rollback loop that *consumes* drafts lives in exactly one exported
+  function, `ds4_session_eval_speculative_argmax`, which takes a sampled
+  `first_token` and returns the committed run with that token at index 0.
+  `ds4_session_eval` advances one token and can never accept a block, so a
+  loop built on it gets zero benefit no matter how the engine is configured.
+  Diagnostic: `DS4_DSPARK_STATS=1` printing *nothing* means the speculative
+  path never ran — it is not the same as poor acceptance, which prints
+  counters. The C gates the call on `temperature <= 0` (verification is
+  argmax) and `ds4_engine_mtp_draft_tokens(e) > 1`; `ds4engine.rs` mirrors
+  both. The committed run is already in the KV cache when the call returns,
+  so nothing downstream can reject part of it — which is why think-recovery
+  now runs once per block instead of once per token.
+- **`DSpark` on Metal went from 0.71x to 1.19x on one upstream commit — pin the
+  engine before quoting any number.** Through the whole M5 fusion work it was a
+  clear loss on M5 Max at IQ2XXS: paired plank replicas read `19.84 t/s`
+  target-only against `13.99 t/s` with `--dspark`, and `DS4_DSPARK_STATS=1`
+  said why — `accept_rate=74.13%` looked healthy, but `verify=107s` and
+  `replay=134555ms` against `saved=148784ms` left `net_saved=-125652ms`.
+  Then `42033ee metal: pipeline `DFlash` verification` (submit tiny
+  target-verifier batches incrementally, and retune the Metal confidence
+  default to 0.6) flipped it: `19.84` against `23.63 t/s`, 1.19x, with wall
+  clock agreeing at 0.81x and `--dspark` winning every pair. Nothing in plank
+  changed between those two measurements — the same binary, prompt, and model.
+  Two lessons. `net_saved` is the number to read, not `accept_rate`, which
+  looked fine in both regimes. And a `DSpark` verdict is only ever true of one
+  engine commit, so record the SHA next to the figure.
+  **Confirm against `./ds4` before suspecting plank.** Building the reference
+  CLI out of the submodule (`make ds4`) and running the same prompt and model
+  reproduced the loss era exactly — `21.92 / 21.78 t/s` target-only against
+  `15.79 / 15.44` with `--dspark`, the same 0.71x plank showed. Two binaries
+  agreeing rules the port out in one step, and it is much cheaper than
+  reasoning about the FFI.
+- **`--dspark-confidence` has no fixed default, so plank does not name one.**
+  The engine picks `METAL ? 0.6 : 0.7` and *ignores the value plank passes*
+  unless `dspark_confidence_threshold_set` is true — which is why the field is
+  `Option<f32>` (`0` means "fixed five-token blocks", not "unset"). A mirrored
+  constant went stale the moment upstream retuned Metal from 0.7 to 0.6, so
+  there is deliberately no `DSPARK_CONFIDENCE_DEFAULT` in `config.rs`: the
+  unset case passes a placeholder the engine discards.
+- **Do not time this with one-shot `./ds4 -p`; use `ds4-bench`.** Ad-hoc CLI
+  timings of a long generation swing wildly on a laptop — the same
+  target-only command measured 34.01, 21.92 and 21.78 t/s across three runs,
+  and an early cold-cache run read 11.52. Any before/after conclusion drawn
+  from single runs like that is noise. The fork's contract is three
+  independent `ds4-bench` processes with the *Promessi sposi* fixture at a
+  fixed 2048-token context (the exact command is in
+  `speed-bench/ds4_m5_fusion_port_results.md`), reporting median and min-max.
+  On that instrument this machine reads decode `42.03 t/s` median
+  (42.86/41.86/42.03) and steady `42.31`, against the fork's documented
+  `39.39` median baseline at `caf64d1` — so the M5 fusions are engaged and
+  worth about +7%. Paired A/B on one instrument beats absolute numbers across
+  two.
+- **plank's greedy output is not bit-reproducible, and it is not `DSpark`.**
+  Across twelve `--temp 0` runs of one prompt, ten produced the same output
+  and two diverged from the first token — one under `--dspark`, one under
+  target-only decode, so the earlier reading that blamed speculation was an
+  artifact of small samples. Both outliers were the first run after something
+  invalidated a cache (a rebuild, a prompt change), which points at prefill
+  chunking changing float accumulation order and flipping a near-tie token,
+  not at the accept path. Divergent outputs are coherent prose, never
+  corruption. Before blaming the port for any of this,
+  `ffi::tests::engine_options_*_match_the_c_layout` pins all 42 field offsets
+  and the struct size against `offsetof` on the C header.
+- **The C's prompt constants can hide behind `#define`s.** `ds4_agent.c` split
+  the editing section into `agent_tools_prompt_edit_exact` (its default) and
+  `agent_tools_prompt_edit_upto`, sharing a sentence through
+  `AGENT_EDIT_TARGET_RULE`. plank ships the `[upto]` variant, because its edit
+  tool implements the anchor. `tests/c_parity.rs` expands object-like string
+  macros before decoding literals; a literal decoder alone chokes on the bare
+  macro name.
 - **The Metal backend needs the macOS 15 SDK** (`MTLResidencySet`), so
   release builds run on `macos-15` runners and bottle as `arm64_sequoia`.
   The ds4 Makefile's `-mcpu=native` default is invalid for x86_64 clang and
@@ -1060,3 +1144,387 @@ test` and review the diff before committing.
   ripples drew as `~~~~~`. Running the key through the splitmix64 finalizer
   first fixed it. The lesson is narrow but recurring: multiply-and-add is a
   *sequence*, not a scatter, and modulo does not rescue it.
+
+- **`ureq` defaults *every* timeout to `None`, and a dropped network gives the
+  kernel nothing to time out.** A sudden link loss (Wi-Fi off, sleep, NAT
+  rebind) produces no RST and no FIN, and once the request is fully sent plank
+  is purely *receiving* — so there is no unacked data for TCP to retransmit and
+  therefore no kernel timeout can ever fire. The socket sits established and
+  black-holed, and a blocking read on it parks forever. Every agent needs
+  explicit `timeout_connect` / `timeout_recv_response`; the streaming ones need
+  more than that, because `timeout_recv_body` bounds the *total* body duration
+  and so cannot tell a dead socket from a long healthy generation. The body
+  therefore gets an **idle** timeout instead (`remote::STREAM_IDLE_TIMEOUT`),
+  which is only sound because both providers keepalive their SSE streams
+  (Anthropic `event: ping`, OpenAI comment frames).
+
+- **Never poll a cancellation flag from a data-driven callback.** The provider
+  and ds4 clients used to check `interrupt()` inside the `read_sse` callback,
+  which runs per arriving event. Zero bytes means zero polls, so cancellation
+  died in exactly the situation it was needed. The fix is structural, not a
+  timeout: the read runs on its own thread feeding a channel and the turn does
+  `recv_timeout`, so the flag is polled on a *clock* (`remote::pump_sse`).
+  Anything gated on "the peer is still talking to us" has this bug latent.
+
+- **A `std::thread::scope` worker cannot be abandoned, so force-quit means
+  `process::exit`.** `run_worker_ui` spawns the turn on a scoped thread holding
+  `&mut Agent`; the scope cannot be left while it runs and the borrow checker
+  enforces it. There is no "abandon the thread and keep going" — the UI's only
+  escape from a wedged worker is restoring the terminal and exiting the
+  process, which skips every destructor and loses the in-flight turn. Worth
+  knowing before designing any UI affordance that promises to cancel a turn.
+
+- **`TextBuffer::write_canon` auto-indents, so it must never seed a file you
+  intend to write back.** The canonicalizing insert path expands tabs to spaces
+  (gated on `indent_with_tabs`, default off) and, after every newline,
+  re-emits the *previous* line's indentation on top of the incoming line's own
+  leading whitespace — so indentation compounds down the file. It also rewrites
+  every interior line break to the one convention `set_crlf` selected. `/open`
+  inherited that seeding from the Ctrl-G prompt path, where it is harmless
+  because nothing is written to disk; against a real file it turned
+  `fn a() {\n    let x;\n}\n` into cascading indentation plus a junk trailing
+  line, silently converted Makefile tabs to spaces, and normalized CRLF — and
+  because `State::original` is read back *out of the buffer*, `is_modified()`
+  reported the mangled buffer as clean, so nothing warned. File mode now uses
+  `write_raw` plus `set_crlf` detection (`src/miniedit/state.rs`), with
+  byte-exact round-trip tests for brace-indented, tab-indented, CRLF, empty and
+  newline-less inputs. Flat unindented fixtures cannot catch this class of bug;
+  any test guarding a file round-trip needs indentation and CRLF in it.
+- **Never decide "did this change?" by re-deriving what an editor buffer would
+  have done.** `/open` first compared the edited text against a seed computed
+  outside the buffer. Each fix modelled one more of the buffer's
+  normalizations (the missing trailing newline) and still missed the next
+  (interior line breaks), so mixed and lone-CR files were silently rewritten on
+  a Ctrl+S the user never edited into. Any independently-derived baseline drifts
+  the moment the buffer normalizes something new. The fix is structural: ask the
+  buffer itself, via `State::is_modified()` against the `original` it read back
+  at construction (`State::accepted_text`). For a file, "accepted unchanged" and
+  "cancelled" are the same outcome, so both collapse to `None`.
+- **Bare `cargo fmt` reformats the vendored `refs/obscura` submodule.** obscura
+  is a path dependency (`Cargo.toml`), so rustfmt walks into it and rewrites 59
+  files / ~4000 lines to plank's style — churn inside a submodule we do not own,
+  showing up only as ` M refs/obscura` in the parent's status. Use `cargo fmt -p
+  plank`. Note the pre-commit hook still runs the bare form, so a commit made
+  through it can carry the drift; recover with `git -C refs/obscura checkout --
+  .`.
+- **A sub-agent's report is its transcript text, and a transcript keeps
+  `<think>` verbatim.** The report handed back as a tool observation came from
+  `last_assistant_text`, i.e. the raw last assistant message — which still
+  carries the reasoning block, because the KV prefix depends on the transcript
+  holding thinking unaltered. The parent therefore received a report narrating
+  half-abandoned alternatives, judged it unreliable, and redid the work by hand
+  (defeating the whole point of delegating). Two fixes are needed, because they
+  address different halves: `strip_thinking` removes blocks the model *marked*
+  as thinking, and the `agents::task_message` envelope asks for the plain answer
+  stated once, which is the only lever against reasoning narrated as ordinary
+  prose in the report body — no parser can identify that. Note the emptiness
+  test has to run *after* stripping, or a pass that was pure reasoning yields a
+  blank report instead of falling back to the last real answer.
+- **`record_usage` fires at pass *completion*, so per-pass token accounting
+  shows nothing during a long pass.** A sub-agent roster row wired only to the
+  per-pass tally sat blank for the minutes a local pass takes, which reads as a
+  broken feature rather than as "not counted yet" — and it is intermittent,
+  since a short pass populates the row almost immediately. Live counts have to
+  come from the worker's `UiEvent::Status` snapshots (`prefill_done`/
+  `prefill_total`/`generated`), the same source `status::progress_segment` draws
+  the main progress line from. Fold the completed pass in and drop the live
+  figures in the same breath, or the two double-count. The snapshot describes
+  whichever pass the engine is running, so it can only be attributed when
+  exactly one sub-agent is in flight; a fan-out has several, and its rows must
+  stay on their own per-pass tallies.
+- **A live one-line summary of an agent cannot come from the tail of its
+  output.** The roster's task column was first derived from the newest non-blank
+  line of the run's `OutputLog`, on the reasoning that a derived value cannot
+  drift from what it summarises. It cannot drift, but it is worthless: a
+  streaming line is sampled mid-statement, so the column showed fragments like
+  `vals =` from whatever code the model happened to be emitting. The delegated
+  task is the stable, meaningful source — flattened to one line, since a task is
+  often a paragraph and a raw newline breaks the row. Cap it well below the
+  available width too (`TASK_MAX_COLS`): sized only by "whatever room is left",
+  prose runs to the edge on a wide terminal and buries the name and the tally
+  the row exists to show.
+- **`.kv` used to mean two different things, and the GC paid for it.** The
+  extension named both a session transcript and a Tier 1 checkpoint, so
+  `gc_system_checkpoints` had to hand-filter file names by the `sysprompt-`
+  prefix to avoid eating user data. Any new species of cache file inherited the
+  same obligation, and one forgotten prefix check would delete transcripts.
+  Bodies are now `<stem>.kv_raw` with a `<stem>.json` sidecar, transcripts alone
+  keep `.kv`, and the sweep can walk by extension with nothing to hand-filter.
+  The rename is also why the migration wipes rather than adopts the old layout:
+  synthesized metadata would carry no lineage and unreliable counters, and every
+  tier rebuilds on demand.
+- **Metadata beside a KV blob has to stay advisory, or the cache stops being
+  safe.** The signature inside the body (`KVCache::decode`) is the only trust
+  input for restoring cached bytes; the sidecar exists for display, counters and
+  retention. A missing or corrupt sidecar therefore costs a nicer `/kvcache` row
+  and some counters, never correctness, and sidecar writes are best-effort for
+  the same reason. The moment anything consults a sidecar field to decide whether
+  a body may be loaded, a stale or hand-edited JSON file becomes able to feed the
+  model a KV built from a different prompt, which is exactly the failure every
+  fingerprint in this subsystem exists to prevent. `META_VERSION` is likewise
+  independent of `kvcache::FORMAT_VERSION`, and a sidecar at an unrecognized
+  version is ignored rather than migrated: resetting counters is cheap, and
+  guessing at a schema you do not know is not.
+- **The GC's "has a surviving child" rule reads the pre-sweep node set.** Judged
+  against a set mutating as files are unlinked, a sweep's outcome would depend on
+  directory scan order, so the same cache could collect different files on two
+  runs. Reading the set as it stood before the sweep began costs one extra run to
+  collect a parent whose last child died this run, which is the intended
+  bottom-up cascade: a dead chain collects one level per launch.
+- **Phase 2 must read the *post*-phase-1 survivor set, the opposite of phase 1.**
+  The budget pass re-derives "has a surviving child" against what phase 1 left
+  alive. Reusing phase 1's pre-sweep view there would make a parent whose only
+  child just expired immortal under any budget, because it would keep looking
+  like it was holding a live descendant up. The two phases read different sets on
+  purpose, and the reason differs on each side: phase 1 wants order independence,
+  phase 2 wants an upper bound that actually binds.
+- **`kvcache.maxBytes = 0` means unbounded, not "evict everything".** The
+  opposite reading is the natural one for a ceiling, and it would wipe the entire
+  cache on every launch for everyone who never set the key. A budget of zero is
+  also the shape an absent or unparsable settings value degrades to, which is the
+  worst possible moment to start deleting. Note the neighbouring TTLs go the
+  other way, where `>=` makes a TTL of zero mean "collect on sight" rather than a
+  silent no-op; a zero is only self-evident once you decide what it disables.
+- **A sweep verdict must map to a path, not to a fingerprint.** Two bodies can
+  legitimately share one fingerprint: a root `sysprompt-X.kv_raw` beside a
+  `<projkey>/project-X.kv_raw`, or the same `project-X` under two project
+  directories. A fingerprint-keyed delete then unlinks a file the sweep decided
+  to keep, and it looks like a policy bug rather than a lookup bug. `sweep` walks
+  paths and metadata as one paired list so verdict `i` names file `i`. The
+  `/kvcache` mutation path cannot do that (its input is a fingerprint prefix
+  typed by a user), so it refuses an ambiguous match outright instead of guessing.
+- **Re-persisting an existing fingerprint must preserve `created` and `pinned`.**
+  A refresh is the same blob being written again, not a new blob, and treating it
+  as new silently unpins whatever the user pinned and resets the age the TTL is
+  measured from. Both fields are read back off the prior sidecar before the new
+  one is written, so a pin survives every subsequent store.
+- **A test whose fixtures are always written fresh silently stops testing
+  anything once retention becomes age-based.**
+  `gc_keeps_the_alt_local_engines_system_checkpoint` was in exactly that state:
+  its blobs were young, freshness alone kept them, and the keep-set it existed to
+  exercise had no effect on the outcome. Deleting the entire code path it
+  guarded left it green. Any test of an age-sensitive policy has to write
+  explicit `last_used` values into its sidecars rather than let the filesystem
+  supply "now".
+- **A feature-gated dependency's binary cost is invisible until something calls
+  it.** Adding Extism (and through it wasmtime) behind the `plugins` feature
+  measured as +1.1 MiB, which is roughly wasmtime's *symbol table* and nothing
+  else: no code in `plank` reached `wasmhost::host()`, so the linker dead-stripped
+  the runtime. Forcing one reachable call from `main` put the real number at
+  **+18.0 MiB**. Any "how much does this dependency cost?" measurement has to
+  route through a call site the binary actually retains, or it measures the
+  linker rather than the dependency.
+- **`extism` does not compile with `default-features = false`.** The obvious way
+  to drop its `http`/`register-http`/`register-filesystem` defaults also drops
+  `wasmtime-default-features`, which is what carries the cranelift backend; the
+  result is 41 trait-resolution errors inside `extism` itself, none of which name
+  the missing feature. Disable the three by name and keep
+  `wasmtime-default-features` on.
+- **plank's release flow signs nothing.** `release.yml` is `cargo build
+  --release` into a tarball plus a Homebrew bottle — no codesigning, no hardened
+  runtime, no notarization. That is why a JIT-based plugin runtime is viable at
+  all: the `com.apple.security.cs.allow-jit` entitlement problem a notarized
+  build would have hit does not exist here. Worth re-checking before anyone adds
+  signing, since it would become a blocker retroactively.
+- **An animation gate keyed to one feature starves the next one.** The TUI's
+  idle loop polled at 20 Hz "if the arcade is open" and at 200 ms otherwise, so
+  the first WASM `frame` component ran at five frames a second. The stutter was
+  the visible half; the worse half is that the frame delta is measured from real
+  elapsed time and then clamped to `MAX_STEP_MS`, so at that rate half of every
+  second was dropped from the simulation and the motion ran *slow* as well as
+  rough. Any new thing that animates has to be added to that condition, and the
+  symptom does not look like a poll-rate problem — it looks like a slow plugin.
+- **A wall-clock assertion in a parallel test suite measures the machine.** A
+  per-frame budget test asserted 10 ms, passed at 3.7 ms run alone, and failed
+  under the full suite because everything else was competing for the CPU. Keep
+  the measurement, print the number, and set the threshold to catch an
+  order-of-magnitude regression rather than a busy box.
+- **A discarded stderr turns every server death into a timeout.** plank spawned
+  MCP stdio servers with `.stderr(Stdio::null())` so that only JSON-RPC reached
+  stdout, and reported both a poll timeout and a closed pipe through one string:
+  `no response from server (timeout or closed pipe)`. When `tokensave serve` is
+  started outside an indexed project it prints `no TokenSave index found ...` to
+  stderr and exits 1 *before* answering `initialize`, so the single actionable
+  line was thrown away and the message blamed a 30-second timeout that had not
+  elapsed. Piping stderr into a bounded rolling tail costs nothing and keeps
+  stdout clean; the tail is what makes the failure legible. Two traps in the
+  fix: EOF on stdout **races the child's exit**, so an immediate `try_wait` says
+  "still running" for a process that has already died and the message reverts to
+  blaming the timeout — a short grace poll is required; and a server's startup
+  error is usually followed by a long usage dump, so keep the *tail* and quote
+  the *last* line rather than the first.
+- **`primaryTools` was honoured on the text path and ignored on the provider
+  path.** `append_tool_schemas` gives a full schema only to primary tools and
+  lists the rest as a one-line directory, but `provider_tool_registry` pushed a
+  `ToolSpec` for *every* MCP tool. With tokensave connected that made a plank
+  request 94.5 KB of which 90.2 KB was 140 tool schemas — 95% of the body,
+  resent on every turn. Filtering to primary cut it to 52.6 KB / 66 tools.
+
+  Measured on a 27B Q4 Metal server (prompt cache off, so prefill is
+  deterministic): bare prompt 61 tokens / 1.4 s to first token; 66 tools 13.6k
+  tokens / 80.8 s; 140 tools 24.7k tokens / 156.4 s. **The cost is
+  time-to-first-token, not generation speed** — decode came out flat at
+  7.07 / 7.67 / 8.16 t/s across the three, i.e. within noise, and a quieter run
+  put the context penalty at roughly 15% (26.6 t/s bare vs 22.4 t/s at 13.6k).
+  The intuition that a long KV slows every token is real but second-order here;
+  what people report as "plank is much slower than llama-cli" is a ~160 t/s
+  prefill multiplied by a prompt two orders of magnitude larger, which reads as
+  catastrophic t/s only if the measurement divides tokens by wall-clock. With
+  the server's prompt cache on, repeat turns prefill in 0.2 s, so the payload is
+  paid on the first turn of a session and again whenever anything perturbs the
+  prefix (tool list change, a server flapping, compaction rewriting early
+  transcript). Beware measuring any of this on a loaded box: an orphaned
+  benchmark hitting the same server concurrently moved decode between 1 and
+  27 t/s and inverted the ordering.
+- **A text-path tool can be undeclared; a provider-path tool cannot.** The text
+  path can leave directory tools out of the prompt because the model emits DSML
+  — free text that can name anything. On an OpenAI-compatible endpoint the model
+  can only call a function that was declared, and llama.cpp goes further by
+  building a *grammar* from the `tools` array, making an undeclared name
+  literally ungeneratable. So narrowing the declared set needs an `mcp_call`
+  escape hatch (full name + JSON arguments) carrying the directory in its
+  description; without one, "hide the schema" silently becomes "delete the
+  tool". Measuring a payload win here is easy, and it is exactly the change that
+  can lose functionality without failing a single test.
+- **The provider path advertised MCP tools under a name its own dispatcher
+  rejects.** `provider_tool_registry` pushed `ToolSpec { name: tool.name }` —
+  the bare `tokensave_status` — while `dispatch` routes MCP calls on the `mcp__`
+  prefix (`tools/mod.rs`) and the text path spells them `mcp__<server>__<tool>`
+  (`append_one_schema`). So on an OpenAI-compatible provider every MCP tool was
+  offered to the model and then answered with `Tool error: unknown tool`. Two
+  reasons it survived: no test compared the advertised name against what
+  dispatch accepts (they only checked that the name was *present*), and the
+  failure needs a live provider turn plus a tool the model actually decides to
+  call. It stayed invisible until the `mcp_call` directory started listing the
+  qualified spelling next to the bare specs — the model then said so out loud,
+  reasoning that "the tool is listed in the function spec as tokensave_status,
+  but it says unknown tool ... maybe it's in the MCP directory". A prompt that
+  contradicts itself produces exactly that thrash, and it looks like a model
+  failure rather than a naming bug. Assert routability, not presence.
+- **A long prompt costs ~20% of decode and all of the TTFT.**
+  `--minimal-prompt` makes the comparison cheap. Measured by warming each prefix
+  once and then sampling decode four times with the server's prompt cache on,
+  same question in every body (±1% repeatability): 59 tokens 6.55 t/s,
+  2,863 tokens 5.37 t/s (**-18%**), 10,679 tokens 5.14 t/s (**-22%**). Cold TTFT
+  over the same three: 0.5 s, 16.1 s, 54.8 s — warm, all three are 0.2-0.3 s.
+  So both effects are real, they compound, and **TTFT is the one that dominates
+  a cold turn** by an order of magnitude.
+
+  Getting a decode number that means anything took three attempts, and the two
+  failures are the lesson. (1) Short natural generations (48-57 tokens) are pure
+  noise: one body measured 20.69 and 7.91 t/s minutes apart. (2) `ignore_eos`,
+  the obvious way to force equal-length generations, **inverts the result** on a
+  speculative-decoding server — past the natural end the model emits degenerate
+  text, the DFlash draft model stops predicting it, acceptance collapses, and
+  the *bare* prompt looks slowest (3.05 t/s) because it reaches that point
+  first. Warm-cache repeat sampling is the method that works. Absolute values
+  still track machine load — the same contexts gave 22-26 t/s on an idle box and
+  5-7 t/s under load average 7.6 — so only ever compare figures measured back to
+  back, and quote ratios rather than absolutes.
+- **A provider engine can report real throughput; it just has to measure a
+  different clock.** `ProviderEngine::generate` hardcoded `tps: 0.0` and
+  `steady_tps: 0.0`, so every provider turn displayed `0.0 t/s` and the
+  `/speeds` peak line was suppressed by its own `> 0.0` guard. Both are
+  measurable from this side: `tps` from a clock started before the request,
+  `steady_tps` from the arrival of the *first text event* — the local engines
+  mark "steady" at `STEADY_WARMUP_SECS` into the pass, which a provider cannot
+  observe, but the first byte separates exactly what that warmup exists to
+  exclude (connect, queue, server-side prefill). Count tokens from the API's
+  `usage`, never from SSE deltas: a delta is not a token. Validated against
+  llama.cpp's own `print_timing` for the same turn — plank 8.5 tok/s vs
+  llama-server 8.46 t/s over an identical 198-token count.
+- **`--dspark` alone never speculates: the gate is `--temp 0`.** Both the C
+  (`ds4_cli.c:600`) and plank's port fetch the draft-block size only when
+  `temperature <= 0.0`, so at the default temperature of 0.7 the speculative
+  entry point is never called and DSpark buys exactly nothing. Nothing says so:
+  the model still loads, the support GGUF still loads, and the run looks normal.
+  Anything keyed off "is speculation happening" — a status segment, a benchmark,
+  a bug report — has to pass `--temp 0` or it is measuring plain decode with an
+  extra model in memory. (The C also honours `DS4_MTP_SPEC_DISABLE`; plank does
+  not read it.)
+- **`--dspark` is a net loss on Metal, and the footer's `x` figure hid it.**
+  With `--temp 0` the plumbing works exactly as designed — the support GGUF
+  loads (`stages=3 block=5`), `ds4_engine_mtp_draft_tokens` returns 5, and the
+  speculative entry point runs — yet measured end to end `--dspark` decodes
+  *slower* than plain decode (29.2/19.9 vs 31.9/26.5 tok/s on an M5 Max;
+  16.4 with `DS4_DSPARK_SCHEDULER=0`, 15.1 at `--dspark-confidence 0`). The
+  engine says so itself: `DS4_DSPARK_STATS=1` reports `saved=5178ms` against
+  `propose=1104ms` + `verify=5345ms`, i.e. **`net_saved=-1321ms`**, because a
+  batched verify of 5 positions costs ~27 ms/token against ~26 ms/token for
+  plain decode — the verify runs through the generic *batch prefill* kernels,
+  which carry a 1.5-2.5x per-stage excess over the decode kernels. Upstream
+  (`speed-bench/README.md`) reached the same verdict independently and reverted
+  four bit-exact optimisation attempts that each recovered nothing; the
+  unwritten fix is genuine small-N batched decode-grade verify kernels, and the
+  batch MoE is already at its distinct-expert floor. Treat `--dspark` as an
+  experiment on Metal, not a speedup. The C's adaptive scheduler is what makes
+  it read as merely *neutral* rather than a visible regression: it declined
+  228 of 405 proposals on the run above.
+  Two reporting traps that made this look like a plank bug rather than an
+  engine limit: `SpecStats::tokens_per_step` is *tokens committed per
+  speculative step*, not a wall-clock ratio — it read `2.1x` on the run that
+  was 40% slower, so it is rendered `2.1t/step` now and must never be labelled
+  `Nx`. And `SpecStats::drafted` counts the block size once per step, not what
+  the C actually proposed (the accept-run entry point never reports the draft
+  length), so `block_fill` is a lower bound: 10% where the engine's own
+  counters said 67%.
+- **Greedy chain decode is bit-exact, and a small regression on M5.**
+  `ds4_session_eval_chain_greedy` keeps the next token id on-device and encodes
+  ahead, removing plank's per-token `waitUntilCompleted` + logits readback +
+  CPU argmax (~0.5 ms/token). The output is bit-identical to the classic path —
+  verified by md5 over the reply across both — and upstream measured +1.75% on
+  an M3 Ultra. On an M5 Max it is **~1.3% slower**, losing all three
+  interleaved pairs (37.0/38.0/38.2 chained against 38.0/38.4/38.3 classic,
+  90 s cooldowns): the host boundary it removes is already cheap there, and the
+  device ring plus a shared-event wait per token is not free. Hence plank's
+  `chain_wanted()` gate — and note that the fork's three sibling Metal decode
+  commits are themselves `pre_m5`-gated, so this is the pattern, not an
+  exception.
+  Benchmarking traps that produced a wrong answer first: back-to-back runs
+  without cooldown gave a fake **+11%**, because this box throttles hard after
+  a heavy run and recovers over ~60-90 s (upstream: "one `ds4` instance at a
+  time; idle ~60 s after heavy runs"). Only interleaved pairs with cooldowns
+  mean anything. And `cargo test`/`cargo clippy` do not rebuild
+  `target/release/plank`, so an A/B run right after them can silently measure
+  the previous binary.
+  Three things to know before touching the chain:
+  `ds4_session_chain_greedy_supported` returns false for **any session holding
+  a support model**, so turning on `--dspark` forfeits the chain; the callback
+  must decline a token *before* recording it, because a `false` return leaves
+  that token out of the C's checkpoint and recording it anyway would desync
+  `reply_tokens` from the KV cache; and think-tool recovery has to be judged
+  inside the callback on the reply *without* the current token, which is the
+  same point in the stream as the serial path's post-commit check.
+- **Why llama.cpp's block drafters pay and ds4's DSpark does not: the verify
+  cost curve, not the algorithm.** llama.cpp implements the same family of
+  drafter — `common/speculative.cpp` has both `draft-dflash` and `draft-dspark`
+  in one impl, reading `dflash.block_size` / `selector_rank` / `selector_top_k`,
+  the same shape as ds4's `stages=3 block=5 markov_rank=256`. Measured on the
+  same M5 Max, Qwen3.8-27B + its DFlash2 drafter is **+21%** (30.0/29.7/28.9
+  against 24.5/24.3/24.1 t/s, interleaved with cooldowns, winning every pair).
+  The mechanism is one number: `llama-bench -p 1,2,3,4,5,6,8` gives the verify
+  cost curve directly, because llama.cpp verifies with a plain
+  `llama_decode(ctx_tgt, [id_last, draft...])` — the *same* graph as decode,
+  just wider. Per-forward latency: N=1 40.1 ms, N=2 44.6 (1.11x), N=4 57.8
+  (1.44x), N=8 88.3 (2.20x). ds4's DSpark verify costs **2.03x a plain decode
+  at N=2** (52.9 ms/verify against 26.1 ms/decode from `DS4_DSPARK_STATS=1`;
+  upstream's M3 Ultra figures, 50 vs 23.3 ms, agree). ds4 at N=2 is worse than
+  llama.cpp at N=8, which is the whole story: at 1.44x for four rows a 67%
+  accept rate is hugely profitable, at 2.03x for two rows it cannot be.
+  **The confound that keeps this from being a to-do list:** Qwen3.8-27B is
+  *dense* (llama-bench reports `qwen35 27B`, 26.9B params, 17.66 GiB), while
+  DeepSeek V4 Flash is a large MoE with IQ2 routed experts. Batching N tokens
+  through an MoE touches up to N x distinct experts, so the routed-expert reads
+  that dominate decode do not amortize the way a dense matmul's do — exactly
+  what ds4 upstream reported ("the batch MoE already runs at its
+  distinct-expert floor"). So llama.cpp's win does not prove ds4's verify is
+  fixable; it establishes what "good" looks like (a 4-row forward at 1.44x a
+  1-row forward) and confirms the gap is in the kernels, not the drafter.
+  Two policy differences are replicable in the C engine regardless, though both
+  are symptoms of the cost curve rather than causes — upstream's own knob sweep
+  already showed tuning does not close the gap. llama.cpp truncates a draft at
+  the first token below `p_min` and *keeps the confident prefix*, where ds4's
+  confidence gate declines the whole cycle (45-75% of them) after already
+  paying the propose; and llama.cpp's `p_min` defaults to 0 — never decline —
+  which is only rational because its verify is cheap. Nothing here is
+  actionable in plank: plank's side of the DSpark path is already correct.

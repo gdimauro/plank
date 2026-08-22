@@ -99,6 +99,8 @@ lines left over when the turn settles start a fresh turn), and Esc/Ctrl-C set
 a shared interrupt flag. The plain line REPL keeps the synchronous inline
 loop — with piped stdin there is no live input to multiplex.
 
+- `goal.rs` — `/goal` autonomous loop: iteration state, adjudication prompt, and verdict parsing. Pure logic; `ui.rs` drives it from both front ends.
+
 ### Engine abstraction (`engine.rs`, `ds4engine.rs`, `ffi.rs`, `snapshot.rs`)
 - `engine.rs` — the `Engine` trait (`generate` over `Prompt::{Flat, Structured}`,
   `warm_reset`/`warm_append`/`warm_sync`, `get_kv`/`set_kv`, `count_tokens`,
@@ -109,13 +111,23 @@ loop — with piped stdin there is no live input to multiplex.
   non-ds4 engines opt in only to what they support.
 - `ffi.rs` — raw declarations for the subset of the ds4 C API plank uses
   (engine open/close, chat-template tokenization, session sync/sample/eval,
-  KV snapshots). Present only under the `ds4_engine` cfg.
+  speculative decode, KV snapshots). Present only under the `ds4_engine` cfg.
+  `Ds4EngineOptions` mirrors the C `ds4_engine_options` **positionally**, so a
+  field inserted mid-struct upstream shifts everything after it with no compile
+  error; `ffi::tests` pins every offset and the struct size against `offsetof`
+  on the checked-out header.
+- `speeds.rs` — per-model peak prefill and generation rates for the current
+  session, printed in the exit message. Session-scoped and never persisted;
+  both rates exclude the first `STEADY_WARMUP_SECS` of their phase.
 - `ds4engine.rs` — the safe wrapper, split (issue #28) into `Ds4Model` (immutable
   `Arc`-shareable weights / tokenizer / Metal queue) and `Ds4Session` (one live
   FFI session, its KV suffix + cursor, implements `Engine`). The single-owner
   path is a `Ds4Session` over a solely-owned `Ds4Model`; it keeps one live session
   across turns so `ds4_session_sync` reuses the cached KV prefix and only prefills
-  the new suffix.
+  the new suffix. With DSpark enabled and greedy sampling, the decode loop drives
+  `ds4_session_eval_speculative_argmax` instead of one `ds4_session_eval` per
+  token — the only entry point that consumes drafts, and the reason configuring
+  the engine for DSpark is not on its own enough to get any benefit from it.
 - `snapshot.rs` — the safe KV snapshot primitive: `SessionSnapshot`
   (`capture`/`restore`/`as_bytes`/`restore_bytes`) over the FFI, plus an
   unconditional-restore `RestoreOnDrop` guard. Shared by `generate_aside`,
@@ -160,7 +172,8 @@ Model text is fed byte-by-byte through a pipeline:
 A headless sub-agent's `StreamRenderer` output does not write to the caller's
 screen directly: it is routed by `ui::SubSinkTarget` through a channel to
 `worker::SubAgentSink`, which re-emits it as `UiEvent::Sub`. From there the
-TUI event loop applies it to `tui::SubPane` (the Ctrl+O buffer), the plain
+TUI event loop applies it to the run's own buffer in `tui::SubPane` (the
+roster), the plain
 REPL prints it inline, or — for `SubSinkTarget::Null` under
 `--non-interactive` — it is discarded so the headless stdout protocol stays
 uncorrupted.
@@ -417,7 +430,7 @@ is parsed from the very arguments the settings seed.
 ## Data flows worth understanding
 
 ### System-prompt KV cache
-See **`docs/KV-CACHE.md`** for the full mechanics — tiers, fingerprints, the
+See **`docs/KV-CACHING.md`** for why this subsystem is shaped the way it is, and **`docs/KV-CACHE.md`** for the full mechanics — tiers, fingerprints, the
 warm walk, the on-disk format, forks, and GC. In outline, on startup the agent
 warms the cache before the first turn:
 
