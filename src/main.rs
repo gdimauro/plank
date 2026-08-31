@@ -116,6 +116,13 @@ fn main() -> ExitCode {
         print!("{}", usage());
         return ExitCode::SUCCESS;
     }
+    // `--dump-config` prints the resolved configuration (every effective key
+    // with the layer it came from) and exits, without starting a session. It
+    // works under `--non-interactive` because it needs no UI.
+    if cfg.dump_config {
+        print!("{}", plank::provenance::render_resolved(&settings, &cfg));
+        return ExitCode::SUCCESS;
+    }
     // Settings can move plank off Metal or shrink the context, and both are
     // invisible once the UI is up — you just notice it got slow. Say so.
     if let Some(note) = plank::settings::startup_note(&settings, &cfg) {
@@ -455,9 +462,10 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             .clone()
             .unwrap_or_else(plank::download::default_model_path);
         plank::download::ensure_model(&model)?;
-        // `--dspark` without `--mtp` resolves to the default support model,
-        // fetched on demand. Kept local rather than written back into `cfg`:
-        // only the engine open needs it.
+        // DSpark is on by default; without `--mtp` it resolves to the default
+        // support model, fetched on demand (`--dspark-off` skips this). Kept
+        // local rather than written back into `cfg`: only the engine open
+        // needs it.
         let mut tuning = cfg.engine.clone();
         plank::download::ensure_dspark_support(&mut tuning)?;
 

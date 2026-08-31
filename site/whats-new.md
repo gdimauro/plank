@@ -7,6 +7,153 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**The footer counts what you have changed.** The TUI's top row has always told
+you which tree you are in — directory and branch, held still while everything
+else churns. It now also tells you what you have done to it: `📄 3 · +128 -41`,
+files touched, then lines added in bright green and lines deleted in bright red.
+Staged and unstaged work are counted together and untracked files are included,
+so a file you edited and then added appears once, not twice. A clean tree shows
+nothing at all.
+
+**`/insights` now recommends the plank features you are not using.** The report
+already knew how you work; a new *Features to try* section turns that into two
+or three concrete suggestions — a skill for the routine you retype every week, a
+`PostToolUse` hook for the lint you keep running by hand, a subagent for the
+sweeps you do serially — each with a ready-to-run snippet rather than a
+description. It reads your installed skills, templates, subagents, hooks and MCP
+servers first, so it suggests what is missing instead of what you already have.
+See [Slash commands](/guide/04-slash-commands.html).
+
+**The thinking you hid is one glance away, in a second window.** With
+`showThinking` off the scrollback stays about the answer — but the reasoning is
+still worth watching while it happens, and a log file only tells you afterwards.
+plank mirrors its whole raw model stream to
+[turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console), a
+text-mode viewer that renders it in its own window: thinking dimmed above the
+answer, code highlighted, tool calls as banners.
+
+![turbo-debug-console showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein](/assets/debug-console.png)
+
+Each session gets a window titled `plank:<session-name>`, matching the name above
+your prompt, and the window and its scrollback survive plank exiting — restart and
+the new run appends below a `-- reconnected --` rule. It is entirely optional:
+with nothing listening plank connects to nothing, says nothing, and behaves
+exactly as it always has. `brew install aovestdipaperino/tap/turbo-debug-console`.
+
+**plank tells you where every setting came from.** Settings arrive from five
+layers — built-in defaults, plugins, `~/.plank`, the project's `./.plank`, and
+CLI flags — and "I set that and nothing happened" used to mean reading code.
+`plank --dump-config` now prints each effective key with the layer that won and
+the layers it beat, and `/config --resolved` does the same inside a session,
+including which plugin won a contested skill or agent name. See
+[Configuration](/guide/08-configuration.html).
+
+**Loop guards for the failure local models actually have.** A stale edit anchor
+sends a model into read/edit/read/edit, and small models often do not notice. On
+the third identical call the result now carries *"you have called this tool with
+these arguments 3 times; the result has not changed"*. Nothing is blocked — a
+legitimate third read exists, and blocking on a guess would be worse — and
+polling an async job is exempt, because a poll looks exactly like a stuck loop.
+Set `tools.callTimeoutSec` and the model is also told when a call overran its
+budget, so a hung test suite stops being invisible.
+
+**Large tool output is no longer a dead end.** Ask about a 5 MB build log and
+`read` used to truncate with nowhere to go. The full payload now goes to
+`~/.plank/spill/`, the model gets a bounded preview plus a `continue_offset` it
+can page through with `more`, and `/export` still sees everything the tool
+returned. The same bound applies to oversized MCP results, which previously had
+no cap at all — a single chatty server could fill your context in one call.
+
+**Context reclaims itself between turns.** After a dozen large reads those
+bodies are dead weight. plank now clears the old ones at end of turn — keeping
+the newest three, anything small, and everything belonging to the task you are
+on — with no model round-trip and no summarising. It holds off unless it would
+reclaim at least 4 KiB, because rewriting the transcript invalidates the KV
+prefix and an eager pass costs more than it saves.
+
+**`/search` across your own sessions.** You remember fixing a Metal crash a few
+weeks ago but not how. `/search metal` finds the session, shows the matching
+snippet and offers `/resume`; `--all` widens beyond the current project. It is
+deliberately compaction-proof — long sessions are both the ones worth searching
+and the ones that get compacted, so the index keeps conversation the transcript
+has since dropped.
+
+**Goals that outlive the session.** `/goal --max 5 make the failing test pass`
+runs a loop that adjudicates its own progress and stops on a verdict or the cap.
+The objective is durable state: it survives `/save`, `/resume` and `/compact`,
+so you can come back tomorrow and still see what it was pursuing and how far it
+got.
+
+**`/rate` records what worked, somewhere the model cannot see.** A rating goes
+to a sidecar, never the transcript, context or KV — if the model could read your
+ratings it would start optimising for them and the signal would be worthless.
+`/insights` turns a week of them into satisfaction over time plus the notes on
+the turns that went wrong.
+
+**Three new tools, on by default.** `recall` gives the model that same session
+history, so it can look up a past decision instead of guessing or interrupting
+you. `fanout` runs several independent subtasks and joins their reports in a
+fixed order, with optional throwaway-worktree isolation when subtasks edit
+files. `run_code` batches a few pre-decided operations — `read`, `glob`, `edit`,
+`bash` — into one turn instead of a round-trip each; every operation is routed
+through the normal tool dispatch, so the sandbox, the `~/.plank` write grant and
+your `PreToolUse` hooks apply exactly as they would to a bare call. Switch any
+of them off with `tools.recall`, `tools.fanout` or `tools.runCode`.
+
+**plank signs the commits it writes.** When the model creates a git commit, the
+message now ends with a blank line and the single line `--Co-Authored by Plank (https://plank-agent.dev)`,
+so a `git log` months from now still says which commits came out of a session
+rather than out of your fingers. It is a system-prompt instruction, not a hook,
+which means the model can be told to leave it off for one commit and your
+repository conventions still come first. If you would rather it never appear,
+set `"git": { "signCommits": false }` in `settings.json` or run
+`/config git.signCommits false`, and the instruction is gone from the prompt
+entirely. See [Configuration](/guide/08-configuration.html#git).
+
+**DSpark speculative decoding is on by default.** The auxiliary draft checkpoint
+used to need `--dspark`; now it is the default and `--dspark-off` is how you get
+target-only decode. Speculation only engages at temperature 0, so a bare `plank`
+samples argmax: pass `--temp` if you want sampling back, and `--dspark-off`
+leaves the old 0.6 default in force. The support model is still fetched on
+demand the first time it is needed.
+
+**The exit summary says where the session went.** It used to end with a peak
+prefill rate and a peak generation rate — one lucky pass each, which tells you
+nothing about the run you just had. Now every model that ran gets a line: time
+spent prefilling and time spent generating, each with the session's average
+rate, and time spent running tools.
+
+```
+avg deepseek-v4-flash  prefill 12.3s (1420.5 tok/s)  ·  generation 45.2s (38.1 tok/s)  ·  tools 8.4s
+```
+
+That last number is the one nobody was measuring, and a turn that felt slow is
+often not the model at all.
+
+**The think segment shows the router working.** Two braille cells beside the
+reasoning level re-roll on every decoded token, standing in for the
+mixture-of-experts routing. Being straight about it: the real selection never
+leaves the GPU on the Metal path, so the pattern is derived from the token id.
+It is honest about sparsity, about routing changing every token, and about the
+same token lighting the same dots — and it does not know which experts. The
+reasoning level itself is now colored by how hard the model is thinking, red for
+`max` down to grey for `off`.
+
+**The decode rate stopped lying on long prompts.** It was timed from the start of
+the generation call, so it divided tokens by decode time plus prefill plus the
+wait for the first token, and opened far below the real rate. It is measured
+from the first token out now.
+
+**Greedy chain decode on Metal.** At temperature 0 a run of argmax tokens decodes
+with the next token id kept on-device, dropping the per-token GPU sync and logits
+readback. Output is bit-identical. Off on M5, where it measures slightly slower
+than the plain path.
+
+**The `--dspark` footer reads `1.5t/step`, not `1.5x`.** It was always tokens
+committed per speculative step, and that is not a wall-clock speedup: on Metal it
+sits above 1.0 on runs that decode *slower* than plain decode. Calling it a
+multiplier was the bug.
+
 **plank can read your screenshots.** Image pasting is on by default now, and paired
 with the [ocr-mcp](https://github.com/aovestdipaperino/ocr-mcp) server the model can
 act on what you paste: it calls `transcribe_image` on the cached path and gets the
@@ -29,7 +176,7 @@ what each one contributes and every warning. There is no installer and no market
 yet — you place the directory yourself. See
 [Extending plank](/guide/09-extending.html).
 
-**v3.0.0 is out**, and the beta channel has opened on 3.0.1. The patch number is
+**v3.3.0 is out**, and the beta channel has opened on 3.3.1. The patch number is
 still the channel: `.0` is stable, anything above it is beta.
 
 **Your session has a name from the first frame.** The memorable

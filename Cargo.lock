@@ -3787,7 +3787,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plank"
-version = "3.1.1"
+version = "3.5.1"
 dependencies = [
  "blake2",
  "crt-off",
@@ -3809,7 +3809,9 @@ dependencies = [
  "similar",
  "stdext",
  "tokio",
+ "trace-stream",
  "tungstenite",
+ "turbo-debug-client",
  "unicode-width 0.2.0",
  "ureq",
 ]
@@ -5840,6 +5842,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
+name = "trace-stream"
+version = "0.1.0"
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6341,6 +6347,12 @@ dependencies = [
  "thiserror 1.0.69",
  "utf-8",
 ]
+
+[[package]]
+name = "turbo-debug-client"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbc55aec361f750b1a9acdcc8c940f3db6b8c8ed54e62df144c03c43d57afa9c"
 
 [[package]]
 name = "typenum"

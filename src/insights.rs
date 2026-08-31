@@ -742,6 +742,31 @@ pub struct Aggregated {
 
     /// One line per counted session, newest first, for the narrative prompt.
     pub highlights: Vec<String>,
+
+    /// What this installation already extends plank with, one line per
+    /// extension point ("skills: release, review", "hooks: none"). Filled in
+    /// by the caller from the live rosters, since none of it is derivable from
+    /// the transcripts, and left empty when it could not be determined. The
+    /// `features` section reads it so it recommends what is *missing* rather
+    /// than what is already installed.
+    pub extensions: Vec<String>,
+
+    /// Feedback ratings (M2): total, positive, negative. These count only
+    /// ratings that still have a subject; see `ratings_orphaned`.
+    pub ratings_total: u32,
+    pub ratings_positive: u32,
+    pub ratings_negative: u32,
+    /// Ratings whose turn no longer exists: the transcript was compacted or
+    /// rolled back and renumbered, or the session file is gone. They are
+    /// reported but never counted into the satisfaction statistics, and never
+    /// reattributed to whatever now sits at the same index.
+    pub ratings_orphaned: u32,
+    /// Satisfaction over time: `(day, positive share)` per local day with a
+    /// rating, newest first.
+    pub satisfaction_by_day: Vec<(String, f64)>,
+    /// Worst-rated turns: `(session id, note)` for negative ratings, newest
+    /// first. The note is the user's own words; no transcript text is quoted.
+    pub worst_turns: Vec<(String, String)>,
 }
 
 impl Aggregated {
@@ -928,6 +953,72 @@ pub fn aggregate(metas: &[SessionMeta], tz_offset: i64) -> Aggregated {
     agg
 }
 
+/// Fills the feedback fields of an [`Aggregated`] from every session's rating
+/// sidecar (M2). Ratings never enter the transcript, model context, or KV —
+/// they are facts *about* sessions, consumed only here.
+///
+/// Satisfaction is the positive share per local day; worst-rated turns are the
+/// user's own notes on negative ratings, never transcript text.
+pub fn aggregate_feedback(
+    agg: &mut Aggregated,
+    feedback: &[(String, Vec<crate::feedback::Rating>)],
+    tz_offset: i64,
+    transcript_of: &dyn Fn(&str) -> Option<Vec<crate::session::Message>>,
+) {
+    let mut by_day: BTreeMap<i64, (u32, u32)> = BTreeMap::new();
+    let mut worst: Vec<(String, String)> = Vec::new();
+    for (session_id, ratings) in feedback {
+        // One load per rated session, not per rating: `/insights` reads the
+        // whole history and most sessions carry no ratings at all.
+        let transcript = transcript_of(session_id);
+        for r in ratings {
+            // A rating whose turn is gone is reported as orphaned and kept out
+            // of the statistics. A session whose file no longer exists has no
+            // subject either, so its ratings are orphaned too.
+            let orphaned = transcript
+                .as_ref()
+                .is_none_or(|t| crate::feedback::is_orphaned(t, r));
+            if orphaned {
+                agg.ratings_orphaned += 1;
+                continue;
+            }
+            agg.ratings_total += 1;
+            if r.positive {
+                agg.ratings_positive += 1;
+            } else {
+                agg.ratings_negative += 1;
+                worst.push((session_id.clone(), r.note.clone()));
+            }
+            let day = local_day(r.at, tz_offset);
+            let (pos, neg) = by_day.entry(day).or_insert((0, 0));
+            if r.positive {
+                *pos += 1;
+            } else {
+                *neg += 1;
+            }
+        }
+    }
+    let mut days: Vec<(i64, (u32, u32))> = by_day.into_iter().collect();
+    days.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+    agg.satisfaction_by_day = days
+        .into_iter()
+        .map(|(day, (pos, neg))| {
+            let total = pos + neg;
+            let share = if total == 0 {
+                0.0
+            } else {
+                f64::from(pos) / f64::from(total)
+            };
+            (
+                date_str(u64::try_from(day).unwrap_or(0) * 86_400, tz_offset),
+                share,
+            )
+        })
+        .collect();
+    worst.sort_by_key(|(_, note)| note.clone());
+    agg.worst_turns = worst;
+}
+
 /// Finds sessions whose messages interleave, and counts how many messages
 /// were sent while another session was live.
 ///
@@ -992,6 +1083,43 @@ pub struct SectionSpec {
 pub const ANALYST_SYSTEM: &str = "You are a careful analyst. You answer with a single JSON \
 object and nothing else: no preamble, no explanation, no markdown fence, no tool calls.";
 
+/// plank's extension points, as the `features` section is told about them.
+///
+/// The model has no reliable knowledge of plank itself, so a recommendation to
+/// "add a skill" is only actionable if the prompt says what a skill *is* and
+/// where it goes. Kept in sync with `user-guide/09-extending.md`: paths that
+/// drift here produce snippets that write files plank never reads.
+///
+/// A macro rather than a plain `const` because the `features` prompt splices it
+/// with `concat!`, which takes literals only.
+macro_rules! feature_catalogue {
+    () => {
+        "\
+- Skills: a directory `~/.plank/skills/<name>/SKILL.md` (or `./.plank/skills/`) \
+holding a named procedure with `name`/`description`/`argument-hint` frontmatter \
+and `$ARGUMENTS` in the body. Runnable as `/<name>` and reachable by the model \
+itself. Best for a multi-step routine repeated across sessions.
+- Templates: one file `~/.plank/templates/<name>.md` whose body has `{{named}}` \
+holes. Lighter than a skill: it saves retyping a prompt shape, and the model \
+cannot invoke it.
+- Subagents: `~/.plank/agents/<name>.md`, dispatched with `/subagent:<name> \
+<task>`; only the final report enters the transcript. Frontmatter can add \
+`isolation: worktree` for its own checkout, or `provider:` to run it on another \
+engine. Best for delegated investigation and for fan-out over independent work.
+- Hooks: `~/.plank/hooks.json` or `./.plank/hooks.json`, shell commands bound to \
+events (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SessionStart`, `Stop`) \
+with a tool-name matcher. Best for a check that should run every time rather \
+than when remembered — formatting, linting, a guard on a dangerous command.
+- MCP servers: `~/.plank/.mcp.json` or `./.mcp.json`, stdio servers whose tools \
+join the roster. Best for reaching a system plank has no built-in tool for.
+- AGENTS.md: project instructions read at session start. Best for facts and \
+conventions repeated to the model by hand.\n"
+    };
+}
+
+/// The catalogue as a string, for tests and for anything that wants to show it.
+pub const FEATURE_CATALOGUE: &str = feature_catalogue!();
+
 /// The prose sections, each one independent model call.
 ///
 /// Every prompt ends the same way — one JSON object, named keys, no prose
@@ -1036,6 +1164,24 @@ down in AGENTS.md once. `prompts` should hold ready-to-paste prompts that fit \
 work they actually do.\n\
 RESPOND WITH ONLY A VALID JSON OBJECT: {\"agents_md\": [\"instruction\"], \
 \"prompts\": [{\"title\": \"short title\", \"prompt\": \"the prompt to paste\"}]}",
+    },
+    SectionSpec {
+        key: "features",
+        heading: "Features to try",
+        prompt: concat!(
+            "Recommend two or three of plank's own extension points this person is not \
+using but clearly would benefit from, grounded in their sessions, tool mix and \
+errors. Skip anything `extensions_in_use` says they already have unless you are \
+recommending a specific new one of that kind. Here is the catalogue, with where \
+each one lives:\n",
+            feature_catalogue!(),
+            "\n`why` must name the evidence in their data. `snippet` must be a complete, \
+ready-to-run shell command or file body that sets the thing up for the work they \
+actually do — no placeholders like <your project>.\n\
+RESPOND WITH ONLY A VALID JSON OBJECT: {\"features\": [{\"name\": \"feature name\", \
+\"one_liner\": \"what it is, one sentence\", \"why\": \"why it fits this person\", \
+\"snippet\": \"the command or file body to set it up\"}]}",
+        ),
     },
     SectionSpec {
         key: "at_a_glance",
@@ -1092,6 +1238,11 @@ pub fn narrative_context(agg: &Aggregated) -> String {
     put("error_categories", top(&agg.errors, 8).into());
     put("failing_tools", top(&agg.error_tools, 8).into());
     put("recent_sessions", agg.highlights.clone().into());
+    // Only when the rosters were actually read: an empty list would read as
+    // "nothing installed" and invite recommending what is already there.
+    if !agg.extensions.is_empty() {
+        put("extensions_in_use", agg.extensions.clone().into());
+    }
 
     // Timing exists only for sessions recorded since per-message stamps, and
     // is sent only when enough of them carry it to mean anything.
@@ -1113,6 +1264,26 @@ pub fn narrative_context(agg: &Aggregated) -> String {
         put("projects", top(&agg.projects, 8).into());
     }
     serde_json::to_string_pretty(&serde_json::Value::Object(ctx)).unwrap_or_default()
+}
+
+/// One `extensions_in_use` line: what is installed at an extension point, or
+/// that nothing is.
+///
+/// "none" is said explicitly rather than by omission — an absent line reads as
+/// "not known", and the `features` section's whole job is to tell those two
+/// apart before it recommends anything.
+#[must_use]
+pub fn extension_line(kind: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return format!("{kind}: none");
+    }
+    let shown: Vec<&str> = names.iter().take(12).map(String::as_str).collect();
+    let more = names.len().saturating_sub(shown.len());
+    let mut line = format!("{kind}: {}", shown.join(", "));
+    if more > 0 {
+        let _ = write!(line, " (+{more} more)");
+    }
+    line
 }
 
 /// Builds the full prompt for one section.
@@ -1311,7 +1482,7 @@ fn dur(secs: u64) -> String {
 }
 
 /// A `YYYY-MM-DD` date for a unix second at the given offset.
-fn date_str(ts: u64, offset: i64) -> String {
+pub(crate) fn date_str(ts: u64, offset: i64) -> String {
     // Civil-from-days, Howard Hinnant's algorithm: the report needs calendar
     // dates and plank has no date dependency to lean on.
     let days = local_day(ts, offset);
@@ -1358,6 +1529,8 @@ pub fn now_secs() -> u64 {
 
 /// Condensed report for the terminal: the numbers that fit on a screen, plus
 /// whichever narrative made it back.
+// A render function; the length is not complexity.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn render_summary(
     agg: &Aggregated,
@@ -1439,6 +1612,47 @@ pub fn render_summary(
         {
             out.push(format!("{field}: {text}"));
         }
+    }
+    // Feedback (M2): satisfaction over time and the worst-rated turns. The
+    // ratings are sidecar facts, never transcript text.
+    if agg.ratings_total > 0 {
+        let pct = f64::from(agg.ratings_positive) * 100.0 / f64::from(agg.ratings_total);
+        out.push(format!(
+            "{} ratings: {} positive ({:.0}%), {} negative",
+            agg.ratings_total, agg.ratings_positive, pct, agg.ratings_negative
+        ));
+        let days = agg
+            .satisfaction_by_day
+            .iter()
+            .take(5)
+            .map(|(d, s)| format!("{d} {:.0}%", s * 100.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!("satisfaction by day: {days}"));
+        if !agg.worst_turns.is_empty() {
+            let worst = agg
+                .worst_turns
+                .iter()
+                .take(5)
+                .map(|(id, note)| {
+                    if note.is_empty() {
+                        id.clone()
+                    } else {
+                        format!("{id}: {note}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!("worst-rated turns: {worst}"));
+        }
+    }
+    // Reported even when every rating is orphaned and the block above is
+    // skipped: silently dropping them would look like the ratings vanished.
+    if agg.ratings_orphaned > 0 {
+        out.push(format!(
+            "{} orphaned (the rated turn is gone; not counted above)",
+            agg.ratings_orphaned
+        ));
     }
     out
 }
@@ -1523,6 +1737,35 @@ fn narrative_html(narrative: &Narrative) -> String {
             }
             body.push_str("</div>");
         }
+        if let Some(features) = value.get("features").and_then(serde_json::Value::as_array) {
+            body.push_str(
+                "<p class=\"note\">Paste a snippet into plank and it will set it up.</p>",
+            );
+            for f in features {
+                let name = f.get("name").and_then(serde_json::Value::as_str);
+                let one_liner = f.get("one_liner").and_then(serde_json::Value::as_str);
+                let why = f.get("why").and_then(serde_json::Value::as_str);
+                let snippet = f.get("snippet").and_then(serde_json::Value::as_str);
+                body.push_str("<div class=\"card feature\">");
+                if let Some(n) = name {
+                    let _ = write!(body, "<h3>{}</h3>", html_escape(n));
+                }
+                if let Some(o) = one_liner {
+                    let _ = write!(body, "<p>{}</p>", html_escape(o));
+                }
+                if let Some(w) = why {
+                    let _ = write!(
+                        body,
+                        "<p class=\"fix\"><b>Why for you.</b> {}</p>",
+                        html_escape(w)
+                    );
+                }
+                if let Some(s) = snippet {
+                    let _ = write!(body, "<pre>{}</pre>", html_escape(s));
+                }
+                body.push_str("</div>");
+            }
+        }
         if let Some(lines) = value.get("agents_md").and_then(serde_json::Value::as_array) {
             body.push_str("<h3>Worth putting in AGENTS.md</h3><ul>");
             for l in lines.iter().filter_map(serde_json::Value::as_str) {
@@ -1580,6 +1823,7 @@ border-radius:.6rem;padding:1.25rem 1.4rem;margin:0 0 2.5rem}\
 .card{background:var(--card);border:1px solid var(--line);border-radius:.6rem;padding:1rem}\
 .card p{margin:0 0 .5rem}.card p:last-child{margin:0}\
 .fix{color:var(--accent)}\
+.feature{margin:0 0 .75rem}.feature pre{margin:.7rem 0 0}\
 .callout{border-left:3px solid var(--accent);padding-left:.9rem;color:var(--dim)}\
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);\
 border-radius:.4rem;padding:.7rem;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0}\
@@ -1953,6 +2197,109 @@ mod tests {
         assert_eq!((meta.lines_added, meta.lines_removed), (2, 1));
     }
 
+    /// The transcript a rating points at, and a rating that matches it. Ratings
+    /// are keyed by ordinal *and* digest, so a test fixture has to carry the
+    /// real sha1 of the message text or every rating reads as orphaned.
+    #[cfg(test)]
+    fn rated(text: &str, ordinal: usize, positive: bool, note: &str) -> crate::feedback::Rating {
+        crate::feedback::Rating {
+            ordinal,
+            digest: crate::session::sha1_hex(text.as_bytes()),
+            positive,
+            note: note.to_string(),
+            at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn aggregate_feedback_counts_and_ranks() {
+        let mut agg = Aggregated::default();
+        let s1 = vec![Message::user("turn zero"), Message::assistant("turn one")];
+        let s2 = vec![Message::user("only turn")];
+        let feedback = vec![
+            (
+                "s1".to_string(),
+                vec![
+                    rated("turn zero", 0, true, "great"),
+                    rated("turn one", 1, false, "confusing"),
+                ],
+            ),
+            ("s2".to_string(), vec![rated("only turn", 0, true, "")]),
+        ];
+        let lookup = |id: &str| match id {
+            "s1" => Some(s1.clone()),
+            "s2" => Some(s2.clone()),
+            _ => None,
+        };
+        aggregate_feedback(&mut agg, &feedback, 0, &lookup);
+        assert_eq!(agg.ratings_orphaned, 0, "every rating still has its turn");
+        assert_eq!(agg.ratings_total, 3);
+        assert_eq!(agg.ratings_positive, 2);
+        assert_eq!(agg.ratings_negative, 1);
+        assert_eq!(
+            agg.worst_turns,
+            vec![("s1".to_string(), "confusing".to_string())]
+        );
+        assert_eq!(agg.satisfaction_by_day.len(), 1);
+        assert!((agg.satisfaction_by_day[0].1 - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rating_orphaned_by_compaction_is_reported_and_not_counted() {
+        // The M2 assertion: compaction renumbers the transcript, so a rating
+        // keyed to the old index no longer has a subject. It must be reported
+        // as orphaned, kept out of the satisfaction statistics, and never
+        // reattributed to whatever now sits at that index.
+        let mut agg = Aggregated::default();
+        let feedback = vec![(
+            "s1".to_string(),
+            vec![
+                rated("kept turn", 0, true, ""),
+                rated("rated turn", 1, false, "was wrong"),
+            ],
+        )];
+        // Compaction rewrote index 1 into something else.
+        let compacted = vec![Message::user("kept turn"), Message::assistant("a summary")];
+        aggregate_feedback(&mut agg, &feedback, 0, &|_| Some(compacted.clone()));
+        assert_eq!(agg.ratings_orphaned, 1, "the renumbered rating is orphaned");
+        assert_eq!(agg.ratings_total, 1, "orphans stay out of the total");
+        assert_eq!(agg.ratings_positive, 1);
+        assert_eq!(
+            agg.ratings_negative, 0,
+            "the orphan must not be reattributed to the summary now at index 1"
+        );
+        assert!(
+            agg.worst_turns.is_empty(),
+            "an orphaned negative rating names no turn: {:?}",
+            agg.worst_turns
+        );
+    }
+
+    #[test]
+    fn ratings_for_a_vanished_session_are_orphaned() {
+        // The session file was swept; its ratings have no subject at all.
+        let mut agg = Aggregated::default();
+        let feedback = vec![("gone".to_string(), vec![rated("whatever", 0, true, "")])];
+        aggregate_feedback(&mut agg, &feedback, 0, &|_| None);
+        assert_eq!(agg.ratings_orphaned, 1);
+        assert_eq!(agg.ratings_total, 0);
+    }
+
+    #[test]
+    fn an_all_orphan_report_still_mentions_them() {
+        // `sessions_counted` is non-zero or the summary short-circuits.
+        let agg = Aggregated {
+            sessions_counted: 1,
+            ratings_orphaned: 2,
+            ..Default::default()
+        };
+        let lines = render_summary(&agg, &Narrative::new(), 0, 1_700_000_000);
+        assert!(
+            lines.iter().any(|l| l.contains("2 orphaned")),
+            "orphans must be reported even with no live ratings: {lines:?}"
+        );
+    }
+
     #[test]
     fn tool_errors_are_attributed_and_classified() {
         let s = session_with(vec![
@@ -2256,6 +2603,63 @@ Tool result 3 (read):\nfine\n</tool_result>",
         // Self-contained: no network references of any kind.
         assert!(!html.contains("http://") && !html.contains("https://"));
         assert!(html.contains("2023-11-14"));
+    }
+
+    #[test]
+    fn the_features_section_renders_a_card_per_recommendation() {
+        let agg = aggregate(
+            &[SessionMeta {
+                id: "a".to_owned(),
+                human_messages: 4,
+                tools: [("bash".to_owned(), 3)].into_iter().collect(),
+                ..SessionMeta::default()
+            }],
+            0,
+        );
+        let mut narrative = Narrative::new();
+        narrative.insert(
+            "features".to_owned(),
+            serde_json::json!({"features": [{
+                "name": "Hooks",
+                "one_liner": "Shell commands bound to events.",
+                "why": "You reran cargo fmt & clippy by hand every session.",
+                "snippet": "{\"PostToolUse\": []}",
+            }]}),
+        );
+        let html = render_html(&agg, &narrative, 0, 0);
+        assert!(html.contains("id=\"features\""), "section is emitted");
+        assert!(html.contains("Features to try"));
+        assert!(html.contains("Why for you."));
+        // Snippets are code, not markup: braces and quotes survive escaped.
+        assert!(html.contains("&quot;PostToolUse&quot;"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn an_empty_extension_point_is_reported_as_none_rather_than_omitted() {
+        assert_eq!(extension_line("skills", &[]), "skills: none");
+        assert_eq!(
+            extension_line("skills", &["a".to_owned(), "b".to_owned()]),
+            "skills: a, b"
+        );
+        let many: Vec<String> = (0..15).map(|i| format!("s{i}")).collect();
+        assert!(extension_line("skills", &many).ends_with("(+3 more)"));
+    }
+
+    #[test]
+    fn the_inventory_reaches_the_narrative_context_only_when_it_was_read() {
+        let mut agg = aggregate(
+            &[SessionMeta {
+                id: "a".to_owned(),
+                human_messages: 4,
+                ..SessionMeta::default()
+            }],
+            0,
+        );
+        assert!(!narrative_context(&agg).contains("extensions_in_use"));
+        agg.extensions = vec![extension_line("skills", &["release".to_owned()])];
+        let ctx = narrative_context(&agg);
+        assert!(ctx.contains("extensions_in_use") && ctx.contains("skills: release"));
     }
 
     #[test]

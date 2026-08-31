@@ -35,9 +35,44 @@
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 },
-//!   "agents": { "autoRoute": true, "maxParallel": 4 }
+//!   "agents": { "autoRoute": true, "maxParallel": 4 },
+//!   "git":    { "signCommits": true }
 //! }
 //! ```
+//!
+//! ## Live vs. restart-bound
+//!
+//! Most fields here are read fresh at the point of use (`crate::settings::active()`
+//! has no caching layer), so a `/config` save that goes through [`reinstall`]
+//! takes effect on the very next read — no restart. But a setting captured once
+//! into some other long-lived value at startup stays stale until something
+//! re-pushes it; `install`/`reinstall` are the chosen choke point for that (see
+//! `ui.reducedMotion` → `crate::anim`, `ui.notifications` → `crate::notify`), and
+//! `crate::complete`/`crate::editor::History::live` show the alternative of simply
+//! reading `active()` again at the moment it matters (`ui.respectGitignore`,
+//! `ui.historySize`) instead of threading a push channel through.
+//!
+//! A few fields are restart-bound **by design** and are not worth chasing:
+//!
+//! - `engine.*` (`model`, `backend`, `threads`, `ctx`, `power`) — the `Engine`
+//!   is constructed once at startup from these; swapping it live would mean
+//!   tearing down and rebuilding the whole inference stack mid-session.
+//! - `safety.sandbox`, `safety.btwSuspend` — copied into `AgentConfig` once at
+//!   startup.
+//! - `tools.recall`, `tools.fanout`, `tools.runCode`, `git.signCommits` — these
+//!   feed the system prompt text, which is built once per session and then
+//!   KV-cached (see `docs/KV-CACHING.md`); applying a change live would silently
+//!   invalidate a cache the model's prefill is relying on to be exactly what it
+//!   was before.
+//!
+//! Do not try to make the settings above live — a restart (or, in the KV case,
+//! a fresh session) is the honest answer for them.
+//!
+//! `ui.historySize` sits in between: `History::live()` re-reads it on every
+//! trim rather than capturing it, so growing the cap live works and shrinking
+//! it evicts down to the new size on the next entry added — but it does not
+//! retroactively resize a history that already holds more than the new cap
+//! until that next add happens.
 
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
@@ -105,9 +140,11 @@ pub struct UiSettings {
     /// Echo tool result text (observations) into the scrollback. Off by
     /// default; the model always receives the results either way.
     pub show_tool_results: bool,
-    /// Render the model's thinking text (dimmed) in the scrollback. On by
-    /// default; when off, thinking is hidden from the display but the model
-    /// still produces it.
+    /// Render the model's thinking text (dimmed) in the scrollback. Off by
+    /// default; when off, the raw model stream (thinking, answer, tool-call
+    /// markup) is instead mirrored to a `turbo-debug-console` listening on
+    /// port 7878, if one is up (see `debugmirror`), so the thinking is not
+    /// simply lost. When on, plank never connects to the console at all.
     pub show_thinking: bool,
     /// When native macOS desktop notifications fire at turn lifecycle points
     /// (turn complete/interrupted past the threshold, and awaiting input):
@@ -160,7 +197,7 @@ impl Default for UiSettings {
             history_size: DEFAULT_HISTORY_SIZE,
             show_tool_calls: false,
             show_tool_results: false,
-            show_thinking: true,
+            show_thinking: false,
             notifications: crate::notify::NotifyMode::Always,
             notify_after_secs: 10,
             crt_off: true,
@@ -254,6 +291,74 @@ impl Default for AgentSettings {
     }
 }
 
+/// Git conventions the model is told to follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitSettings {
+    /// Whether the system prompt asks the model to sign the commits it makes
+    /// with plank's attribution trailer. Set to `false` to leave commit
+    /// messages entirely to the model and the repository's own conventions.
+    pub sign_commits: bool,
+}
+
+impl Default for GitSettings {
+    fn default() -> Self {
+        Self { sign_commits: true }
+    }
+}
+
+/// Tool-dispatch tuning: loop guards and call deadlines.
+// Flat on/off feature flags; the length is not complexity.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolsSettings {
+    /// Whether the repeat-tool advisory is on. Default on; a deliberate
+    /// deviation from the C reference, documented in
+    /// `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+    pub repeat_advisory: bool,
+    /// Dispatch-level wall-clock deadline in seconds for a single tool call.
+    /// `0` (the default) is off — parity is untouched until a user opts in.
+    /// Bash keeps its own model-supplied timeout; this is the outer bound.
+    pub call_timeout_sec: u64,
+    /// A tool result larger than this many bytes is spilled to
+    /// `~/.plank/spill/<session-id>/` and replaced inline by a bounded preview
+    /// plus a locator. Defaults high enough that ordinary sessions never spill.
+    pub spill_max_bytes: usize,
+    /// How many bytes of a spilled result stay inline as the preview.
+    pub spill_preview_bytes: usize,
+    /// Whether the `recall` tool is offered to the model (M8). Default off:
+    /// the C agent has no such tool, so advertising it changes the system
+    /// prompt and churns the `fp1` fingerprint — a deliberate, versioned
+    /// deviation, documented in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+    pub recall: bool,
+    /// Whether the `fanout` tool is offered to the model (M9). Default off:
+    /// a new model-facing tool that runs independent subtasks and joins their
+    /// reports deterministically. On the `ds4_engine` path subtasks are
+    /// interleaved on one Metal queue, not parallel — the description promises
+    /// a deterministic join, not speed.
+    pub fanout: bool,
+    /// Whether the `run_code` tool is offered to the model (M10). Default off:
+    /// a new model-facing tool that runs a small script of named operations
+    /// (read/glob/edit/bash) through the existing tool dispatch path, so the
+    /// consent and sandbox checks apply. Advertising it changes the system
+    /// prompt and churns the `fp1` fingerprint — a deliberate, versioned
+    /// deviation, documented in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+    pub run_code: bool,
+}
+
+impl Default for ToolsSettings {
+    fn default() -> Self {
+        Self {
+            repeat_advisory: true,
+            call_timeout_sec: 0,
+            spill_max_bytes: 1_048_576,
+            spill_preview_bytes: 4096,
+            recall: true,
+            fanout: true,
+            run_code: true,
+        }
+    }
+}
+
 /// Ceiling on `agents.maxParallel`; a higher configured value clamps to this.
 pub const AGENT_MAX_PARALLEL: usize = 16;
 
@@ -278,6 +383,10 @@ pub struct Settings {
     pub worktree: WorktreeSettings,
     /// KV-cache retention.
     pub kvcache: KvCacheSettings,
+    /// Git conventions the model is told to follow.
+    pub git: GitSettings,
+    /// Tool-dispatch tuning: loop guards and call deadlines.
+    pub tools: ToolsSettings,
     /// Values set for plugin-declared `config` options, keyed
     /// `<component-id>.<option>`.
     ///
@@ -287,6 +396,10 @@ pub struct Settings {
     /// declares the type, and `ConfigOption::accepts` validates against that
     /// declaration rather than against anything settings.rs believes.
     pub plugin_config: std::collections::BTreeMap<String, String>,
+    /// Provenance of each effective settings key (`section.key`), keyed by the
+    /// addressing `/config` and `configform::FIELDS` use. Populated during
+    /// overlay; CLI overrides are recorded separately on `AgentConfig`.
+    pub provenance: std::collections::BTreeMap<String, crate::provenance::Provenance>,
 }
 
 /// `worktree` block: how [`crate::worktree`] builds a new working copy.
@@ -387,57 +500,81 @@ impl Settings {
     /// Parses one `settings.json`, overlaying `self` key by key.
     ///
     /// Unknown keys are ignored, so a newer plank's file stays loadable by an
-    /// older one.
+    /// older one. Provenance is recorded as [`Origin::UserSettings`] — the
+    /// test-only convenience; the layered loaders use [`overlay_from`](Self::overlay_from).
+    #[cfg(test)]
     fn overlay(&mut self, text: &str) {
+        self.overlay_from(text, &crate::provenance::Origin::UserSettings);
+    }
+
+    /// [`overlay`](Self::overlay) with the provenance origin the file came from,
+    /// so `/config --resolved` can report which layer won each key.
+    // A mechanical key-by-key overlay; the length is not complexity.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn overlay_from(&mut self, text: &str, origin: &crate::provenance::Origin) {
         let Some(root) = json_parse(text) else { return };
         let engine = root.get("engine");
         if let Some(v) = string(engine, "model") {
             self.engine.model = Some(expand_tilde(&v));
+            self.note("engine.model", origin);
         }
         if let Some(v) = num(engine, "threads") {
             self.engine.threads = Some(v);
+            self.note("engine.threads", origin);
         }
         if let Some(v) = string(engine, "backend") {
             self.engine.backend = Some(v);
+            self.note("engine.backend", origin);
         }
         if let Some(v) = num(engine, "power") {
             self.engine.power = Some(v);
+            self.note("engine.power", origin);
         }
         if let Some(v) = num(engine, "ctx") {
             self.engine.ctx = Some(v);
+            self.note("engine.ctx", origin);
         }
         if let Some(v) = boolean(engine, "thinkingToolCalls") {
             self.engine.thinking_tool_calls = v;
+            self.note("engine.thinkingToolCalls", origin);
         }
 
         let ui = root.get("ui");
         if let Some(v) = boolean(ui, "respectGitignore") {
             self.ui.respect_gitignore = v;
+            self.note("ui.respectGitignore", origin);
         }
         // A zero-row popup or zero-entry history would silently disable the
         // feature rather than tune it; treat those as unset.
         if let Some(v) = num::<usize>(ui, "popupRows").filter(|v| *v > 0) {
             self.ui.popup_rows = v;
+            self.note("ui.popupRows", origin);
         }
         if let Some(v) = num(ui, "indexRefreshSecs") {
             self.ui.index_refresh_secs = v;
+            self.note("ui.indexRefreshSecs", origin);
         }
         if let Some(v) = num::<usize>(ui, "historySize").filter(|v| *v > 0) {
             self.ui.history_size = v;
+            self.note("ui.historySize", origin);
         }
         if let Some(v) = boolean(ui, "showToolCalls") {
             self.ui.show_tool_calls = v;
+            self.note("ui.showToolCalls", origin);
         }
         if let Some(v) = boolean(ui, "showToolResults") {
             self.ui.show_tool_results = v;
+            self.note("ui.showToolResults", origin);
         }
         if let Some(v) = boolean(ui, "showThinking") {
             self.ui.show_thinking = v;
+            self.note("ui.showThinking", origin);
         }
         if let Some(v) = string(ui, "screensaver")
             && let Some(d) = crate::arcade::ScreensaverDelay::parse(&v)
         {
             self.ui.screensaver = d;
+            self.note("ui.screensaver", origin);
         }
         // A face is either one plank ships or one a plugin contributes. The
         // built-in spellings win, so a plugin cannot capture the word "matrix"
@@ -451,6 +588,7 @@ impl Settings {
             } else if v.contains(':') {
                 self.ui.screensaver_face_plugin = Some(v);
             }
+            self.note("ui.screensaverFace", origin);
         }
         // `notifications` accepts a mode string (always/unfocused/never) or
         // the legacy booleans (true=always, false=never).
@@ -460,83 +598,146 @@ impl Settings {
             } else {
                 crate::notify::NotifyMode::Never
             };
+            self.note("ui.notifications", origin);
         } else if let Some(v) =
             string(ui, "notifications").and_then(|s| crate::notify::NotifyMode::parse(&s))
         {
             self.ui.notifications = v;
+            self.note("ui.notifications", origin);
         }
         if let Some(v) = num(ui, "notifyAfterSecs") {
             self.ui.notify_after_secs = v;
+            self.note("ui.notifyAfterSecs", origin);
         }
         if let Some(v) = boolean(ui, "crtOff") {
             self.ui.crt_off = v;
+            self.note("ui.crtOff", origin);
         }
         if let Some(v) = boolean(ui, "reducedMotion") {
             self.ui.reduced_motion = v;
+            self.note("ui.reducedMotion", origin);
         }
         if let Some(v) = boolean(ui, "easterEggs") {
             self.ui.easter_eggs = v;
+            self.note("ui.easterEggs", origin);
         }
         if let Some(v) = boolean(ui, "builtinEditor") {
             self.ui.builtin_editor = v;
+            self.note("ui.builtinEditor", origin);
         }
 
         let safety = root.get("safety");
         if let Some(v) = boolean(safety, "sandbox") {
             self.safety.sandbox = Some(v);
+            self.note("safety.sandbox", origin);
         }
         if let Some(v) = boolean(safety, "btwSuspend") {
             self.safety.btw_suspend = Some(v);
+            self.note("safety.btwSuspend", origin);
         }
 
         if let Some(v) = num::<u64>(root.get("mcp"), "timeoutSecs").filter(|v| *v > 0) {
             self.mcp.timeout_secs = v;
+            self.note("mcp.timeoutSecs", origin);
         }
 
         // A max below the fixed minimum would make every `ask` call impossible;
         // clamp it up rather than silently breaking the tool.
         if let Some(v) = num::<usize>(root.get("ask"), "maxOptions") {
             self.ask.max_options = v.max(ASK_MIN_OPTIONS);
+            self.note("ask.maxOptions", origin);
         }
 
         if let Some(v) = boolean(root.get("update"), "check") {
             self.update.check = v;
+            self.note("update.check", origin);
         }
 
-        self.overlay_agents_and_worktree(&root);
+        let tools = root.get("tools");
+        if let Some(v) = boolean(tools, "repeatAdvisory") {
+            self.tools.repeat_advisory = v;
+            self.note("tools.repeatAdvisory", origin);
+        }
+        if let Some(v) = num::<u64>(tools, "callTimeoutSec") {
+            self.tools.call_timeout_sec = v;
+            self.note("tools.callTimeoutSec", origin);
+        }
+        if let Some(v) = num::<usize>(tools, "spillMaxBytes") {
+            self.tools.spill_max_bytes = v;
+            self.note("tools.spillMaxBytes", origin);
+        }
+        if let Some(v) = num::<usize>(tools, "spillPreviewBytes") {
+            self.tools.spill_preview_bytes = v;
+            self.note("tools.spillPreviewBytes", origin);
+        }
+        if let Some(v) = boolean(tools, "recall") {
+            self.tools.recall = v;
+            self.note("tools.recall", origin);
+        }
+        if let Some(v) = boolean(tools, "fanout") {
+            self.tools.fanout = v;
+            self.note("tools.fanout", origin);
+        }
+        if let Some(v) = boolean(tools, "runCode") {
+            self.tools.run_code = v;
+            self.note("tools.runCode", origin);
+        }
+
+        self.overlay_agents_and_worktree(&root, origin);
+    }
+
+    /// Records that `origin` set the settings key `key` (`section.key`).
+    fn note(&mut self, key: &str, origin: &crate::provenance::Origin) {
+        self.provenance
+            .entry(key.to_string())
+            .or_insert_with(|| crate::provenance::Provenance::new(origin.clone()))
+            .note(origin.clone());
     }
 
     /// The `agents` and `worktree` half of [`overlay`](Self::overlay), split out
     /// only to keep each function under the length lint.
-    fn overlay_agents_and_worktree(&mut self, root: &Json) {
+    fn overlay_agents_and_worktree(&mut self, root: &Json, origin: &crate::provenance::Origin) {
         let agents = root.get("agents");
         if let Some(v) = boolean(agents, "autoRoute") {
             self.agents.auto_route = v;
+            self.note("agents.autoRoute", origin);
         }
         if let Some(v) = num::<usize>(agents, "maxParallel") {
             self.agents.max_parallel = v.clamp(1, AGENT_MAX_PARALLEL);
+            self.note("agents.maxParallel", origin);
         }
 
         let worktree = root.get("worktree");
         if let Some(v) = strings(worktree, "sparsePaths") {
             self.worktree.sparse_paths = v;
+            self.note("worktree.sparsePaths", origin);
         }
         if let Some(v) = strings(worktree, "symlinkDirectories") {
             self.worktree.symlink_directories = v;
+            self.note("worktree.symlinkDirectories", origin);
         }
         if let Some(v) = boolean(worktree, "isolateAgents") {
             self.worktree.isolate_agents = v;
+            self.note("worktree.isolateAgents", origin);
         }
 
         let kvcache = root.get("kvcache");
         if let Some(v) = num::<u64>(kvcache, "ttlSessionDays") {
             self.kvcache.ttl_session_days = v;
+            self.note("kvcache.ttlSessionDays", origin);
         }
         if let Some(v) = num::<u64>(kvcache, "ttlTierDays") {
             self.kvcache.ttl_tier_days = v;
+            self.note("kvcache.ttlTierDays", origin);
         }
         if let Some(v) = num::<u64>(kvcache, "maxBytes") {
             self.kvcache.max_bytes = v;
+            self.note("kvcache.maxBytes", origin);
+        }
+
+        if let Some(v) = boolean(root.get("git"), "signCommits") {
+            self.git.sign_commits = v;
+            self.note("git.signCommits", origin);
         }
 
         // Merged key by key rather than replaced wholesale: a project file that
@@ -546,6 +747,7 @@ impl Settings {
             for (key, value) in entries {
                 if let Json::Str(v) = value {
                     self.plugin_config.insert(key.clone(), v.clone());
+                    self.note(&format!("pluginConfig.{key}"), origin);
                 }
             }
         }
@@ -557,9 +759,23 @@ impl Settings {
     #[must_use]
     pub fn load_from_paths(low: &[PathBuf], high: &[PathBuf]) -> Self {
         let mut s = Self::default();
-        for p in low.iter().chain(high.iter()) {
+        // Provenance per file: `low` is the plugin layer, `high` is the user
+        // file then the project file (see `paths_in`). Overlay runs low-to-high,
+        // so a later layer demotes the earlier one to shadowed.
+        let low_origins = low
+            .iter()
+            .map(|p| (p, crate::provenance::Origin::Plugin(String::new())));
+        let high_origins = high.iter().enumerate().map(|(i, p)| {
+            let origin = if i == 0 {
+                crate::provenance::Origin::UserSettings
+            } else {
+                crate::provenance::Origin::ProjectSettings
+            };
+            (p, origin)
+        });
+        for (p, origin) in low_origins.chain(high_origins) {
             if let Ok(text) = std::fs::read_to_string(p) {
-                s.overlay(&text);
+                s.overlay_from(&text, &origin);
             }
         }
         s
@@ -945,6 +1161,11 @@ impl Settings {
             upsert(a, "autoRoute", Json::Bool(self.agents.auto_route));
             upsert(a, "maxParallel", unum(self.agents.max_parallel as u64));
         }
+        upsert(
+            section(&mut root, "git"),
+            "signCommits",
+            Json::Bool(self.git.sign_commits),
+        );
 
         let mut out = String::new();
         write_pretty(&mut out, &Json::Obj(root), 0);
@@ -971,21 +1192,38 @@ pub fn install(settings: Settings) {
     // Recover rather than panic on a poisoned lock: settings are advisory and a
     // stale guard is harmless here.
     crate::anim::set_reduced_motion(settings.ui.reduced_motion);
+    // Seeds the notification mode the same way `reducedMotion` seeds `anim`:
+    // this is the one choke point both front-ends now rely on instead of each
+    // calling `notify::set_mode` once at startup themselves.
+    crate::notify::set_mode(settings.ui.notifications);
     let mut slot = ACTIVE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if slot.is_none() {
         *slot = Some(Box::leak(Box::new(settings)));
     }
+    drop(slot);
+    // showThinking may already be off in the loaded config at startup (it is
+    // the new default), so the debug-console mirror must be reconciled here
+    // too, not only on a later `/config` change.
+    crate::debugmirror::reconcile();
 }
 
 /// Replaces the process-wide settings (used by `/config` after a save), so the
 /// current session picks up the change on its next [`active`] read.
 pub fn reinstall(settings: Settings) {
     crate::anim::set_reduced_motion(settings.ui.reduced_motion);
+    // `ui.notifications` was previously seeded once at startup and never
+    // re-pushed, so changing it in `/config` had no effect until restart.
+    crate::notify::set_mode(settings.ui.notifications);
     *ACTIVE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::leak(Box::new(settings)));
+    // The common choke point for both `/config showThinking <bool>` and the
+    // interactive config form save: reconciling here, rather than at each
+    // call site, is what makes the toggle take effect immediately instead of
+    // waiting for the next turn to notice.
+    crate::debugmirror::reconcile();
 }
 
 // Test-only settings override, scoped to the calling thread. The libtest
@@ -1212,16 +1450,16 @@ mod tests {
     }
 
     #[test]
-    fn show_thinking_defaults_on_and_can_be_turned_off() {
+    fn show_thinking_defaults_off_and_can_be_turned_on() {
         assert!(
-            Settings::default().ui.show_thinking,
-            "thinking shown by default"
+            !Settings::default().ui.show_thinking,
+            "thinking hidden (mirrored to the debug console) by default"
         );
-        let s = from_json(r#"{"ui":{"showThinking":false}}"#);
-        assert!(!s.ui.show_thinking);
-        // Only the non-default (off) value is surfaced in the startup note.
+        let s = from_json(r#"{"ui":{"showThinking":true}}"#);
+        assert!(s.ui.show_thinking);
+        // Only the non-default (on) value is surfaced in the startup note.
         let note = note_for(&s, &[]).expect("a note");
-        assert!(note.contains("showThinking=false"), "{note}");
+        assert!(note.contains("showThinking=true"), "{note}");
     }
 
     #[test]
@@ -1357,6 +1595,33 @@ mod tests {
         assert_eq!(reloaded.engine.ctx, Some(8192));
         assert_eq!(reloaded.engine.backend, None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_and_reinstall_push_notification_mode() {
+        // Regression test: `ui.notifications` used to be seeded once at
+        // startup by two call sites in ui.rs and never re-pushed, so a
+        // `/config` change had no effect until restart. `install`/`reinstall`
+        // are now the one choke point, mirroring `reducedMotion`.
+        use crate::notify::{self, NotifyMode};
+
+        let mut s = Settings::default();
+        s.ui.notifications = NotifyMode::Never;
+        install(s);
+        assert_eq!(notify::mode(), NotifyMode::Never, "install seeds the mode");
+
+        let mut s = Settings::default();
+        s.ui.notifications = NotifyMode::Unfocused;
+        reinstall(s);
+        assert_eq!(
+            notify::mode(),
+            NotifyMode::Unfocused,
+            "reinstall re-seeds the mode live"
+        );
+
+        // `notify::MODE` is a process-wide global; leave it at the default so
+        // other tests in this process are not affected by test order.
+        notify::set_mode(NotifyMode::Always);
     }
 
     #[test]
@@ -1623,5 +1888,53 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provenance_records_plugin_below_user_below_project() {
+        // The plugin-below-user rule from CLAUDE.md must be visible in the
+        // provenance, not just in the docs: a plugin setting loses to the user
+        // file, which loses to the project file, and each loser is shadowed.
+        let dir = std::env::temp_dir().join(format!("plank-provenance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(home.join(".plank")).expect("mkdir home");
+        std::fs::create_dir_all(cwd.join(".plank")).expect("mkdir cwd");
+
+        let plugin = dir.join("plugin-settings.json");
+        std::fs::write(&plugin, r#"{"kvcache":{"maxBytes":111}}"#).expect("write plugin");
+        let user = home.join(".plank").join("settings.json");
+        std::fs::write(&user, r#"{"kvcache":{"maxBytes":222}}"#).expect("write user");
+        let project = cwd.join(".plank").join("settings.json");
+        std::fs::write(&project, r#"{"kvcache":{"maxBytes":333}}"#).expect("write project");
+
+        let s = Settings::load_with_plugins_in(Some(&home), &cwd, &[plugin]);
+        assert_eq!(s.kvcache.max_bytes, 333);
+        let p = s
+            .provenance
+            .get("kvcache.maxBytes")
+            .expect("provenance recorded");
+        assert_eq!(p.origin, crate::provenance::Origin::ProjectSettings);
+        assert_eq!(
+            p.shadowed,
+            vec![
+                crate::provenance::Origin::Plugin(String::new()),
+                crate::provenance::Origin::UserSettings,
+            ],
+            "plugin then user, in increasing precedence, both shadowed by project"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provenance_records_a_key_only_when_it_takes_effect() {
+        // A malformed value is ignored by overlay, so it must not be recorded
+        // as provenance — the resolved dump lists effective keys only.
+        let mut s = Settings::default();
+        s.overlay(r#"{"kvcache":{"maxBytes":"soon"}}"#);
+        assert!(!s.provenance.contains_key("kvcache.maxBytes"));
+        assert_eq!(s.kvcache.max_bytes, 21_474_836_480);
     }
 }

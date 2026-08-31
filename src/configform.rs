@@ -47,6 +47,14 @@ pub enum FieldId {
     AskMaxOptions,
     AgentsAutoRoute,
     AgentsMaxParallel,
+    GitSignCommits,
+    ToolsRepeatAdvisory,
+    ToolsCallTimeoutSec,
+    ToolsSpillMaxBytes,
+    ToolsSpillPreviewBytes,
+    ToolsRecall,
+    ToolsFanout,
+    ToolsRunCode,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -270,6 +278,62 @@ pub static FIELDS: &[Field] = &[
         "max concurrent sub-agents",
         Kind::Count,
     ),
+    f(
+        FieldId::GitSignCommits,
+        "git",
+        "signCommits",
+        "sign commits with plank's trailer",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::ToolsRepeatAdvisory,
+        "tools",
+        "repeatAdvisory",
+        "nudge the model when it repeats a tool call",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::ToolsCallTimeoutSec,
+        "tools",
+        "callTimeoutSec",
+        "per-call deadline (s); 0 = off",
+        Kind::Count,
+    ),
+    f(
+        FieldId::ToolsSpillMaxBytes,
+        "tools",
+        "spillMaxBytes",
+        "spill a tool result larger than this (bytes)",
+        Kind::Count,
+    ),
+    f(
+        FieldId::ToolsSpillPreviewBytes,
+        "tools",
+        "spillPreviewBytes",
+        "inline preview bytes of a spilled result",
+        Kind::Count,
+    ),
+    f(
+        FieldId::ToolsRecall,
+        "tools",
+        "recall",
+        "offer the recall tool to the model",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::ToolsFanout,
+        "tools",
+        "fanout",
+        "offer the fanout tool to the model",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::ToolsRunCode,
+        "tools",
+        "runCode",
+        "offer the run_code tool to the model",
+        Kind::Bool,
+    ),
 ];
 
 const fn f(
@@ -338,6 +402,14 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::AskMaxOptions => s.ask.max_options.to_string(),
         FieldId::AgentsAutoRoute => s.agents.auto_route.to_string(),
         FieldId::AgentsMaxParallel => s.agents.max_parallel.to_string(),
+        FieldId::GitSignCommits => s.git.sign_commits.to_string(),
+        FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory.to_string(),
+        FieldId::ToolsCallTimeoutSec => s.tools.call_timeout_sec.to_string(),
+        FieldId::ToolsSpillMaxBytes => s.tools.spill_max_bytes.to_string(),
+        FieldId::ToolsSpillPreviewBytes => s.tools.spill_preview_bytes.to_string(),
+        FieldId::ToolsRecall => s.tools.recall.to_string(),
+        FieldId::ToolsFanout => s.tools.fanout.to_string(),
+        FieldId::ToolsRunCode => s.tools.run_code.to_string(),
     }
 }
 
@@ -450,6 +522,13 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
             let n = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
             s.agents.max_parallel = n.min(crate::settings::AGENT_MAX_PARALLEL);
         }
+        FieldId::ToolsCallTimeoutSec => s.tools.call_timeout_sec = parse_pos(0)?,
+        FieldId::ToolsSpillMaxBytes => {
+            s.tools.spill_max_bytes = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
+        }
+        FieldId::ToolsSpillPreviewBytes => {
+            s.tools.spill_preview_bytes = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
+        }
         // Bool/Tri fields accept an explicit textual value from the REPL path.
         // Accepts always/unfocused/never, plus the legacy true/false.
         FieldId::UiNotifications => {
@@ -489,7 +568,12 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiReducedMotion
         | FieldId::UiEasterEggs
         | FieldId::UiBuiltinEditor
-        | FieldId::AgentsAutoRoute => {
+        | FieldId::AgentsAutoRoute
+        | FieldId::GitSignCommits
+        | FieldId::ToolsRepeatAdvisory
+        | FieldId::ToolsRecall
+        | FieldId::ToolsFanout
+        | FieldId::ToolsRunCode => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -511,6 +595,11 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiEasterEggs => s.ui.easter_eggs = b,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = b,
         FieldId::AgentsAutoRoute => s.agents.auto_route = b,
+        FieldId::GitSignCommits => s.git.sign_commits = b,
+        FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory = b,
+        FieldId::ToolsRecall => s.tools.recall = b,
+        FieldId::ToolsFanout => s.tools.fanout = b,
+        FieldId::ToolsRunCode => s.tools.run_code = b,
         _ => {}
     }
 }
@@ -779,8 +868,12 @@ impl ConfigForm {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => return Outcome::Cancel,
-            KeyCode::Char('q' | 'Q') => return Outcome::Cancel,
-            KeyCode::Esc => return Outcome::Save(Box::new(self.working.clone())),
+            // Escape means cancel everywhere else in plank; it must not be the
+            // one place that silently commits a half-typed value. Saving is an
+            // explicit act (Ctrl-S) so a reflexive "back out" keystroke never
+            // writes to disk.
+            KeyCode::Char('q' | 'Q') | KeyCode::Esc => return Outcome::Cancel,
+            KeyCode::Char('s') if ctrl => return Outcome::Save(Box::new(self.working.clone())),
             KeyCode::Up => {
                 self.status = None;
                 self.cursor = self.cursor.checked_sub(1).unwrap_or(self.field_count() - 1);
@@ -1349,9 +1442,9 @@ mod tests {
         for _ in 0..idx {
             form.handle_key(k(KeyCode::Down));
         }
-        assert!(form.working.ui.show_thinking, "default is on");
+        assert!(!form.working.ui.show_thinking, "default is off");
         form.handle_key(k(KeyCode::Enter));
-        assert!(!form.working.ui.show_thinking, "toggled off");
+        assert!(form.working.ui.show_thinking, "toggled on");
     }
 
     #[test]
@@ -1409,14 +1502,43 @@ mod tests {
     }
 
     #[test]
-    fn esc_saves_and_q_cancels() {
+    fn esc_and_q_cancel_ctrl_s_saves() {
         let mut form = ConfigForm::new(Settings::default());
-        assert!(matches!(form.handle_key(k(KeyCode::Esc)), Outcome::Save(_)));
+        assert!(matches!(form.handle_key(k(KeyCode::Esc)), Outcome::Cancel));
         let mut form2 = ConfigForm::new(Settings::default());
         assert!(matches!(
             form2.handle_key(k(KeyCode::Char('q'))),
             Outcome::Cancel
         ));
+        let mut form3 = ConfigForm::new(Settings::default());
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(matches!(form3.handle_key(ctrl_s), Outcome::Save(_)));
+    }
+
+    /// Escape must discard an edited field rather than commit it: this is the
+    /// exact scenario that used to write a half-typed value to disk (a stray
+    /// sentence landing in `engine.model` because Escape saved instead of
+    /// cancelling).
+    #[test]
+    fn esc_discards_working_copy() {
+        let mut form = ConfigForm::new(Settings::default());
+        focus(&mut form, FieldId::EngineModel);
+        form.handle_key(k(KeyCode::Enter)); // open the inline editor
+        for c in "oops".chars() {
+            form.handle_key(k(KeyCode::Char(c)));
+        }
+        // Still mid-edit: Escape here only closes the inline editor (existing
+        // behaviour), so commit the typed value into the working copy first to
+        // simulate a value that made it in, then cancel the whole form.
+        form.handle_key(k(KeyCode::Enter));
+        assert_eq!(
+            form.working.engine.model.as_deref(),
+            Some(std::path::Path::new("oops"))
+        );
+        assert!(matches!(form.handle_key(k(KeyCode::Esc)), Outcome::Cancel));
+        // Outcome::Cancel carries no settings — the caller must drop
+        // `form.working` and leave `active()`/disk untouched, which is exactly
+        // what the ui.rs Cancel arm does (no write, no `settings::install`).
     }
 
     #[test]
@@ -1456,7 +1578,12 @@ mod tests {
             .filter(|r| r.header)
             .map(|r| r.label.as_str())
             .collect();
-        assert_eq!(headers, ["engine", "ui", "safety", "mcp", "ask", "agents"]);
+        assert_eq!(
+            headers,
+            [
+                "engine", "ui", "safety", "mcp", "ask", "agents", "git", "tools"
+            ]
+        );
         assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());
     }
 }

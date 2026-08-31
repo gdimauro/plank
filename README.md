@@ -78,24 +78,25 @@ Without a model (or on non-macOS platforms) plank still runs against a built-in 
 
 ### Speculative decoding (DSpark)
 
-`--dspark` turns on DeepSeek's auxiliary draft checkpoint for V4 Flash: it reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with — so one verification pass can advance the stream by several tokens. It is off by default.
+DSpark speculative decoding is **on by default**: DeepSeek's auxiliary draft checkpoint for V4 Flash reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with — so one verification pass can advance the stream by several tokens. `--dspark-off` turns it off for target-only decode.
 
 The support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/ds4flash.dspark.gguf` and, when missing, is offered for download through the same resumable, playable path as the main model. Passing `--mtp <path>` overrides it, which is also how a legacy one-stage MTP drafter is supplied.
 
 ```sh
-plank --dspark --temp 0
+plank --temp 0
 ```
 
+- `--dspark-off` — disable DSpark speculative decoding (target-only decode).
 - `--dspark-confidence F` — pruning threshold, `0..1`. `0` forces fixed five-token blocks (diagnostics). The default is the engine's own and depends on the backend.
 - `--dspark-strict` — load the drafter but keep target-only decode, for comparisons and correctness checks.
 
-Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it actually pays depends on the engine build, the quant, and the machine — on an M5 Max it was a 0.71× *slowdown* until upstream pipelined the Metal verifier, after which the same measurement read 1.19×. Plank's exit message reports the session's peak prefill and generation rates, which is the quickest way to check on your own hardware.
+Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it actually pays depends on the engine build, the quant, and the machine — on an M5 Max it was a 0.71× *slowdown* until upstream pipelined the Metal verifier, after which the same measurement read 1.19×. Plank's exit message reports, per model, how long the session spent prefilling and generating with the average rate for each (and how long it spent in tools), which is the quickest way to check on your own hardware.
 
 ### Plank-only features
 
 plank tracks `ds4_agent` for the core agent loop but moves faster on the user-facing side. A few of the things that exist only in plank:
 
-- **Full-screen Ratatui TUI** — markdown rendering with syntax-highlighted code, mouse-wheel scrollback, and a two-row animated status bar: the working directory and git branch on the first row, so the location holds still, and everything volatile on the second — engine origin, reasoning level, context gauge, and the name of the tool currently running. The C reference is a plain line REPL. Resumed sessions replay through the same renderer, so history comes back as markdown with thinking dimmed, not flat text.
+- **Full-screen Ratatui TUI** — markdown rendering with syntax-highlighted code, mouse-wheel scrollback, and a two-row animated status bar: the working directory, git branch and a working-tree change counter (`📄 3 · +128 -41` — files touched, then lines added in green and deleted in red) on the first row, so the location holds still, and everything volatile on the second — engine origin, reasoning level (colored by how hard the model is thinking, with a braille stand-in for the expert routing that re-rolls every token), context gauge, and the name of the tool currently running. The C reference is a plain line REPL. Resumed sessions replay through the same renderer, so history comes back as markdown with thinking dimmed, not flat text.
 - **Type while it thinks** — each turn runs on a worker thread, so the prompt stays live during generation and you can queue the next message.
 - **`/btw` side questions** — ask something mid-task; the answer runs on a fork of the session, interleaved with the main generation, so it streams into a split panel while the main task keeps going. Nothing is written to the conversation, and neither side re-prefills.
 - **Checkpoints, resume, and instant KV restore** — `/checkpoint`/`/rollback` and `/resume` snapshot the live engine KV alongside the transcript, so returning to a conversation skips re-prefilling it.
@@ -109,6 +110,7 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 - **Editable, selectable prompt** — Shift with the arrows, Home/End, or a word-wise Alt/Ctrl arrow selects text in the prompt; so does click-and-drag. `Ctrl-C` copies the selection (and still clears the line when nothing is selected), `Ctrl-X` cuts, `Ctrl-V` pastes, `Ctrl-Shift-A` selects everything. It all works mid-turn too, on the prompt that stays live while the model generates.
 - **Extensible** — skills (user- *and* model-invoked), named subagents, an expanded hook system, MCP tools and resources, and a `settings.json` for durable preferences.
 - **`ask` tool** — when a turn is genuinely ambiguous the model can pose a multiple-choice question instead of guessing; you pick in a panel (or numbered list in the REPL), and it degrades cleanly when there's no user to ask.
+- **`/install-claude-plugin`** — fetches and installs a Claude Code plugin from a GitHub repo, an `owner/repo` shorthand, a browser-copied `/tree/`/`/blob/` URL, a marketplace, a `.tar.gz`, or a local directory. It rewrites `${CLAUDE_PLUGIN_ROOT}` to the real install path and unwraps Claude Code's nested hook config, since plank's hook runner and hook reader expect neither as-is; `.mcp.json` and `settings.json` need no such translation and merge in the same way any other plugin's do.
 - **Desktop notifications & live window title** — long turns end with a persistent macOS banner (`'<prompt>' finished` and the tail of the answer; `interrupted` for aborted turns), configurable to fire `always`, only while `unfocused`, or `never`; the terminal title tracks the task (`🪵 plank - fix the bug…`).
 
 See **[docs/FEATURES.md](docs/FEATURES.md)** for the complete list.
@@ -141,9 +143,34 @@ Long turns end with a native macOS notification — your prompt as the headline 
   <img src="assets/notification.png" alt="macOS desktop notification: a finished plank task with the prompt as headline and the answer tail as body" width="500">
 </p>
 
+### Watching the thinking in a debug console
+
+`ui.showThinking` controls whether the model's reasoning is rendered in the scrollback. It is **off by default**: the thinking is usually noise once you trust the answer, and hiding it keeps the transcript readable.
+
+Hiding it does not have to mean losing it. While `showThinking` is off, plank mirrors its whole raw model stream to [turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console), a text-mode viewer that renders it in its own window, so the reasoning is one glance away instead of gone:
+
+<p align="center">
+  <img src="assets/debug-console.png" alt="turbo-debug-console showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein" width="700">
+</p>
+
+Install it and leave it running; plank finds it on its own:
+
+```sh
+brew install aovestdipaperino/tap/turbo-debug-console
+turbo-debug-console
+```
+
+`cargo install turbo-debug-console` works too. It listens on port 7878, and each plank session gets its own window titled `plank:<session-name>`, matching the session name plank shows above the prompt. Sessions are reconnectable: the window and its scrollback survive plank exiting, so restarting plank appends the new run below a `-- reconnected --` rule instead of losing the old one.
+
+The console is entirely optional and plank never depends on it. If nothing is listening, plank connects to nothing, says nothing, and behaves exactly as it always has. If you close the console mid-turn, the mirror is dropped and the turn carries on. Turning `showThinking` back on disconnects it, since the reasoning is back in the scrollback where you can already see it.
+
+What arrives there is the *whole* stream, not just the hidden part: thinking, answer, and tool calls, rendered by the same renderer plank uses for its own output. That is deliberate. The console shares plank's streaming renderer as the [`trace-stream`](https://crates.io/crates/trace-stream) crate rather than reimplementing it, so the two cannot drift, and reasoning arrives in the context of the answer it produced rather than as disembodied fragments.
+
 ### Settings file
 
-Preferences you'd otherwise retype every launch live in `settings.json`, hierarchical like the MCP configs: `~/.plank/settings.json` applies globally, `./.plank/settings.json` in the working directory overrides it key by key. Everything is optional — the file need not exist, and any subset of keys works. Edit it in-session with `/config` (an interactive TUI form, or `/config <section>.<key> <value>` from the prompt, e.g. `/config ui.showThinking false`); changes write `./.plank/settings.json` and apply immediately.
+Preferences you'd otherwise retype every launch live in `settings.json`, hierarchical like the MCP configs: `~/.plank/settings.json` applies globally, `./.plank/settings.json` in the working directory overrides it key by key. Everything is optional — the file need not exist, and any subset of keys works. Edit it in-session with `/config` (an interactive TUI form, or `/config <section>.<key> <value>` from the prompt, e.g. `/config ui.showThinking false`); changes write `./.plank/settings.json` and apply immediately. In the interactive form, **Ctrl-S** saves and closes; **Esc** cancels and discards.
+
+A few keys cannot take effect until you restart, because what they configure is built once at startup: everything under `engine` (the model is already loaded), `safety.sandbox` and `safety.btwSuspend`, and the keys that shape the system prompt — `tools.recall`, `tools.fanout`, `tools.runCode` and `git.signCommits` — since the prompt is built once per session and KV-cached, and rewriting it mid-session would throw that cache away. Everything else is live.
 
 ```json
 {
@@ -152,12 +179,13 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
               "thinkingToolCalls": true },
   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
               "historySize": 512, "showToolCalls": false, "showToolResults": false,
-              "showThinking": true, "notifications": "always", "notifyAfterSecs": 10,
+              "showThinking": false, "notifications": "always", "notifyAfterSecs": 10,
               "screensaver": "1m", "screensaverFace": "matrix" },
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
   "ask":    { "maxOptions": 7 },
   "agents": { "autoRoute": true, "maxParallel": 4 },
+  "git":    { "signCommits": true },
   "worktree": { "sparsePaths": ["src", "docs"],
                 "symlinkDirectories": ["target"], "isolateAgents": false }
 }
@@ -177,7 +205,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `historySize` | 512 | Prompt history entries retained. |
 | | `showToolCalls` | `false` | Show the model's `🛠️` tool-call banners. Off keeps the UI uncluttered; the tools still run. |
 | | `showToolResults` | `false` | Echo tool result text into the scrollback. Off keeps the UI clean; the model still receives the results. |
-| | `showThinking` | `true` | Render the model's thinking (dimmed) in the scrollback. Off hides it from the display; the model still produces it. |
+| | `showThinking` | `false` | Render the model's thinking (dimmed) in the scrollback. Off hides it from the display; the model still produces it, and plank mirrors the stream to a [debug console](#watching-the-thinking-in-a-debug-console) if one is running. |
 | | `notifications` | `always` | When desktop notifications fire: `always`, `unfocused` (only while the terminal window isn't focused), or `never`. |
 | | `notifyAfterSecs` | 10 | Minimum turn duration before a turn-end notification; awaiting-input notifications ignore it. |
 | | `crtOff` | `true` | CRT power-off animation on clean TUI exit. |
@@ -190,6 +218,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | `ask` | `maxOptions` | 7 | Most options the `ask` tool may offer in one question (minimum is fixed at 2). |
 | `agents` | `autoRoute` | `true` | Whether the model may select a sub-agent definition on its own initiative. |
 | | `maxParallel` | 4 | How many sub-agents may run concurrently (clamped to 16). |
+| `git` | `signCommits` | `true` | Ask the model to end each commit message it writes with a blank line and `--Co-Authored by Plank (https://plank-agent.dev)`. `false` drops the instruction and leaves commit messages to your repository's own conventions. |
 | `worktree` | `sparsePaths` | `[]` | Cone-mode sparse-checkout paths for a new worktree. Empty checks out everything; set it when a second full checkout of the repo is painful. |
 | | `symlinkDirectories` | `[]` | Directories symlinked from the main checkout rather than duplicated, e.g. `target` or `node_modules`. A name that could climb out of the worktree is ignored. |
 | | `isolateAgents` | `false` | Give every sub-agent its own throwaway worktree. Off because a checkout per agent costs disk and time and the work must then be merged back; use `isolation: worktree` on the definitions that need it instead. |

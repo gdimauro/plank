@@ -11,8 +11,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::tools::diff::EditPreview;
-
 /// What bare `/open` says when nothing has been edited yet.
 pub const NO_LAST_EDITED: &str = "no file edited yet this session — usage: /open <path>";
 
@@ -140,19 +138,93 @@ pub fn save(path: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Points `last` at the file the just-finished dispatch edited, if any.
+/// Points `last` at the file the just-finished dispatch wrote, if any.
 ///
-/// Both `edit` and `write` push an [`EditPreview`], so the previews the UI
-/// already drains after every dispatch are a complete record of what changed —
-/// no extra plumbing through `ToolContext` is needed. The final preview wins:
-/// "the last file edited" is the last one in dispatch order.
+/// `written` is `ToolContext::last_written`, set by every file-mutating tool.
+/// This deliberately does *not* read the diff previews: creating a new file
+/// pushes no preview (the streaming dim preview already showed it), so a
+/// preview-driven pointer silently missed exactly the case a bare `/open` is
+/// most useful for — "write a summary to status.md", then open it.
 ///
-/// Paths are resolved against `cwd` here rather than stored as the raw relative
-/// string, because `EnterWorktree` moves the cwd mid-session.
-pub fn note_edited(last: &mut Option<PathBuf>, previews: &[EditPreview], cwd: &Path) {
-    if let Some(p) = previews.last() {
-        *last = Some(resolve(&p.path, cwd));
+/// The tool resolves against the cwd at write time, so the stored path is
+/// already absolute; that is what keeps it correct across an `EnterWorktree`
+/// that moves the cwd mid-session.
+pub fn note_written(last: &mut Option<PathBuf>, written: Option<PathBuf>) {
+    if let Some(p) = written {
+        *last = Some(p);
     }
+}
+
+/// Extensions `/open` hands to the browser rather than the text editor.
+///
+/// Deliberately short: only markup a browser renders as a *document*. An
+/// `.svg` or `.json` opened from a coding agent is far more likely to be
+/// something the user wants to edit than to look at.
+const BROWSER_EXTENSIONS: [&str; 2] = ["html", "htm"];
+
+/// Whether `/open` should show `path` in the browser instead of miniedit.
+///
+/// Extension-based, and case-insensitive because `.HTML` is still HTML.
+#[must_use]
+pub fn is_browser_target(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            BROWSER_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+
+/// The platform command that hands a path to the default browser.
+///
+/// Split out from [`open_in_browser`] so the platform choice is unit-testable
+/// without actually launching anything.
+#[must_use]
+fn browser_command(path: &Path) -> (&'static str, Vec<std::ffi::OsString>) {
+    let p = path.as_os_str().to_os_string();
+    if cfg!(target_os = "macos") {
+        ("open", vec![p])
+    } else if cfg!(target_os = "windows") {
+        // `start` is a cmd builtin, not an executable; the empty string is the
+        // window title `start` would otherwise eat the path as.
+        ("cmd", vec!["/C".into(), "start".into(), "".into(), p])
+    } else {
+        ("xdg-open", vec![p])
+    }
+}
+
+/// Opens `path` in the default browser.
+///
+/// The child is spawned and *not* waited on: the launcher exits immediately on
+/// macOS but `xdg-open` can outlive the browser it starts, and `/open` must not
+/// block the session either way. Output is silenced so a launcher's chatter
+/// cannot scribble over the TUI.
+///
+/// # Errors
+/// Returns a user-facing message when the launcher cannot be spawned — the
+/// common case being a headless Linux box with no `xdg-open` installed.
+pub fn open_in_browser(path: &Path) -> Result<(), String> {
+    let (program, args) = browser_command(path);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "cannot open {} in a browser ({program}: {e})",
+                path.display()
+            )
+        })
+}
+
+/// The log line for a file handed to the browser.
+#[must_use]
+pub fn opened_in_browser_message(display: &str) -> String {
+    format!("opened {display} in the default browser")
 }
 
 /// The log line for a successful write.
@@ -321,50 +393,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Builds a preview carrying just the path; the diff rows are irrelevant
-    /// to the pointer bookkeeping.
-    fn preview(path: &str) -> EditPreview {
-        EditPreview {
-            path: path.to_string(),
-            created: false,
-            added: 1,
-            removed: 0,
-            bytes: None,
-            rows: Vec::new(),
-        }
-    }
-
     #[test]
-    fn note_edited_takes_the_last_preview() {
-        let cwd = Path::new("/work");
+    fn note_written_takes_the_path_the_tool_resolved() {
         let mut last = None;
-        note_edited(&mut last, &[preview("a.rs"), preview("b.rs")], cwd);
+        note_written(&mut last, Some(PathBuf::from("/work/b.rs")));
         assert_eq!(last, Some(PathBuf::from("/work/b.rs")));
     }
 
     #[test]
-    fn note_edited_resolves_relative_paths_eagerly() {
-        // `EnterWorktree` moves the cwd mid-session, so a stored relative path
-        // would later resolve to the worktree copy — a different file than the
-        // one that was edited.
-        let mut last = None;
-        note_edited(&mut last, &[preview("src/ui.rs")], Path::new("/work"));
-        assert_eq!(last, Some(PathBuf::from("/work/src/ui.rs")));
-        note_edited(&mut last, &[preview("src/ui.rs")], Path::new("/work/.wt/x"));
-        assert_eq!(last, Some(PathBuf::from("/work/.wt/x/src/ui.rs")));
+    fn note_written_follows_a_newly_created_file() {
+        // The regression: `write` creating a file pushes no diff card, but the
+        // new file is precisely what a bare `/open` should open.
+        let mut last = Some(PathBuf::from("/work/old.rs"));
+        note_written(&mut last, Some(PathBuf::from("/work/status.md")));
+        assert_eq!(last, Some(PathBuf::from("/work/status.md")));
     }
 
     #[test]
-    fn note_edited_keeps_an_absolute_path_as_is() {
-        let mut last = None;
-        note_edited(&mut last, &[preview("/etc/hosts")], Path::new("/work"));
-        assert_eq!(last, Some(PathBuf::from("/etc/hosts")));
-    }
-
-    #[test]
-    fn note_edited_leaves_the_pointer_alone_when_nothing_changed() {
+    fn note_written_leaves_the_pointer_alone_when_nothing_was_written() {
         let mut last = Some(PathBuf::from("/work/a.rs"));
-        note_edited(&mut last, &[], Path::new("/work"));
+        note_written(&mut last, None);
         assert_eq!(last, Some(PathBuf::from("/work/a.rs")));
     }
 
@@ -375,6 +423,64 @@ mod tests {
         assert_eq!(wrote_message("a.txt", "a\nb\n"), "wrote a.txt (2 lines)");
         assert_eq!(wrote_message("a.txt", "a\n"), "wrote a.txt (1 line)");
         assert_eq!(wrote_message("a.txt", ""), "wrote a.txt (0 lines)");
+    }
+
+    #[test]
+    fn html_files_go_to_the_browser() {
+        assert!(is_browser_target(Path::new("/work/report.html")));
+        assert!(is_browser_target(Path::new("/work/report.htm")));
+        // A browser renders it, but from a coding agent it is far more likely
+        // to be something the user wants to edit.
+        assert!(!is_browser_target(Path::new("/work/logo.svg")));
+        assert!(!is_browser_target(Path::new("/work/data.json")));
+        assert!(!is_browser_target(Path::new("/work/notes.md")));
+        assert!(!is_browser_target(Path::new("/work/src/ui.rs")));
+    }
+
+    #[test]
+    fn the_extension_match_is_case_insensitive() {
+        assert!(is_browser_target(Path::new("/work/REPORT.HTML")));
+        assert!(is_browser_target(Path::new("/work/Report.Htm")));
+    }
+
+    #[test]
+    fn an_extensionless_or_dotfile_name_is_not_html() {
+        // `.html` as the whole file name is an extensionless dotfile, not an
+        // HTML document; neither is a file that merely contains the word.
+        assert!(!is_browser_target(Path::new("/work/.html")));
+        assert!(!is_browser_target(Path::new("/work/README")));
+        assert!(!is_browser_target(Path::new("/work/html")));
+        assert!(!is_browser_target(Path::new("/work/index.html.bak")));
+    }
+
+    #[test]
+    fn the_browser_command_passes_the_path_as_one_argument() {
+        // A path with spaces must survive as a single argv entry rather than
+        // being re-split by a shell -- which is why this spawns a program
+        // directly instead of going through `sh -c`.
+        let path = Path::new("/work/my report.html");
+        let (program, args) = browser_command(path);
+        assert!(!program.is_empty());
+        assert_eq!(
+            args.last().map(std::ffi::OsString::as_os_str),
+            Some(path.as_os_str())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_the_open_launcher() {
+        let (program, args) = browser_command(Path::new("/work/r.html"));
+        assert_eq!(program, "open");
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn opened_in_browser_message_names_the_file() {
+        assert_eq!(
+            opened_in_browser_message("/work/r.html"),
+            "opened /work/r.html in the default browser"
+        );
     }
 
     #[test]

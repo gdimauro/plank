@@ -48,6 +48,134 @@ pub const POWERLINE_BRANCH: char = '\u{e0a0}';
 /// `push_dir_prefix` mistake it for part of the branch name.
 pub const THINK_MARK: &str = "🧠";
 
+/// Leading glyph of the **git stat segment** (`📄 3 · +12 -4`), shown just
+/// after the branch name inside the dir prefix.
+///
+/// Like [`THINK_MARK`], it is also the anchor the TUI splits on: the segment
+/// rides between the branch and the engine origin, so `push_dir_prefix` peels
+/// it here rather than letting it be absorbed into the branch name.
+pub const GIT_STAT_MARK: &str = "📄";
+
+/// Bright green (256-color 10), the added-lines count in the git stat segment.
+pub const GIT_ADD_COLOR: u8 = 10;
+/// Bright red (256-color 9), the deleted-lines count in the git stat segment.
+pub const GIT_DEL_COLOR: u8 = 9;
+
+/// Working-tree change summary: files touched, lines added, lines deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitStats {
+    /// Number of files differing from `HEAD` (staged and unstaged, deduped).
+    pub files: usize,
+    /// Lines added across those files.
+    pub added: usize,
+    /// Lines deleted across those files.
+    pub deleted: usize,
+}
+
+impl GitStats {
+    /// True when the tree is clean, in which case the footer shows nothing.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.files == 0 && self.added == 0 && self.deleted == 0
+    }
+}
+
+/// How long a computed [`GitStats`] is reused before the diff is walked again.
+///
+/// The footer repaints several times a second; diffing the whole working tree
+/// at that rate would cost more than everything else on the line put together.
+/// A second of staleness in a change counter nobody is watching frame-by-frame
+/// is not a defect.
+const GIT_STATS_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Cached result of the last working-tree diff, with the instant it was taken.
+static GIT_STATS_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<GitStats>)>> =
+    std::sync::Mutex::new(None);
+
+/// Working-tree change summary against `HEAD`, discovered from the cwd via
+/// `git2`. `None` outside a repo, or when the diff cannot be taken.
+///
+/// Cached for [`GIT_STATS_TTL`]; a poisoned cache falls through to a fresh
+/// computation rather than panicking on the render path.
+#[must_use]
+pub fn git_stats() -> Option<GitStats> {
+    let now = std::time::Instant::now();
+    if let Ok(cache) = GIT_STATS_CACHE.lock()
+        && let Some((taken, stats)) = *cache
+        && now.duration_since(taken) < GIT_STATS_TTL
+    {
+        return stats;
+    }
+    let stats = compute_git_stats();
+    if let Ok(mut cache) = GIT_STATS_CACHE.lock() {
+        *cache = Some((now, stats));
+    }
+    stats
+}
+
+/// Walks the `HEAD`-to-working-tree diff once. See [`git_stats`] for the
+/// cached entry point.
+fn compute_git_stats() -> Option<GitStats> {
+    let repo = git2::Repository::discover(".").ok()?;
+    // Tree-to-workdir-with-index: one diff covering both staged and unstaged
+    // work, so a file edited and then added is counted once, not twice.
+    let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))
+        .ok()?;
+    let stats = diff.stats().ok()?;
+    Some(GitStats {
+        files: stats.files_changed(),
+        added: stats.insertions(),
+        deleted: stats.deletions(),
+    })
+}
+
+/// The git stat segment text, `📄 3 · +12 -4`, or `None` for a clean tree or
+/// no repo. With `color`, the counts carry their own ANSI colors and return to
+/// the footer style.
+#[must_use]
+pub fn git_stat_segment(color: bool) -> Option<String> {
+    let st = git_stats()?;
+    if st.is_clean() {
+        return None;
+    }
+    if color {
+        Some(format!(
+            "{GIT_STAT_MARK} {} · \x1b[38;5;{GIT_ADD_COLOR};1m+{}{STATUS_STYLE_START} \x1b[38;5;{GIT_DEL_COLOR};1m-{}{STATUS_STYLE_START}",
+            st.files, st.added, st.deleted
+        ))
+    } else {
+        Some(format!(
+            "{GIT_STAT_MARK} {} · +{} -{}",
+            st.files, st.added, st.deleted
+        ))
+    }
+}
+
+/// The think segment's level name colored by *temperature*: the hotter the
+/// reasoning effort, the hotter the color. Red for `max`, white for `med`, blue
+/// for `low`, grey for `off` — so the level is legible at a glance, from a
+/// segment only three columns wide, without reading the word.
+///
+/// A 256-color index rather than an RGB triple: the footer is written as
+/// `38;5;<n>` escapes on the plain path and as `Color::Indexed` in the TUI, and
+/// one number serves both. Grey 245 rather than the 240 used for dim text
+/// elsewhere: the status bar's own background is 238, and 240 on 238 is not a
+/// contrast so much as a rumor.
+#[must_use]
+pub fn think_color(mode: crate::engine::ThinkMode) -> u8 {
+    use crate::engine::ThinkMode;
+    match mode {
+        ThinkMode::Max => 196,
+        ThinkMode::Medium => 231,
+        ThinkMode::Low => 39,
+        ThinkMode::Off => 245,
+    }
+}
+
 const PROGRESS_BAR_WIDTH: usize = 32;
 
 /// Worker lifecycle state mirrored from `agent_worker_state`.
@@ -877,6 +1005,7 @@ impl LocalPass {
             crate::anim::epoch_ms(),
             std::sync::atomic::Ordering::Relaxed,
         );
+        ROUTED_TOKEN.store(NO_ROUTED_TOKEN, std::sync::atomic::Ordering::Relaxed);
         LOCAL_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
         Self
     }
@@ -926,15 +1055,44 @@ pub(crate) fn set_local_pass_ms(ms: u64) {
 static LOCAL_PASS_OVERRIDE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// How long one on/off cycle of the local-engine brain blink takes. Slower than
-/// the tool blink: this is a reassurance, not an alert, and a fast pulse next to
-/// the shimmering verb would be noise.
-pub const BRAIN_BLINK_MS: u64 = 1200;
+/// Sentinel for "no token has been decoded in this pass yet".
+const NO_ROUTED_TOKEN: u64 = u64::MAX;
 
-/// Whether the brain is in the lit half of its blink at `tick_ms`.
+/// The token whose expert routing the think segment is currently drawing.
+///
+/// Process-global for the same reason [`LOCAL_PASS`] is: the pass runs on the
+/// worker thread while the TUI draws on the UI thread, and the renderer only
+/// ever receives the rendered status string.
+static ROUTED_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(NO_ROUTED_TOKEN);
+
+/// Records the token just decoded, so [`crate::experts`] can draw its routing.
+///
+/// Called from the local decode loop; a pass that never reports one (prefill, or
+/// any engine but the native one) falls back to the pass clock in
+/// [`routing_seed`], so the glyph still animates on the `EchoEngine` path.
+pub fn note_routed_token(token: i32) {
+    ROUTED_TOKEN.store(
+        u64::from(token.unsigned_abs()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// How long one expert frame holds when the seed comes from the clock rather
+/// than from a real token. Close to a fast decode rate: slow enough to read as
+/// distinct frames, fast enough to look like work.
+pub const EXPERT_FRAME_MS: u64 = 120;
+
+/// The seed [`crate::experts`] draws the current routing from: the live token
+/// when the decode loop is reporting them, else the pass clock in frame steps.
 #[must_use]
-pub fn brain_blink_on(tick_ms: u64) -> bool {
-    tick_ms % BRAIN_BLINK_MS < BRAIN_BLINK_MS / 2
+pub fn routing_seed() -> u64 {
+    let token = ROUTED_TOKEN.load(std::sync::atomic::Ordering::Relaxed);
+    if token == NO_ROUTED_TOKEN {
+        local_pass_ms() / EXPERT_FRAME_MS
+    } else {
+        token
+    }
 }
 
 /// Sets the running-tools label for as long as the guard lives, then hands it
@@ -1260,7 +1418,18 @@ fn build_status_text_with_cells(
     // worth a permanent slot rather than appearing only when off the default.
     // Abbreviated to a fixed three columns so changing level does not shift the
     // rest of the footer sideways.
-    let think = format!("{THINK_MARK} {} | ", st.think.short_name());
+    // The level itself is temperature-colored (see `think_color`); the mark and
+    // separator stay in the footer's own style.
+    let level = if color {
+        format!(
+            "\x1b[38;5;{}m{}{STATUS_STYLE_START}",
+            think_color(st.think),
+            st.think.short_name()
+        )
+    } else {
+        st.think.short_name().to_owned()
+    };
+    let think = format!("{THINK_MARK} {level} | ");
     let power = power_suffix(st);
     // Theme-colored accent text; returns to the footer style (not a full
     // reset) so the status bar's background survives on color terminals.
@@ -1278,8 +1447,12 @@ fn build_status_text_with_cells(
     let dir = if cwd.is_empty() {
         origin
     } else if let Some(branch) = git_branch_label() {
+        // The git stat segment rides with the branch, inside the dir prefix:
+        // it answers "what have I changed in this tree", which is the same
+        // question the path and branch answer, one level down.
+        let stat = git_stat_segment(color).map_or(String::new(), |s| format!(" | {s}"));
         format!(
-            "{} {POWERLINE_BRANCH} {} | {origin}",
+            "{} {POWERLINE_BRANCH} {}{stat} | {origin}",
             theme(&cwd),
             theme(&branch)
         )
@@ -1961,6 +2134,46 @@ mod tests {
         assert_eq!(flash_tip(), None);
     }
 
+    /// The level is colored by temperature — red `max`, white `med`, blue `low`,
+    /// grey `off` — and the four are distinct, which is the whole point: the
+    /// color has to identify the level on its own, from three columns.
+    ///
+    /// Colored only when the caller asked for color; the TUI renders the footer
+    /// plain and re-styles it span by span, so an escape leaking into that text
+    /// would be drawn literally.
+    #[test]
+    fn the_think_level_is_colored_by_temperature() {
+        use crate::engine::ThinkMode;
+
+        let levels = [
+            ThinkMode::Off,
+            ThinkMode::Low,
+            ThinkMode::Medium,
+            ThinkMode::Max,
+        ];
+        let colors: std::collections::HashSet<u8> =
+            levels.iter().map(|&m| think_color(m)).collect();
+        assert_eq!(colors.len(), levels.len(), "a shared color hides a level");
+        // Hotter effort, hotter color: max is the red one, off the grey one.
+        assert_eq!(think_color(ThinkMode::Max), 196);
+        assert_eq!(think_color(ThinkMode::Off), 245);
+
+        for level in levels {
+            let st = Status {
+                think: level,
+                ctx_size: 1000,
+                ctx_used: 30,
+                ..Status::default()
+            };
+            let want = format!("\x1b[38;5;{}m{}", think_color(level), level.short_name());
+            let colored = build_status_text(&st, true, true);
+            assert!(colored.contains(&want), "{level:?}: {colored:?}");
+            let plain = build_status_text(&st, false, true);
+            assert!(!plain.contains("\x1b["), "{level:?}: {plain:?}");
+            assert!(plain.contains(level.short_name()), "{level:?}: {plain:?}");
+        }
+    }
+
     /// The think segment sits immediately before the ctx gauge, in every state,
     /// and names the level `/think` selected.
     #[test]
@@ -2011,6 +2224,68 @@ mod tests {
         assert!(mark < ctx, "{line}");
         // Nothing between the two but the separator.
         assert_eq!(&line[mark..ctx], format!("{THINK_MARK} med | "), "{line}");
+    }
+
+    /// The change counter belongs to the *location*, not the body: it describes
+    /// the tree named by the path and branch, so it sits inside the dir prefix,
+    /// after the branch and before the origin. (The TUI splits on
+    /// `GIT_STAT_MARK` for the same reason it splits on `THINK_MARK`.)
+    #[test]
+    fn git_stat_segment_sits_between_the_branch_and_the_body() {
+        let st = Status {
+            ctx_used: 1,
+            ctx_size: 100,
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        // The repo under test may be clean, in which case the segment is absent
+        // by design and there is nothing to place.
+        let Some(mark) = line.find(GIT_STAT_MARK) else {
+            assert!(git_stats().is_none_or(|s| s.is_clean()), "{line}");
+            return;
+        };
+        let branch = line.find(POWERLINE_BRANCH).expect("branch glyph present");
+        let think = line.find(THINK_MARK).expect("think segment present");
+        assert!(branch < mark && mark < think, "{line}");
+    }
+
+    /// The counts are colored where they are read: bright green for additions,
+    /// bright red for deletions, with the footer style restored after each so
+    /// the bar's background survives.
+    #[test]
+    fn git_stat_counts_carry_their_own_colors() {
+        let Some(seg) = git_stat_segment(true) else {
+            return;
+        };
+        assert!(
+            seg.contains(&format!("\x1b[38;5;{GIT_ADD_COLOR};1m+")),
+            "{seg}"
+        );
+        assert!(
+            seg.contains(&format!("\x1b[38;5;{GIT_DEL_COLOR};1m-")),
+            "{seg}"
+        );
+        assert!(seg.ends_with(STATUS_STYLE_START), "{seg}");
+    }
+
+    /// A clean tree says nothing: the segment exists to report change, and a
+    /// permanent `0 · +0 -0` would be three columns of noise.
+    #[test]
+    fn a_clean_tree_shows_no_git_stat_segment() {
+        let clean = GitStats {
+            files: 0,
+            added: 0,
+            deleted: 0,
+        };
+        assert!(clean.is_clean());
+        assert!(
+            !GitStats {
+                files: 1,
+                added: 0,
+                deleted: 0
+            }
+            .is_clean()
+        );
     }
 
     /// The power cap rides with the local origin, not the bar's tail: it caps

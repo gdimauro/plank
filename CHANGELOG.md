@@ -8,6 +8,185 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The status footer counts what you have changed.** Beside the directory and
+  branch — on the TUI's location row, which answers "which tree am I in" —
+  the footer now carries a working-tree summary: `📄 3 · +128 -41`, files
+  touched then lines added in bright green and lines deleted in bright red. It
+  is one `HEAD`-to-workdir-with-index diff, untracked files included, so a file
+  edited and then staged counts once rather than twice. A clean tree shows
+  nothing: a permanent `0 · +0 -0` is three columns of noise. The diff is
+  cached for a second, because the footer repaints several times a second and
+  walking the tree at that rate would cost more than the rest of the line put
+  together.
+
+## [3.5.0] - 2026-08-30
+
+### Added
+
+- **`/insights` recommends plank features to adopt.** A new "Features to try"
+  section names two or three extension points — a skill, a template, a
+  subagent, a hook, an MCP server — grounded in the sessions, tool mix and
+  error categories the report already measured, each with a ready-to-run
+  snippet rather than a description. The prompt carries a catalogue of the
+  extension points and where their files live, because the model has no
+  reliable knowledge of plank itself, and the report passes it the live
+  skill/template/subagent/hook/MCP rosters as `extensions_in_use` so it
+  recommends what is missing instead of what is already installed. A point with
+  nothing installed is sent as `none` explicitly: an absent line would read as
+  "unknown", which is a different thing.
+
+- **`/install-claude-plugin <url|owner/repo> [plugin-name] [--force]`.** Plank
+  already understood the Claude Code plugin layout (`.claude-plugin/plugin.json`,
+  `commands/`, `hooks/hooks.json`, `.mcp.json`, `settings.json`); this adds the
+  missing way to acquire one. Accepts a GitHub repo URL, an `owner/repo`
+  shorthand, a browser-copied `/tree/<ref>/<path>` or `/blob/<ref>/<path>` URL
+  (resolving the plugin at that path, walking up a level when it names the
+  `.claude-plugin` directory itself), a marketplace repository (asks for a
+  name, and lists what it offers, when one isn't given or doesn't match), a
+  `.tar.gz` over https, or a local directory — so a plugin can be tried before
+  it's published. Installs land in `~/.plank/plugins/claude/<name>/`, a third
+  scan root after `~/.plank/plugins/dev/*` and before `<cwd>/.plank/plugins/*`,
+  so a plugin you wrote yourself still wins a bare-name collision; `/plugins`
+  lists the origin as `claude` and `/plugins remove <name>` uninstalls it. It
+  refuses a tree with no `.claude-plugin/plugin.json`, a symlink escaping the
+  plugin tree, an unusable name, a name already installed, and a hook event
+  plank doesn't implement (Claude Code's `Notification` and `SubagentStop`
+  have no plank equivalent) — only that last refusal is waivable, with
+  `--force`, and those hooks are installed but will never fire. Two things are
+  rewritten at install time because the formats genuinely differ: Claude
+  Code's hook commands reference `${CLAUDE_PLUGIN_ROOT}`, but plank's hook
+  runner execs `/bin/sh` with no injected environment, so it's rewritten to
+  the actual install path in `hooks/hooks.json` and `.mcp.json` (and moving
+  the directory afterwards breaks those hooks, which the command warns about
+  when it happens); and Claude Code nests hook events under a top-level
+  `"hooks"` key, which is unwrapped so plank's flat-event reader actually
+  loads them. `.mcp.json` and `settings.json` need no translation — plank's
+  existing plugin loaders already merge them, with a plugin's settings
+  sitting below the user's own. Verified end to end against `obra/superpowers`
+  v6.3.0, installed from a `/tree/main/.claude-plugin` marketplace URL, with
+  all 14 of its skills loading on the next start.
+
+## [3.4.0] - 2026-08-29
+
+### Added
+
+- **Configuration provenance (M0).** `plank --dump-config` and
+  `/config --resolved` print every effective setting with the layer it came
+  from and the layers it shadowed, so "my setting did not take effect" is one
+  command rather than a code read.
+- **Loop guards (M1).** A repeat advisory tells the model when it has made the
+  same call three times (`tools.repeatAdvisory`, on by default; async job polls
+  are exempt), and an optional per-call budget (`tools.callTimeoutSec`) reports
+  when a tool overran it. Neither blocks or cancels — both inform the model.
+- **Feedback sidecar (M2).** `/rate + note` / `/rate -` records a rating in
+  `~/.plank/usage-data/feedback/<session>.jsonl`, deliberately outside the
+  transcript, context and KV so the model can never read or play to it.
+  `/insights` reports satisfaction over time and the worst-rated turns, and
+  now reports ratings orphaned by compaction separately instead of counting
+  them.
+- **The log-everything invariant (M3).** `tests/log_invariant.rs` asserts
+  structurally that every span of an assembled request is either a transcript
+  entry or the separately-fingerprinted system prompt, so `/repro` and
+  `/resume` cannot silently omit injected text.
+- **Output spill (M4).** Oversized tool output is written to
+  `~/.plank/spill/<session>/<n>.txt` and the model sees a bounded preview plus
+  a `continue_offset` locator it can page with `more`. Applied post-dispatch to
+  every tool, including MCP results, which previously had no cap at all.
+  Defaults are 1 MiB / 4 KiB (`tools.spillMaxBytes`, `tools.spillPreviewBytes`).
+- **Microcompact cadence and keep-policy (M5).** Old tool-result bodies are
+  cleared at end of turn without a model round-trip, keeping the newest three
+  result messages, anything under 256 bytes, and everything belonging to the
+  active task. The pass only fires when it would reclaim at least 4 KiB,
+  because rewriting the transcript invalidates the KV prefix.
+- **Cross-session search (M6).** `/search <query> [--all]` searches prior
+  sessions, scoped to the current project by default. The index archives
+  conversation that compaction removes, so history stays findable after the
+  transcript no longer holds it.
+- **Durable goal state (M7).** `/goal --max N <objective>` runs an adjudicated
+  loop; the goal is durable session state that survives `/save`, `/resume` and
+  `/compact`. Only an *active* goal is injected into subagent preambles.
+- **The `recall` tool (M8).** Gives the model the session index: prior sessions
+  scoped to this project, plus the current transcript.
+- **Subagent fan-out (M9).** One call runs several independent subtasks and
+  joins their reports in a deterministic order. Agents declaring
+  `isolation: worktree` run in a throwaway worktree. Serial by design — the
+  value is the deterministic join and the isolation, not throughput.
+- **`run_code` (M10).** A short script of `read`/`glob`/`edit`/`bash`
+  operations executed in one turn. Each operation is routed through the normal
+  tool dispatch, so the sandbox, the `~/.plank` grant and the `PreToolUse`
+  hooks all apply exactly as they would to a bare call.
+
+### Changed
+
+- **`tools.recall`, `tools.fanout` and `tools.runCode` now default to `true`.**
+  Their schemas are part of the standing tools prompt, so `fp1` no longer
+  matches the C agent's fingerprint out of the box. This is a versioned
+  deviation recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`; the C-*derived*
+  prompt text is still asserted byte-for-byte by
+  `tools_prompt_matches_c_source`. Set any of the three to `false` to remove
+  its schema.
+
+### Fixed
+
+- `/insights` no longer folds ratings whose turn compaction renumbered into the
+  satisfaction statistics; they are reported as orphaned and excluded.
+- `/search` no longer loses text that compaction removed from a session.
+- `/goal clear` drops the goal outright, and a settled or cleared goal is no
+  longer injected into subagent preambles as if it were the live objective.
+- The spill tests no longer read and write the real `~/.plank/spill`, where
+  blobs left by an interrupted run could make later runs fail.
+
+## [3.3.0] - 2026-08-26
+
+### Added
+
+- **Commits plank writes are signed.** The system prompt now asks the model to
+  end each commit message it writes with a blank line and the trailer
+  `--with help from plank`. Set `git.signCommits` to `false` in
+  `settings.json` (or `/config git.signCommits false`) to drop the
+  instruction and leave commit messages to your repository's own conventions.
+
+### Changed
+
+- **DSpark speculative decoding is on by default.** `--dspark` is now the
+  explicit opt-in (it was the only way to turn it on), and `--dspark-off`
+  selects target-only decode. Because speculation only engages at temperature
+  0, a bare run now samples argmax; an explicit `--temp` still wins, and
+  `--dspark-off` leaves the 0.6 sampling default in force.
+
+## [3.2.0] - 2026-08-25
+
+### Added
+
+- **Per-model phase times in the exit message.** The session summary used to end
+  with one peak prefill and one peak generation rate. A peak is one lucky pass
+  and says nothing about where the session actually went, so it now reports, for
+  each model that ran, how long that model spent prefilling and generating with
+  the session average rate beside each, plus how long it spent running tools:
+
+  ```
+  avg deepseek-v4-flash  prefill 12.3s (1420.5 tok/s)  ·  generation 45.2s (38.1 tok/s)  ·  tools 8.4s
+  ```
+
+  With more than one model the rows are labeled and aligned with the per-engine
+  token rows below them. Tool time is charged at the single dispatch chokepoint
+  every front-end shares and attributed to whichever engine drove the turn — the
+  alt engine during a sidechain, same rule as the token tally. Online providers
+  report neither a token count nor a local rate, so a provider-only session's
+  exit message is unchanged.
+
+- **The think segment draws the router.** Two braille cells beside the reasoning
+  level stand in for the `MoE` expert routing, re-rolled on every decoded token.
+  The real selection never leaves the GPU on the Metal path, so the display is
+  derived from the token id rather than read from the engine: it is honest about
+  sparsity (a few of many), about routing changing per token, and about the same
+  token lighting the same experts — and says nothing about *which* experts. Two
+  columns wide, exactly like the 🧠 it replaces, so the footer never reflows.
+
+- **The reasoning level is colored by temperature** — red for `max`, white for
+  `med`, blue for `low`, grey for `off` — so a three-column segment is legible
+  without reading the word.
+
 - **Greedy chain decode on Metal**, via the ds4 engine's new
   `ds4_session_eval_chain_greedy`. At temperature 0 plank decodes a run of
   argmax tokens with the next token id kept on-device, removing the per-token
@@ -24,6 +203,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   support model, so the two are mutually exclusive.
 
 ### Changed
+
+- **The live decode rate is measured from the first token out.** It was anchored
+  at the start of the `generate` call, so on a long prompt it divided the token
+  count by decode time *plus* prefill *plus* time-to-first-token: the footer
+  opened far below the real rate and only crept toward it as the pass ran.
 
 - **The `--dspark` footer segment now reads `1.5t/step`, not `1.5x`.** It was
   always mean tokens committed per speculative step, which is not a wall-clock

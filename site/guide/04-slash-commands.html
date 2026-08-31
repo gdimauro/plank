@@ -88,6 +88,7 @@
   th{background:var(--birch);font-weight:800}
   hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
   img{max-width:100%}
+  article p>img{display:block;margin:1.3em 0;border:2px solid var(--line);border-radius:12px}
 
   .toc{list-style:none;padding:0;margin:0}
   .toc li{margin:0 0 10px}
@@ -424,6 +425,13 @@ single self-contained file. It never touches the live session.</p>
 and uses the model only for prose it cannot replace — a failed or
 skipped model call costs the report its narrative, never its
 statistics.</p>
+<p>Among the written sections is <strong>Features to try</strong>: two
+or three of plank's own <a href="09-extending.html">extension points</a> —
+a skill, a template, a subagent, a hook, an MCP server — chosen from
+what your sessions actually show, each with a ready-to-run snippet that
+sets it up. The report knows what you already have installed (it reads
+the live skill, template, subagent, hook and MCP rosters), so it
+recommends what is missing rather than what is already there.</p>
 <h2 id="editing-a-file">Editing a file</h2>
 <table>
 <thead>
@@ -465,16 +473,17 @@ the command is not available.</p>
 <td>recognized as a command</td>
 </tr>
 <tr>
-<td><code>/grant</code></td>
-<td>recognized; approves a remote client's control request</td>
+<td><code>/grant [session]</code></td>
+<td>approves a remote client's control request</td>
 </tr>
 </tbody>
 </table>
 <p>Both are part of the remote-control surface described in <a
-href="10-remote-and-providers.html">Remote and hosted engines</a>. The
-local <code>/grant</code> handler is not wired into the UI yet, so today
-a remote client that needs to take control should be started against a
-server run with <code>--control-allow</code>.</p>
+href="10-remote-and-providers.html">Remote and hosted engines</a>.
+<code>/grant</code> matters only when the bridge was started with
+<code>/rc ask</code>, which withholds control from attaching clients
+until you approve each request; plain <code>/rc</code> grants it up
+front and leaves <code>/grant</code> with nothing to answer.</p>
 <h2 id="not-in-help">Not in <code>/help</code></h2>
 <p>Five arcade commands are deliberately absent from <code>/help</code>
 and from the completion popup. They are covered in <a

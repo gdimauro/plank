@@ -1401,6 +1401,12 @@ impl<W: Write> fmt::Debug for TokenRenderer<W> {
 }
 
 impl<W: Write> TokenRenderer<W> {
+    /// Borrows the sink, so a caller rendering into a buffer can harvest
+    /// bytes without consuming the renderer.
+    pub fn sink_mut(&mut self) -> &mut W {
+        &mut self.sink
+    }
+
     /// Creates a renderer writing to `sink` with the given options.
     pub fn new(sink: W, opts: RenderOptions) -> Self {
         Self {
@@ -1495,6 +1501,14 @@ impl<W: Write> TokenRenderer<W> {
             self.last_output_newline = true;
         }
         let _ = self.sink.flush();
+    }
+
+    /// Consumes the renderer and returns the sink it was writing into.
+    ///
+    /// The Turbo Vision front end renders into a `Vec<u8>` and harvests the
+    /// ANSI, rather than writing it to a terminal.
+    pub fn into_sink(self) -> W {
+        self.sink
     }
 
     /// Emits a raw color escape, tracking whether a manual color is open.

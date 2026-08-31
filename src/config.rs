@@ -134,6 +134,14 @@ pub struct AgentConfig {
     /// it may be replaced by the provider's reported window; an explicit value
     /// is the user's decision and is never overridden.
     pub ctx_size_explicit: bool,
+    /// Settings keys (`section.key`) a CLI flag overrode, for `/config
+    /// --resolved`. Populated by [`parse_options_with`]; empty when no flag
+    /// shadowed a settings key.
+    pub cli_provenance: std::collections::BTreeMap<String, crate::provenance::Origin>,
+    /// True when `--dump-config` was given: print the resolved configuration
+    /// (every effective key with its origin) and exit, without starting a
+    /// session. Works under `--non-interactive`.
+    pub dump_config: bool,
 }
 
 /// Third-party provider family selector (`--provider`).
@@ -198,7 +206,7 @@ pub struct EngineTuning {
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
-    /// Use a `DSpark` draft model, from `--dspark`.
+    /// Use a `DSpark` draft model. On by default; `--dspark-off` turns it off.
     ///
     /// The support GGUF comes from `--mtp` when given; otherwise it is
     /// resolved to `~/.plank/ds4flash.dspark.gguf` at startup and downloaded
@@ -253,7 +261,7 @@ impl Default for EngineTuning {
             mtp_path: None,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
-            dspark: false,
+            dspark: true,
             dspark_strict: false,
             dspark_confidence: None,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
@@ -327,6 +335,8 @@ impl Default for AgentConfig {
             provider_api_key: None,
             provider_cache: true,
             ctx_size_explicit: false,
+            cli_provenance: std::collections::BTreeMap::new(),
+            dump_config: false,
         }
     }
 }
@@ -365,6 +375,13 @@ impl AgentConfig {
         }
         c
     }
+
+    /// Records that a CLI flag set the settings key `key` (`section.key`), so
+    /// `/config --resolved` can show the flag beating the file provenance.
+    fn cli_set(&mut self, key: &str) {
+        self.cli_provenance
+            .insert(key.to_string(), crate::provenance::Origin::Cli);
+    }
 }
 
 /// Parses a backend name; `None` for anything unrecognised.
@@ -397,9 +414,10 @@ Options:
       --mtp PATH           multi-token-prediction draft model (GGUF)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
-      --dspark             DSpark speculative decoding; downloads the support model
-                           to ~/.plank/ds4flash.dspark.gguf unless --mtp names one
-                           (defaults --temp to 0 unless --temp is given)
+      --dspark             DSpark speculative decoding (on by default); downloads
+                           the support model to ~/.plank/ds4flash.dspark.gguf unless
+                           --mtp names one (defaults --temp to 0 unless --temp is given)
+      --dspark-off         disable DSpark speculative decoding (target-only decode)
       --dspark-confidence F  DSpark confidence pruning threshold 0..1
                            (engine default: Metal 0.6, CUDA/ROCm 0.7; 0 = fixed blocks)
       --dspark-strict      load DSpark support but keep target-only decode
@@ -453,6 +471,8 @@ Options:
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
       --non-interactive    disable the interactive UI
+      --dump-config        print every effective setting with the layer it came
+                           from (default, plugin, ~/.plank, ./.plank, CLI) and exit
       --minimal-prompt     start with the smallest prompt this build can make:
                            no MCP servers, skills, templates, plugin agents,
                            WASM components or session-start context. For
@@ -750,6 +770,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "list, install, remove, inspect, disable, approve, or trust a key",
     },
     SlashCommand {
+        name: "/install-claude-plugin",
+        args: "<url|owner/repo> [plugin-name] [--force]",
+        desc: "install a Claude Code plugin from a repository or a tarball",
+    },
+    SlashCommand {
         name: "/frame",
         args: "[id]",
         desc: "open a wasm frame component, or list the openable ones",
@@ -897,6 +922,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/init"
             | "/skills"
             | "/plugins"
+            | "/install-claude-plugin"
             | "/frame"
             | "/templates"
             | "/tasks"
@@ -1087,19 +1113,36 @@ pub fn parse_options_with(
                 }
                 return Ok(c);
             }
-            "-m" | "--model" => c.model_path = Some(PathBuf::from(need_arg(&mut i)?)),
-            "-t" | "--threads" => c.n_threads = parse_int(need_arg(&mut i)?, arg)?,
+            "-m" | "--model" => {
+                c.model_path = Some(PathBuf::from(need_arg(&mut i)?));
+                c.cli_set("engine.model");
+            }
+            "-t" | "--threads" => {
+                c.n_threads = parse_int(need_arg(&mut i)?, arg)?;
+                c.cli_set("engine.threads");
+            }
             "--backend" => {
                 let v = need_arg(&mut i)?;
                 c.backend = Some(parse_backend(v).ok_or_else(|| format!("invalid backend: {v}"))?);
+                c.cli_set("engine.backend");
             }
-            "--metal" => c.backend = Some(Backend::Metal),
-            "--cuda" => c.backend = Some(Backend::Cuda),
-            "--cpu" => c.backend = Some(Backend::Cpu),
+            "--metal" => {
+                c.backend = Some(Backend::Metal);
+                c.cli_set("engine.backend");
+            }
+            "--cuda" => {
+                c.backend = Some(Backend::Cuda);
+                c.cli_set("engine.backend");
+            }
+            "--cpu" => {
+                c.backend = Some(Backend::Cpu);
+                c.cli_set("engine.backend");
+            }
             "--power" => {
                 let v = need_arg(&mut i)?;
                 c.power_percent = parse_power_percent(v)
                     .ok_or_else(|| format!("invalid value for {arg}: {v}"))?;
+                c.cli_set("engine.power");
             }
             "-p" | "--prompt" => c.prompt = Some(need_arg(&mut i)?.to_owned()),
             "/resume" => {
@@ -1148,6 +1191,7 @@ pub fn parse_options_with(
                 };
             }
             "--non-interactive" => c.non_interactive = true,
+            "--dump-config" => c.dump_config = true,
             "--minimal-prompt" => c.minimal_prompt = true,
             // Bare `--ui-remote` means an ephemeral port. A following bare
             // number is almost certainly someone meaning to pin one, so
@@ -1174,6 +1218,7 @@ pub fn parse_options_with(
             "-c" | "--ctx" => {
                 c.generation.ctx_size = parse_int(need_arg(&mut i)?, arg)?;
                 c.ctx_size_explicit = true;
+                c.cli_set("engine.ctx");
             }
             "-n" | "--tokens" => c.generation.n_predict = parse_int(need_arg(&mut i)?, arg)?,
             "--temp" => {
@@ -1199,15 +1244,28 @@ pub fn parse_options_with(
             }
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--plugin-dir" => c.plugin_dirs.push(PathBuf::from(need_arg(&mut i)?)),
-            "--sandbox" => c.sandbox_override = Some(true),
-            "--no-sandbox" => c.sandbox_override = Some(false),
-            "--btw-suspend" => c.btw.suspend = true,
-            "--disable-btw-suspend" => c.btw.suspend = false,
+            "--sandbox" => {
+                c.sandbox_override = Some(true);
+                c.cli_set("safety.sandbox");
+            }
+            "--no-sandbox" => {
+                c.sandbox_override = Some(false);
+                c.cli_set("safety.sandbox");
+            }
+            "--btw-suspend" => {
+                c.btw.suspend = true;
+                c.cli_set("safety.btwSuspend");
+            }
+            "--disable-btw-suspend" => {
+                c.btw.suspend = false;
+                c.cli_set("safety.btwSuspend");
+            }
             "--quality" => c.engine.quality = true,
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
             "--dspark" => c.engine.dspark = true,
+            "--dspark-off" => c.engine.dspark = false,
             "--dspark-strict" => {
                 c.engine.dspark = true;
                 c.engine.dspark_strict = true;
@@ -1244,9 +1302,9 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
         c.engine.dir_steering_ffn = 1.0;
     }
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
-    // draft gate), so asking for DSpark defaults the temperature to 0. Done
-    // here rather than at the flag because `--temp` may follow it; an explicit
-    // `--temp` in either order still wins.
+    // draft gate), so DSpark defaults the temperature to 0. Done here rather
+    // than at the flag because `--temp` may follow it; an explicit `--temp` in
+    // either order still wins. `--dspark-off` leaves the 0.6 default in force.
     if c.engine.dspark && !temp_set {
         c.generation.temperature = 0.0;
     }
@@ -1373,6 +1431,49 @@ mod tests {
         assert_eq!(c.generation.ctx_size, 8192);
         assert_eq!(c.sandbox_override, Some(false));
         assert!(!c.btw.suspend);
+    }
+
+    #[test]
+    fn cli_flags_record_provenance_for_the_keys_they_override() {
+        // `/config --resolved` needs to show a CLI flag beating the file
+        // provenance, so every flag that shadows a settings key must record it.
+        use crate::provenance::Origin;
+        let c = parse_options_with(
+            &full_settings(),
+            &args(&[
+                "-m",
+                "/from/flag.gguf",
+                "-t",
+                "16",
+                "--metal",
+                "--power",
+                "90",
+                "-c",
+                "8192",
+                "--no-sandbox",
+                "--disable-btw-suspend",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(c.cli_provenance.get("engine.model"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("engine.threads"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("engine.backend"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("engine.power"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("engine.ctx"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("safety.sandbox"), Some(&Origin::Cli));
+        assert_eq!(
+            c.cli_provenance.get("safety.btwSuspend"),
+            Some(&Origin::Cli)
+        );
+        // A flag that shadows no settings key records nothing.
+        let c = parse_options(&args(&["--non-interactive"])).unwrap();
+        assert!(c.cli_provenance.is_empty());
+    }
+
+    #[test]
+    fn dump_config_flag_is_parsed() {
+        let c = parse_options(&args(&["--dump-config"])).unwrap();
+        assert!(c.dump_config);
     }
 
     #[test]
@@ -1753,7 +1854,8 @@ mod tests {
 
     #[test]
     fn dspark_defaults_the_temperature_to_zero() {
-        let c = parse_options(&args(&["--dspark"])).unwrap();
+        // DSpark is on by default, so a bare run samples argmax.
+        let c = parse_options(&args(&[])).unwrap();
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
 
         // The implying flags carry the same default.
@@ -1764,17 +1866,29 @@ mod tests {
     }
 
     #[test]
+    fn dspark_off_keeps_the_sampling_default() {
+        // --dspark-off turns speculation off, so the 0.6 temperature default
+        // stays in force rather than being forced to 0.
+        let c = parse_options(&args(&["--dspark-off"])).unwrap();
+        assert!(!c.engine.dspark);
+        assert!((c.generation.temperature - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
     fn an_explicit_temp_beats_the_dspark_default_in_either_order() {
         let c = parse_options(&args(&["--dspark", "--temp", "0.9"])).unwrap();
         assert!((c.generation.temperature - 0.9).abs() < 1e-6);
         let c = parse_options(&args(&["--temp", "0.9", "--dspark"])).unwrap();
         assert!((c.generation.temperature - 0.9).abs() < 1e-6);
+        // --dspark-off with an explicit --temp also keeps the explicit value.
+        let c = parse_options(&args(&["--dspark-off", "--temp", "0.9"])).unwrap();
+        assert!((c.generation.temperature - 0.9).abs() < 1e-6);
     }
 
     #[test]
-    fn dspark_is_off_by_default() {
+    fn dspark_is_on_by_default() {
         let c = parse_options(&args(&[])).unwrap();
-        assert!(!c.engine.dspark);
+        assert!(c.engine.dspark);
         assert!(!c.engine.dspark_strict);
         assert_eq!(c.engine.dspark_confidence, None);
     }
@@ -1968,6 +2082,7 @@ mod tests {
     #[test]
     fn plugins_is_a_known_slash_command() {
         assert!(slash_command_known("/plugins"));
+        assert!(slash_command_known("/install-claude-plugin"));
     }
 
     #[test]

@@ -13,9 +13,150 @@ it.
 Riding the beta channel today, on top of the newest stable release. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
-### 3.0.1
+### 3.5.1
 
-Pasted screenshots stop being filenames.
+📄 **The status footer counts what you have changed.** The TUI's location row
+already told you which tree you were in — path and branch. It now also tells you
+what you have done to it: `📄 3 · +128 -41`, files touched, then lines added in
+bright green and lines deleted in bright red. Staged and unstaged work count
+together, untracked files included, so a file you edited and then added shows up
+once. A clean tree shows nothing.
+
+### 3.4.1
+
+Opens the new beta channel on the same code as 3.4.0.
+
+📦 **`/install-claude-plugin` fetches a Claude Code plugin and installs it.** Plank
+already knew how to *load* a Claude Code plugin; now it can also grab one from
+a GitHub repo, a `/tree/...` link copied straight out of the browser, a
+marketplace, a `.tar.gz`, or a local directory. It sorts out the format
+differences along the way — `${CLAUDE_PLUGIN_ROOT}` becomes a real path, and
+nested hook config gets unwrapped — so the plugin's hooks and MCP servers just
+work. Tried end to end with `obra/superpowers`: one command, all 14 skills
+showed up on the next start.
+
+## Stable releases
+
+### 3.4.0
+
+Eleven features built on the DeepSeek-harness plan, and the theme is
+self-knowledge: plank gets better at telling you what it is doing, remembering
+what it has done, and staying inside its own guard rails while doing more.
+
+🔍 **`plank --dump-config` tells you where every setting came from.** Settings
+arrive from five layers — defaults, plugins, `~/.plank`, `./.plank`, CLI flags —
+and "I set that and nothing happened" used to be a code-reading exercise. Now
+each key prints with the layer that won and the layers it beat.
+
+```
+engine.ctx = 8192        <- CLI flag
+                              (shadowed: ~/.plank/settings.json)
+```
+
+`/config --resolved` does the same inside a session, and additionally shows
+which plugin won each contested skill or agent name.
+
+🔁 **Loop guards.** The classic local-model failure is a loop: a stale edit
+anchor sends the model into read/edit/read/edit and it does not notice. On the
+third identical call it now sees *"you have called this tool with these
+arguments 3 times; the result has not changed"*. Nothing is blocked — a
+legitimate third read exists — and polling an async job is exempt, because a
+poll looks exactly like a stuck loop. Separately, `tools.callTimeoutSec` gives
+tool calls a budget and tells the model when one blew it, so a hung test suite
+stops being invisible.
+
+📄 **Big tool output is no longer a dead end.** Ask about a 5 MB build log and
+`read` used to truncate with no way forward. Now the full payload goes to
+`~/.plank/spill/`, the model gets a bounded preview plus a `continue_offset` it
+can page with `more`, and `/export` still sees everything. The same applies to
+oversized MCP results, which previously had no cap at all — one chatty server
+could eat a whole context in a single call.
+
+🧹 **Context gets reclaimed without a round-trip.** After a dozen large reads
+their bodies are dead weight. Microcompact clears the old ones at end of turn,
+keeping the newest three, anything small, and everything belonging to the task
+you are on. It only runs when it would reclaim at least 4 KiB, because
+rewriting the transcript invalidates the KV prefix and an eager pass costs more
+than it saves.
+
+🔎 **`/search` across your own history.** You remember fixing a Metal crash a
+few weeks ago but not how. `/search metal` finds the session, shows the
+snippet, and offers `/resume`. Crucially it is compaction-proof: long sessions
+are both the ones worth searching and the ones that get compacted, so the index
+keeps conversation the transcript has dropped.
+
+🎯 **Goals survive the session.** `/goal --max 5 make the failing test pass`
+runs an adjudicated loop you can walk away from. The objective is durable state
+— it survives `/save`, `/resume` and `/compact`, so tomorrow you can still see
+what it was pursuing and how far it got.
+
+⭐ **`/rate` records what worked, where the model cannot see it.** A rating
+lives in a sidecar, never the transcript, context or KV — if the model could
+read your ratings it would optimise for them and the signal would be worthless.
+`/insights` turns a week of them into satisfaction over time and the notes on
+the worst turns.
+
+🧰 **Three new tools, on by default.** `recall` lets the model search that same
+session history instead of guessing or interrupting you. `fanout` runs several
+independent subtasks and joins their reports in a fixed order, with optional
+throwaway-worktree isolation for subtasks that edit. `run_code` batches a few
+pre-decided operations into one turn instead of one round-trip each — and every
+operation goes through the normal tool dispatch, so the sandbox, the `~/.plank`
+grant and the `PreToolUse` hooks apply exactly as they would to a bare call.
+Each can be switched off individually with `tools.recall`, `tools.fanout` or
+`tools.runCode`.
+
+🪵 **And a rule the rest of it rests on.** A test now asserts structurally that
+everything reaching the model is reconstructible from the session log — either
+a transcript entry or the separately-fingerprinted system prompt. Without it,
+`/repro` and `/resume` are guesses.
+
+### 3.2.0
+
+The 3.1 beta line, promoted: the status bar learns to show what the model is
+doing, the exit message learns to say where the session went, and — carried up
+from the 3.0 betas — plank learns to read the screenshots you paste at it.
+
+⏱️ **The exit summary reports where the time went, per model.** It used to print
+a peak prefill rate and a peak generation rate — one lucky pass each, which
+tells you nothing about the session you just had. Now every model that ran gets
+a line: how long it spent prefilling and how long generating, each with the
+session's average rate, and how long it spent running tools.
+
+```
+avg deepseek-v4-flash  prefill 12.3s (1420.5 tok/s)  ·  generation 45.2s (38.1 tok/s)  ·  tools 8.4s
+```
+
+That last figure is the one nobody was measuring. A turn that feels slow is
+often not the model at all.
+
+🧠 **The think segment shows the router working.** Two braille cells beside the
+reasoning level re-roll on every decoded token, standing in for the mixture-of-
+experts routing. Being straight about it: the real selection never leaves the
+GPU on the Metal path, so plank derives the pattern from the token id. It is
+honest about sparsity, about routing changing every token, and about the same
+token lighting the same dots — and it does not know which experts. The reasoning
+level itself is now colored by temperature, red for `max` down to grey for
+`off`, so three columns are readable without reading the word.
+
+📉 **The decode rate in the footer stopped lying on long prompts.** It was timed
+from the start of the generation call, so it divided tokens by decode time plus
+prefill plus the wait for the first token, and opened far below the real rate.
+It is now measured from the first token out.
+
+⚡ **Greedy chain decode on Metal.** At temperature 0 a run of argmax tokens is
+decoded with the next token id kept on-device, dropping the per-token GPU sync
+and logits readback. Output is bit-identical. It is off on M5, where it measures
+slightly slower than the plain path — `PLANK_GREEDY_CHAIN=1` forces it on if you
+want to re-measure on your own machine.
+
+🔢 **The `--dspark` footer reads `1.5t/step`, not `1.5x`.** It was always tokens
+committed per speculative step, and that is not a wall-clock speedup: on Metal
+it sits above 1.0 on runs that decode *slower* than plain decode. Calling it a
+multiplier was the bug.
+
+And carried up from the 3.0 betas, which never got a stable entry of their own:
+pasted screenshots stop being filenames.
 
 👁️ **plank can finally read your screenshots.** Image pasting is on by default
 now, and paired with the new [`ocr-mcp`](https://github.com/aovestdipaperino/ocr-mcp)
@@ -39,8 +180,6 @@ and the DPI metadata that an OCR tool then needs. The bytes now land in
 
 One consequence worth knowing: the cache is bounded by file count, not bytes, so
 full-resolution captures make it larger than it used to be.
-
-## Stable releases
 
 ### 2.8.0
 

@@ -245,6 +245,36 @@ pub fn tool_more(ctx: &mut ToolContext, call: &ToolCall) -> String {
         1,
         i64::MAX,
     );
+    // A spilled tool result (M4) takes precedence: continue reading the spill
+    // by id, `count` bytes at a time, until the payload is exhausted.
+    if let Some(spilled) = ctx.spill.clone() {
+        let start = spilled.offset;
+        let n = usize::try_from(count).unwrap_or(usize::MAX);
+        let bytes = std::fs::read(&spilled.path).unwrap_or_default();
+        let total = bytes.len();
+        let chunk = &bytes[start.min(total)..];
+        let chunk = &chunk[..n.min(chunk.len())];
+        let mut out = String::from_utf8_lossy(chunk).into_owned();
+        let new_offset = start + chunk.len();
+        if new_offset >= total {
+            ctx.spill = None;
+        } else {
+            if let Some(s) = ctx.spill.as_mut() {
+                s.offset = new_offset;
+            }
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            // Model-facing locator, built with `write!` (never a
+            // `\`-continued literal). Reuses the fixture-blessed shape.
+            let _ = writeln!(
+                out,
+                "[Output truncated at {new_offset} bytes of {total}. continue_offset={new_offset}. \
+                 Call more with count={count} to read the next chunk.]"
+            );
+        }
+        return out;
+    }
     let Some(more) = ctx.more.clone() else {
         return "Tool error: no previous output to continue\n".to_string();
     };
@@ -279,6 +309,10 @@ pub fn tool_write(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if let Err(e) = std::io::Write::write_all(&mut file, content.as_bytes()) {
         return format!("Tool error: write failed: {e}\n");
     }
+    // Aim a bare `/open` here. Unconditional, unlike the diff card below: a
+    // freshly created file is exactly the one the user asked for and wants to
+    // read back, even though it gets no card.
+    ctx.last_written = Some(full.clone());
     // A new file is shown by the streaming dim preview; only an overwrite gets
     // a post-edit diff card here.
     if let Some(prior) = &prior {
@@ -767,6 +801,23 @@ mod tests {
         assert_eq!(
             tool_write(&mut ctx, &test_call("write", &[("path", "p")])),
             "Tool error: write requires content\n"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A new file gets no diff card, but it is still the file a bare `/open`
+    /// should open — so the pointer must be set independently of the card.
+    #[test]
+    fn write_records_the_target_even_when_it_creates_the_file() {
+        let (mut ctx, dir) = test_ctx();
+        tool_write(
+            &mut ctx,
+            &test_call("write", &[("path", "status.md"), ("content", "hi\n")]),
+        );
+        assert!(ctx.edit_previews.is_empty(), "new file still gets no card");
+        assert_eq!(
+            ctx.last_written.as_deref(),
+            Some(dir.join("status.md").as_path())
         );
         std::fs::remove_dir_all(dir).ok();
     }

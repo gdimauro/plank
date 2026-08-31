@@ -84,6 +84,15 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     /// Continuation state for the `more` tool, if a read was truncated.
     pub more: Option<MoreState>,
+    /// The last spilled tool result, for the `more` tool to continue reading
+    /// it by spill id. Set by the dispatch-level spill policy.
+    pub spill: Option<crate::spill::Spilled>,
+    /// Session id, used to scope spill storage under `~/.plank/spill/<id>/`.
+    pub session_id: String,
+    /// The live transcript, for the `recall` tool to search the current
+    /// session's pre-compaction portion alongside the saved-session index.
+    /// Populated by the turn loop before dispatch; empty in tests.
+    pub current_transcript: Vec<crate::session::Message>,
     /// Table of live and finished asynchronous bash jobs.
     pub bash: bash::BashJobs,
     /// Per-session web tool state (sticky approval flag).
@@ -141,6 +150,11 @@ pub struct ToolContext {
     /// Diff previews from `edit`/`write` calls this dispatch, drained by the UI
     /// to render a git-style change card. Empty when nothing changed a file.
     pub edit_previews: Vec<diff::EditPreview>,
+    /// Absolute path of the file a tool most recently wrote, drained by the UI
+    /// to aim a bare `/open`. Distinct from [`edit_previews`](Self::edit_previews):
+    /// creating a new file deliberately produces no diff card (the streaming
+    /// preview already showed it) but is still the file the user wants to open.
+    pub last_written: Option<PathBuf>,
     /// Front end that presents `ask` questions (issue #34); `None` in
     /// non-interactive mode, where `ask` fast-fails instead of blocking.
     pub asker: Option<Box<dyn ask::Asker>>,
@@ -199,6 +213,9 @@ impl ToolContext {
         Self {
             cwd: cwd.into(),
             more: None,
+            spill: None,
+            session_id: String::new(),
+            current_transcript: Vec::new(),
             bash: bash::BashJobs::default(),
             web: web::WebState::default(),
             web_confirm: None,
@@ -219,6 +236,7 @@ impl ToolContext {
             tasks: crate::tasks::TaskList::new(),
             task_completions: Vec::new(),
             edit_previews: Vec::new(),
+            last_written: None,
             asker: None,
             ask_bridge: None,
             #[cfg(ds4_engine)]
@@ -327,6 +345,12 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             call.name
         ));
     }
+    // Dispatch-level wall-clock deadline (`tools.callTimeoutSec`): the outer
+    // bound on a single tool call, off by default. Bash keeps its own
+    // model-supplied timeout; this is the outer bound of the two. Measured
+    // around the tool body only, so hooks still see the full output.
+    let deadline = crate::settings::active().tools.call_timeout_sec;
+    let start = std::time::Instant::now();
     let output = match call.name.as_str() {
         "EnterWorktree" => worktree::tool_enter_worktree(ctx, call),
         "ExitWorktree" => worktree::tool_exit_worktree(ctx, call),
@@ -356,6 +380,8 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         ),
         "task" => crate::tasks::tool_task(&mut ctx.tasks, &mut ctx.task_completions, call),
         "ask" => ask::tool_ask(ctx.asker.as_mut(), call),
+        "recall" => tool_recall(ctx, call),
+        "run_code" => tool_run_code(ctx, call),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         // A WASM component's tool. Checked before the unknown-tool fallthrough
         // and after every built-in, so a component can extend the table and
@@ -430,7 +456,30 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if output.starts_with("Tool error:") && !ctx.hooks.post_tool_use_failure.is_empty() {
         fire_post_tool_failure(ctx, call, &arg_values, &mut output);
     }
-    ToolResult::from_output(output)
+    // Deadline notice: the tool exceeded `callTimeoutSec`. Post-hoc (the tool
+    // already ran) but actionable — the model sees it exceeded the budget.
+    if deadline > 0 && start.elapsed().as_secs() >= deadline {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "[deadline] {call} exceeded tools.callTimeoutSec={deadline}s",
+            call = call.name
+        );
+    }
+    // Output spill (M4): applied AFTER the PostToolUse hooks, so a hook sees
+    // the full output and only the model sees the preview. The full payload is
+    // written to `~/.plank/spill/<session-id>/` and the inline result becomes a
+    // bounded preview plus a locator the `more` tool can continue.
+    let s = crate::settings::active().tools.clone();
+    let policy = crate::spill::SpillPolicy {
+        max_bytes: s.spill_max_bytes,
+        preview_bytes: s.spill_preview_bytes,
+    };
+    let (preview, spilled) = crate::spill::apply(&policy, &ctx.session_id, &call.name, output);
+    ctx.spill = spilled;
+    ToolResult::from_output(preview)
 }
 
 /// Fires the `PostToolUseFailure` hooks and appends any exit-2 block message to
@@ -624,6 +673,139 @@ pub fn parse_bool_default(s: Option<&str>, def: bool) -> bool {
     def
 }
 
+/// Implements the `recall` tool (M8): searches prior sessions and the current
+/// one's pre-compaction portion, scoped to the current project. Off by default
+/// (`tools.recall`); when off, the tool is not advertised and dispatches as
+/// unknown. Results are bounded through the M4 spill policy like any other
+/// tool result.
+fn tool_recall(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    use std::fmt::Write as _;
+    if !crate::settings::active().tools.recall {
+        return "Tool error: unknown tool: recall\n".to_string();
+    }
+    let query = call.arg_value("query").unwrap_or("").trim().to_string();
+    if query.is_empty() {
+        return "Tool error: recall requires a non-empty 'query'\n".to_string();
+    }
+    let mut out = String::new();
+    let project = crate::session::project_key(&ctx.cwd);
+    // Saved sessions, scoped to the current project. Best-effort: an index
+    // build failure (e.g. an ambiguous session prefix) skips the saved-session
+    // search but never blocks the current-transcript search below.
+    let hits = match crate::session::SessionStore::open(crate::session::SessionStore::default_dir())
+    {
+        Ok(store) => match crate::sessionindex::build(&store, &crate::sessionindex::index_dir()) {
+            Ok(_) => crate::sessionindex::search(
+                &query,
+                Some(&project),
+                false,
+                &crate::sessionindex::index_dir(),
+            ),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    // The current session's pre-compaction portion: search the live transcript
+    // directly (it is not yet in the index).
+    let mut current: Vec<(String, String)> = Vec::new();
+    for m in &ctx.current_transcript {
+        if let Some(pos) = m.text.find(&query) {
+            let start = pos.saturating_sub(40);
+            let end = (pos + query.len() + 40).min(m.text.len());
+            let mut snippet = String::new();
+            if start > 0 {
+                snippet.push('…');
+            }
+            snippet.push_str(&m.text[start..end]);
+            if end < m.text.len() {
+                snippet.push('…');
+            }
+            current.push(("current session".to_string(), snippet));
+        }
+    }
+    if hits.is_empty() && current.is_empty() {
+        let _ = writeln!(out, "No sessions match {query:?}.");
+        return out;
+    }
+    for hit in hits {
+        let _ = writeln!(out, "{} — {} — {}", hit.session_id, hit.title, hit.snippet);
+    }
+    for (label, snippet) in current {
+        let _ = writeln!(out, "{label} — {snippet}");
+    }
+    // Bound the result through the M4 spill policy.
+    let policy = crate::spill::SpillPolicy {
+        max_bytes: crate::settings::active().tools.spill_max_bytes,
+        preview_bytes: crate::settings::active().tools.spill_preview_bytes,
+    };
+    let (preview, spilled) = crate::spill::apply(&policy, &ctx.session_id, "recall", out);
+    ctx.spill = spilled;
+    preview
+}
+
+/// Implements the `run_code` tool (M10): a small script of named operations
+/// (read/glob/edit/bash), one per line, each dispatched through the existing
+/// tool path so the consent and sandbox checks apply — a binding that
+/// shortcuts them would be a hole straight through every guard. Off by default
+/// (`tools.runCode`); when off, the tool dispatches as unknown. Output is
+/// bounded through the M4 spill policy.
+fn tool_run_code(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    use std::fmt::Write as _;
+    if !crate::settings::active().tools.run_code {
+        return "Tool error: unknown tool: run_code\n".to_string();
+    }
+    let script = call.arg_value("script").unwrap_or("").trim();
+    if script.is_empty() {
+        return "Tool error: run_code requires a non-empty 'script'\n".to_string();
+    }
+    let mut out = String::new();
+    for (i, line) in script.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (op, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let rest = rest.trim();
+        let (name, args): (&str, Vec<(&str, &str)>) = match op {
+            "read" => ("read", vec![("path", rest)]),
+            "glob" => ("glob", vec![("pattern", rest)]),
+            "edit" => {
+                let mut parts = rest.splitn(3, char::is_whitespace);
+                let path = parts.next().unwrap_or("");
+                let old = parts.next().unwrap_or("");
+                let new = parts.next().unwrap_or("");
+                ("edit", vec![("path", path), ("old", old), ("new", new)])
+            }
+            "bash" => ("bash", vec![("command", rest)]),
+            _ => {
+                let _ = writeln!(out, "Step {}: unknown operation {op:?}", i + 1);
+                continue;
+            }
+        };
+        let tool_call = ToolCall {
+            name: name.to_string(),
+            args: args
+                .iter()
+                .map(|(n, v)| crate::dsml::ToolArg {
+                    name: (*n).to_string(),
+                    value: (*v).to_string(),
+                    is_string: true,
+                })
+                .collect(),
+        };
+        let res = dispatch(&tool_call, ctx);
+        let _ = writeln!(out, "Step {} ({name}):\n{}", i + 1, res.output);
+    }
+    // Bound through the M4 spill policy like any other tool result.
+    let policy = crate::spill::SpillPolicy {
+        max_bytes: crate::settings::active().tools.spill_max_bytes,
+        preview_bytes: crate::settings::active().tools.spill_preview_bytes,
+    };
+    let (preview, spilled) = crate::spill::apply(&policy, &ctx.session_id, "run_code", out);
+    ctx.spill = spilled;
+    preview
+}
+
 #[cfg(test)]
 pub(crate) fn test_call(name: &str, args: &[(&str, &str)]) -> ToolCall {
     ToolCall {
@@ -733,6 +915,229 @@ mod tests {
             dispatch_all(&[], &mut ctx),
             "Tool error: empty tool call block\n"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn deadline_notice_is_off_by_default() {
+        // `tools.callTimeoutSec` defaults to 0 (off), so parity is untouched
+        // until a user opts in: no deadline notice on an ordinary dispatch.
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("nope", &[]), &mut ctx);
+        assert!(!res.output.contains("[deadline]"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn run_code_executes_a_script_by_default_and_can_be_disabled() {
+        // `tools.runCode` defaults to true. Turning it off makes the call
+        // dispatch as unknown, matching the prompt where it is unadvertised.
+        let mut off = crate::settings::Settings::default();
+        off.tools.run_code = false;
+        crate::settings::install_for_test(off);
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(
+            &test_call("run_code", &[("script", "read x.txt")]),
+            &mut ctx,
+        );
+        assert!(res.is_error);
+        assert!(res.output.contains("unknown tool: run_code"));
+        // At the default, a script of named operations executes through the
+        // existing dispatch path (so consent/sandbox checks apply) and collects
+        // outputs.
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let (mut ctx, dir2) = test_ctx();
+        let f = dir2.join("x.txt");
+        std::fs::write(&f, "hello").expect("write");
+        let res = dispatch(
+            &test_call("run_code", &[("script", "read x.txt")]),
+            &mut ctx,
+        );
+        assert!(
+            !res.is_error,
+            "run_code dispatches when enabled: {}",
+            res.output
+        );
+        assert!(res.output.contains("hello"), "{}", res.output);
+        // An empty script is rejected: a documented criterion the model will
+        // not produce on its own.
+        let empty = dispatch(&test_call("run_code", &[("script", "   ")]), &mut ctx);
+        assert_eq!(
+            empty.output,
+            "Tool error: run_code requires a non-empty 'script'\n"
+        );
+        // An unrecognised operation reports and continues rather than aborting
+        // the rest of the script.
+        let mixed = dispatch(
+            &test_call(
+                "run_code",
+                &[("script", "frobnicate something\nread x.txt")],
+            ),
+            &mut ctx,
+        );
+        assert!(
+            mixed
+                .output
+                .contains("Step 1: unknown operation \"frobnicate\""),
+            "{}",
+            mixed.output
+        );
+        assert!(
+            mixed.output.contains("Step 2 (read):") && mixed.output.contains("hello"),
+            "a bad step must not abort the script: {}",
+            mixed.output
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    /// The M10 security assertion: `run_code` binds operations *through*
+    /// `dispatch`, so a `bash` step inside a script must hit exactly the same
+    /// sandbox refusal a bare `bash` tool call does. If a step ever succeeded
+    /// here, it would be a hole straight through every guard in `sandbox.rs`.
+    /// Requires /usr/bin/sandbox-exec, so macOS only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bash_step_inside_run_code_is_sandboxed_like_a_bare_call() {
+        crate::settings::install_for_test(crate::settings::Settings::default());
+
+        // The scratch dir lives under temp_dir(), which the sandbox profile
+        // always allows, so the escape target must sit outside both cwd and
+        // temp — the same reasoning as `bash_sandbox_blocks_writes_outside_cwd`.
+        let home = std::env::var("HOME").expect("HOME set");
+        let outside =
+            std::path::Path::new(&home).join(format!(".plank-runcode-test-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let escape = format!("echo escape > '{}/escape.txt'", outside.display());
+
+        // Bare `bash` tool call: refused by the sandbox.
+        let (mut ctx, dir) = test_ctx();
+        ctx.sandbox.enabled = true;
+        let bare = dispatch(&test_call("bash", &[("command", &escape)]), &mut ctx);
+        assert!(
+            bare.output.contains("[sandbox blocked:"),
+            "bare call must be blocked: {}",
+            bare.output
+        );
+
+        // The same command as a `run_code` step: identically refused.
+        let (mut ctx2, dir2) = test_ctx();
+        ctx2.sandbox.enabled = true;
+        let script = format!("bash {escape}");
+        let via_run_code = dispatch(&test_call("run_code", &[("script", &script)]), &mut ctx2);
+        assert!(
+            via_run_code.output.contains("[sandbox blocked:"),
+            "run_code must not bypass the sandbox: {}",
+            via_run_code.output
+        );
+        assert!(
+            !via_run_code.output.contains("exit_status=0\n"),
+            "the escaping step must not succeed: {}",
+            via_run_code.output
+        );
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "the write must not have landed"
+        );
+
+        std::fs::remove_dir_all(outside).ok();
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(dir2).ok();
+    }
+
+    #[test]
+    fn recall_dispatches_by_default_and_can_be_disabled() {
+        // `tools.recall` defaults to true: the tool dispatches and searches the
+        // current transcript's pre-compaction portion. Turning it off makes the
+        // call dispatch as unknown, matching the prompt where it is unadvertised.
+        let mut off = crate::settings::Settings::default();
+        off.tools.recall = false;
+        crate::settings::install_for_test(off);
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
+        assert!(res.is_error);
+        assert!(res.output.contains("unknown tool: recall"));
+        // Back at the default, it dispatches.
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let (mut ctx, dir2) = test_ctx();
+        ctx.current_transcript = vec![crate::session::Message::user("a needle here")];
+        let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
+        assert!(
+            !res.is_error,
+            "recall dispatches when enabled: {}",
+            res.output
+        );
+        assert!(res.output.contains("current session"), "{}", res.output);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn recall_rejects_an_empty_query_and_reports_no_match() {
+        // Both are documented M8 pass criteria that cannot be reached through
+        // the model: the request itself quotes the query, so the current
+        // transcript always self-matches and `No sessions match` never fires
+        // in a live session.
+        crate::settings::install_for_test(crate::settings::Settings::default());
+
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("recall", &[("query", "   ")]), &mut ctx);
+        assert!(res.is_error, "a blank query is an error: {}", res.output);
+        assert_eq!(
+            res.output,
+            "Tool error: recall requires a non-empty 'query'\n"
+        );
+
+        let (mut ctx, dir2) = test_ctx();
+        ctx.current_transcript = vec![crate::session::Message::user("nothing relevant here")];
+        let res = dispatch(
+            &test_call("recall", &[("query", "qqzzxxnomatchtoken")]),
+            &mut ctx,
+        );
+        assert!(
+            res.output
+                .contains("No sessions match \"qqzzxxnomatchtoken\"."),
+            "no-match message: {}",
+            res.output
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn dispatch_spills_oversized_results_and_more_continues() {
+        // A 5 MB-style oversized result (here a 1000-byte read under a 100-byte
+        // cap) yields a bounded preview plus a locator, and the generalised
+        // `more` continues the spill by id.
+        let mut s = crate::settings::Settings::default();
+        s.tools.spill_max_bytes = 100;
+        s.tools.spill_preview_bytes = 50;
+        crate::settings::install_for_test(s);
+        let (mut ctx, dir) = test_ctx();
+        // Dispatch spills through the real `~/.plank/spill`, so use a session
+        // id unique to this test run: a fixed one collides with other tests and
+        // leaves blobs behind that shift the next run's spill numbering.
+        ctx.session_id = format!(
+            "plank-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let big = dir.join("big.txt");
+        std::fs::write(&big, "x".repeat(1000)).expect("write");
+        let res = dispatch(&test_call("read", &[("path", "big.txt")]), &mut ctx);
+        assert!(
+            res.output.contains("[Output truncated at 50 bytes of"),
+            "preview + locator: {}",
+            res.output
+        );
+        assert!(ctx.spill.is_some(), "spill state set for `more`");
+        let more = dispatch(&test_call("more", &[("count", "100")]), &mut ctx);
+        assert!(
+            more.output.contains("continue_offset="),
+            "more continues the spill: {}",
+            more.output
+        );
+        std::fs::remove_dir_all(crate::spill::spill_dir().join(&ctx.session_id)).ok();
         std::fs::remove_dir_all(dir).ok();
     }
 }

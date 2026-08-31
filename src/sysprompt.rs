@@ -16,8 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Removed from the built prompt when `engine.thinkingToolCalls` is on, so the
 /// prompt matches the behavior. The C constants themselves are never edited —
 /// `tests/c_parity.rs` locks them against `refs/ds4`.
-pub const IN_THINK_PROHIBITION: &str =
-    "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.";
+pub use trace_stream::viz::IN_THINK_PROHIBITION;
 
 /// Introductory section of the tools prompt (verbatim from C).
 const TOOLS_PROMPT_INTRO: &str = "You are a coding agent running in a local workspace. Use tools for local file and system work. \
@@ -128,6 +127,10 @@ ask permission to start a browser.\n\n\
 - Write code that is reliable; keep a clear mental model of complex parts.\n\
 - Preserve the current system configuration integrity unless explicitly asked otherwise.\n",
     );
+    if crate::settings::active().git.sign_commits {
+        out.push('\n');
+        out.push_str(COMMIT_SIGNATURE_INSTRUCTION);
+    }
     if !user_system.is_empty() {
         out.push('\n');
         out.push_str(user_system);
@@ -668,6 +671,91 @@ fn append_native_extra_schemas(out: &mut String) {
          }\n",
     );
     append_agent_and_plan_schemas(out);
+    // The `recall` (M8), `fanout` (M9) and `run_code` (M10) tools are
+    // deliberate deviations from the C reference: the C agent has none of them.
+    // They are advertised by default and can be switched off individually
+    // (`tools.recall` / `tools.fanout` / `tools.runCode`). Because they are in
+    // the prompt, `fp1` differs from the C agent's fingerprint — the versioned
+    // deviation documented in docs/SYSTEM-PROMPT-OVERRIDES.md. What parity
+    // still holds byte-for-byte is the C-*derived* text, which
+    // `tools_prompt_matches_c_source` checks independently of this list.
+    if crate::settings::active().tools.recall {
+        append_recall_schema(out);
+    }
+    if crate::settings::active().tools.fanout {
+        append_fanout_schema(out);
+    }
+    if crate::settings::active().tools.run_code {
+        append_run_code_schema(out);
+    }
+}
+
+/// Appends the `recall` tool schema (M8): search prior sessions and the
+/// current one's pre-compaction portion, scoped to the current project.
+fn append_recall_schema(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"recall\",\n\
+         \x20   \"description\": \"Search your prior sessions and the current one's pre-compaction portion for a query, scoped to the current project. Returns matching session titles, ages and snippets.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"query\": {\"type\": \"string\", \"description\": \"the text to search for\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"query\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+}
+
+/// Appends the `fanout` tool schema (M9): run independent subtasks and join
+/// their reports deterministically. The description deliberately promises a
+/// deterministic join, not speed — on the `ds4_engine` path subtasks are
+/// interleaved on one Metal queue, not parallel.
+fn append_fanout_schema(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"fanout\",\n\
+         \x20   \"description\": \"Run a list of independent subtasks, each delegated to a named sub-agent, and join their reports into one deterministic result. Subtasks run serially on the shared engine — this buys structure, not speed.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"subtasks\": {\"type\": \"array\", \"description\": \"JSON array of {\\\"name\\\": <agent name>, \\\"task\\\": <task text>} objects\", \"items\": {\"type\": \"object\"}}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"subtasks\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+}
+
+/// Appends the `run_code` tool schema (M10): run a small script of named
+/// operations (read/glob/edit/bash) through the existing tool dispatch path,
+/// so the consent and sandbox checks apply. The minimal viable guest language
+/// is a sequence of operations; a full interpreted guest compiled to the WASM
+/// host is a documented follow-up.
+fn append_run_code_schema(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"run_code\",\n\
+         \x20   \"description\": \"Run a small script of named operations (read <path>, glob <pattern>, edit <path> <old> <new>, bash <command>) through the same checks as the tools, collecting outputs into one result. One line per operation, one operation per line.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"script\": {\"type\": \"string\", \"description\": \"the script, one operation per line\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"script\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
 }
 
 /// Appends the `agent` (sub-agent delegation) and plan-mode tool schemas
@@ -798,6 +886,25 @@ pub fn build_system_prompt_reminder(
     out
 }
 
+/// The attribution trailer plank asks the model to end its commit messages
+/// with, disabled by `git.signCommits` in `settings.json`.
+pub const COMMIT_SIGNATURE_TRAILER: &str = "--Co-Authored by Plank (https://plank-agent.dev)";
+
+/// Instruction that puts [`COMMIT_SIGNATURE_TRAILER`] on the commits the model
+/// makes.
+///
+/// It is appended *after* [`SplitSystemPrompt::trusted_len`] on purpose: it is
+/// plank's own text, but nothing in it teaches DSML, so there is no reason to
+/// widen the span that gets the control-text tokenizer. It is settings-derived
+/// yet still cache-stable — `settings.json` does not change within a session,
+/// and editing it correctly re-fingerprints `sysprompt.kv`.
+pub const COMMIT_SIGNATURE_INSTRUCTION: &str = concat!(
+    "## Commits\n\n",
+    "When you create a git commit, end its message with a blank line followed by the",
+    " single line `--Co-Authored by Plank (https://plank-agent.dev)`. Leave the trailer out only if the user",
+    " asks you to, or if the message already ends with it.\n"
+);
+
 /// Composes the initial system prompt: tools prompt plus optional user text.
 ///
 /// Mirrors `agent_append_system_prompt`: the built-in tools prompt comes
@@ -878,6 +985,10 @@ pub fn build_system_prompt_parts_with_wasm(
 ) -> SplitSystemPrompt {
     let (mut text, trusted_len) =
         build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity);
+    if crate::settings::active().git.sign_commits {
+        text.push_str("\n\n");
+        text.push_str(COMMIT_SIGNATURE_INSTRUCTION);
+    }
     if !user_system.is_empty() {
         text.push_str("\n\n");
         text.push_str(user_system);
@@ -1000,6 +1111,72 @@ mod tests {
         }
     }
 
+    /// The three plank-native tools (M8/M9/M10) are advertised by default and
+    /// can be switched off. They are still deviations from the C reference —
+    /// the C agent has none of them — so `fp1` differs from the C agent's
+    /// fingerprint for every session. What parity still guarantees is that the
+    /// C-*derived* text is byte-identical, which `tools_prompt_matches_c_source`
+    /// checks independently of this schema list.
+    #[test]
+    fn recall_schema_is_advertised_by_default_and_can_be_disabled() {
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            text.contains("\"recall\""),
+            "recall is advertised by default"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.recall = false;
+        crate::settings::install_for_test(s);
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            !text.contains("\"recall\""),
+            "tools.recall = false removes the schema"
+        );
+    }
+
+    #[test]
+    fn fanout_schema_is_advertised_by_default_and_can_be_disabled() {
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            text.contains("\"fanout\""),
+            "fanout is advertised by default"
+        );
+        // The description must promise a deterministic join, not speed: on the
+        // ds4_engine path subtasks are interleaved on one Metal queue.
+        assert!(text.contains("deterministic"), "{text}");
+        let mut s = crate::settings::Settings::default();
+        s.tools.fanout = false;
+        crate::settings::install_for_test(s);
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            !text.contains("\"fanout\""),
+            "tools.fanout = false removes the schema"
+        );
+    }
+
+    #[test]
+    fn run_code_schema_is_advertised_by_default_and_can_be_disabled() {
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            text.contains("\"run_code\""),
+            "run_code is advertised by default"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.run_code = false;
+        crate::settings::install_for_test(s);
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            !text.contains("\"run_code\""),
+            "tools.runCode = false removes the schema"
+        );
+    }
+
     #[test]
     fn tools_prompt_contains_verbatim_phrases() {
         let p = build_tools_prompt(&[], true);
@@ -1052,6 +1229,25 @@ mod tests {
                 "volatile marker {marker:?} leaked into the cached prefix"
             );
         }
+    }
+
+    #[test]
+    fn commit_signature_instruction_is_in_the_default_prompt() {
+        // Default settings sign commits, and the trailer must land outside the
+        // trusted control-text span.
+        let parts = build_system_prompt_parts("", &[], true);
+        assert!(
+            parts
+                .text
+                .contains("--Co-Authored by Plank (https://plank-agent.dev)")
+        );
+        assert!(
+            !parts.text[..parts.trusted_len]
+                .contains("--Co-Authored by Plank (https://plank-agent.dev)")
+        );
+        assert!(
+            provider_system_prompt("").contains("--Co-Authored by Plank (https://plank-agent.dev)")
+        );
     }
 
     #[test]
@@ -1318,7 +1514,12 @@ mod tests {
     #[test]
     fn trusted_span_ends_before_anything_appended() {
         let bare = build_system_prompt_parts("", &[], true);
-        assert_eq!(bare.trusted_len, bare.text.len(), "nothing untrusted yet");
+        // Only the commit-signature instruction sits past the boundary here.
+        assert_eq!(
+            &bare.text[bare.trusted_len..],
+            format!("\n\n{COMMIT_SIGNATURE_INSTRUCTION}"),
+            "nothing untrusted but the signature note"
+        );
 
         let with_user = build_system_prompt_parts("Be terse.", &[], true);
         assert_eq!(with_user.trusted_len, bare.trusted_len);
@@ -1378,9 +1579,12 @@ mod tests {
 
     #[test]
     fn system_prompt_composition() {
+        // Default settings append the commit-signature instruction between the
+        // tools prompt and the user's `-sys` text.
+        let signature = format!("\n\n{COMMIT_SIGNATURE_INSTRUCTION}");
         assert_eq!(
             build_system_prompt("", &[], true),
-            build_tools_prompt(&[], true)
+            format!("{}{signature}", build_tools_prompt(&[], true))
         );
         let with_extra = build_system_prompt("Be terse.", &[], true);
         assert!(with_extra.starts_with(&build_tools_prompt(&[], true)));

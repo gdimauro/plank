@@ -20,6 +20,18 @@ for wire formats and prompt text.
   syntax, and the system prompt are reproduced verbatim from the C reference.
 - **Correctness before cleverness.** The KV cache reuses only a genuinely
   matching token prefix; a stale disk checkpoint is rebuilt, never trusted.
+- **The log-everything invariant.** Anything that reaches a model request must
+  be reconstructible from the session log — either as a transcript entry, or
+  as the separately-fingerprinted system prompt. `/fork`, `/clone`,
+  `/rollback`, `/checkpoint`, `/branch`, `/resume` and `/repro` all replay the
+  transcript, and a replayed transcript that differs from the recorded one
+  produces a KV prefix that silently disagrees with the blob on disk. This is
+  the text-level analogue of the KV discipline in `docs/KV-CACHING.md` (a
+  blob's embedded signature is the sole trust input): the same rule applied to
+  text instead of tensors. Where content is injected at request-assembly time,
+  log the *rendered* text as a system-role transcript entry at the moment it
+  is injected, rather than recomputing it at replay time. Deliberate
+  exceptions are recorded in `FINDINGS.md` with the reason.
 
 ## Layers
 
@@ -116,9 +128,10 @@ loop — with piped stdin there is no live input to multiplex.
   field inserted mid-struct upstream shifts everything after it with no compile
   error; `ffi::tests` pins every offset and the struct size against `offsetof`
   on the checked-out header.
-- `speeds.rs` — per-model peak prefill and generation rates for the current
-  session, printed in the exit message. Session-scoped and never persisted;
-  both rates exclude the first `STEADY_WARMUP_SECS` of their phase.
+- `speeds.rs` — per-model prefill, generation and tool-dispatch totals for the
+  current session (tokens and wall-clock seconds), printed in the exit message
+  as a time plus the session average rate for each phase. Session-scoped and
+  never persisted.
 - `ds4engine.rs` — the safe wrapper, split (issue #28) into `Ds4Model` (immutable
   `Arc`-shareable weights / tokenizer / Metal queue) and `Ds4Session` (one live
   FFI session, its KV suffix + cursor, implements `Engine`). The single-owner
@@ -230,9 +243,27 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   `node` records, so a linear session's file is unchanged and older files load
   as a single-branch tree.
 - `compact.rs` — the durable-summary + verbatim-tail rebuild and its pressure
-  thresholds.
+  thresholds. Token measurement stays behind `Engine::count_tokens` and never
+  migrates into the compaction module: the compaction code reasons about
+  *bytes* and *counts*, and only the engine boundary measures tokens.
 - `sysprompt.rs` — the verbatim tools/system prompt, datetime context, and the
   token-distance policy for re-injecting the system-prompt reminder.
+
+### Plugins (`plugins.rs`, `claudeplugin.rs`)
+- `plugins.rs` — what a plugin *is* once it is on disk: a directory bundling
+  skills, agents, templates, hooks, an `.mcp.json` and a `settings.json`,
+  discovered under `~/.plank/plugins/dev/`, `~/.plank/plugins/claude/`,
+  `./.plank/plugins/`, or `--plugin-dir`, in that scan order. Both the plank
+  (`.plank-plugin/plugin.json`, `templates/`, `hooks.json`) and Claude Code
+  (`.claude-plugin/plugin.json`, `commands/`, `hooks/hooks.json`) spellings are
+  accepted.
+- `claudeplugin.rs` — the other half: fetching a Claude Code plugin from a git
+  repository, a marketplace repository, or a `.tar.gz`, validating it against
+  the hook events plank implements, and installing it into
+  `~/.plank/plugins/claude/`, the scan root `plugins.rs` checks between `dev/`
+  and the project root. It is a separate module because it owns a different
+  set of questions than `plugins.rs` — network, subprocess and trust decisions
+  that only matter once, at install time, not on every scan.
 
 ### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`, `configform.rs`, `miniedit/`)
 - `tui.rs` — the Ratatui presentation layer: a styled scrollback `OutputLog`

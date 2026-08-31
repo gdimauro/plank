@@ -635,6 +635,111 @@ test` and review the diff before committing.
   callers print it with the fingerprint and the exact path, because two rounds
   were spent guessing at it.
 
+## The log-everything invariant (M3) — the two suspects, decided
+
+The invariant (written into `docs/ARCHITECTURE.md`): anything that reaches a
+model request must be reconstructible from the session log, either as a
+transcript entry or as the separately-fingerprinted system prompt. The audit
+found plank already honours it at every injection site — context blocks,
+reinjection, task list, skills/templates, memory, and subagent messages are all
+pushed into the transcript via `session.push`; the system prompt (including MCP
+adverts) is fingerprinted (`fp1`) and stored as `sysprompt-<fp1>.kv_raw`. Two
+narrow suspects were resolved:
+
+- **`volatile_context()` on resume: faithful replay, not recomputation.** Git
+  status and the date line are time-varying, but a resumed session loads the
+  transcript from disk (`resume_from_cli`/`resume_pick` assign `self.session`
+  from the store) and never re-runs `ContextContent::new_with_agents`, so the
+  context the model sees is exactly the context recorded at session start.
+  This is the faithful-replay choice; it is deliberate and needs no exception.
+- **MCP advertisements: accounted for by the system-prompt fingerprint.** The
+  advert text (`src/tools/mcp_advert.rs`) is rendered into the tools prompt,
+  which is part of the fingerprinted system prompt. A server's tool list
+  changing underneath a resumed session changes `fp1`, which invalidates the
+  `sysprompt-<fp1>.kv_raw` snapshot and forces a rebuild — survivable, never a
+  silent gain or loss of tools relative to the session's own record.
+
+## Output spill (M4) — the locator line is new model-facing text
+
+The spill preview banner (`[Output truncated at N bytes of M. continue_offset=K.
+Call more with count=C to read the next chunk.]`, `src/spill.rs`) is a new
+model-facing sentence. The C agent has no spill concept, so there is no
+`refs/ds4` wording to match; the shape deliberately reuses the fixture-blessed
+`[Read truncated at line N of M. continue_offset=K. ...]` sentence to minimise
+the surface. It is a deliberate deviation, gated behind `tools.spillMaxBytes`
+(default high enough that ordinary sessions never spill). Regenerate fixtures
+with `PLANK_REGEN_FIXTURES=1 cargo test` if a fixture ever pins this text.
+
+## Microcompact cadence (M5) — the KV effect, measured
+
+The opportunistic end-of-turn microcompact (`try_microcompact_opportunistic`,
+`src/ui.rs`) fires only when `microcompact_reclaimable` reports at least
+`MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES = 4096` reclaimed. The rationale is
+KV-specific: pruning mid-session rewrites transcript text in place, which
+invalidates the KV prefix from that point, so an eager pass that reclaims
+little costs more than it saves. The 4096-byte gate is the measured trade-off
+point — below it the prefix rebuild outweighs the reclaimed context. The
+keep-policy is now keep-last-3 PLUS anything under `MICROCOMPACT_MIN_BYTES`
+(never candidates) PLUS anything belonging to the current task (a tool result
+following the last `# Task list` injection). `MICROCOMPACT_STUB` is unchanged
+and still fixtured. A real-engine measurement of the prefix-stability win
+(earlier suffix stop vs. per-pass prefix invalidation) is pending; the gate is
+the conservative default until then.
+
+## Durable goal state (M7) — model-facing text, fixtures
+
+The goal statement is now durable session state (`Session.goal`), pinned
+against compaction and re-injected above the task list. Two surfaces are
+model-facing and changed: `TaskList::inject_block` now carries the goal line
+(`Current goal: ...`), and `agents::task_message` prepends `Session goal: ...`
+to a subagent's preamble. Both are new model-facing text — check `refs/ds4`
+for the C behaviour first and regenerate fixtures with
+`PLANK_REGEN_FIXTURES=1 cargo test` if a fixture pins either. The goal field
+itself is the durable fact; the transcript entry (kickoff message, and the
+compaction re-injection) is the record of what was shown, so the
+log-everything invariant (M3) holds — the field never becomes a second
+unlogged source of model-visible text.
+
+## The recall tool (M8) — a tools-prompt change, fp1 churn
+
+The `recall` tool is a deliberate deviation from the C reference: the C agent
+has no such tool, so advertising it changes the system prompt, which changes
+`fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot
+(`session::sysprompt_checkpoint_name`). Snapshots rebuild rather than break,
+so this is survivable — but it is a versioned deviation, gated behind
+`tools.recall` (default **on** since 3.4.0; set it to `false` to remove the
+schema), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+Batch the fingerprint churn with any other tools-prompt change (M10) so it
+happens once rather than twice.
+
+## Subagent fan-out (M9) — a tools-prompt change, fp1 churn
+
+The `fanout` tool is a deliberate deviation from the C reference: the C agent
+has no such tool, so advertising it changes the system prompt, which changes
+`fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot. Gated behind
+`tools.fanout` (default **on** since 3.4.0; set it to `false` to remove the
+schema), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+The description promises a deterministic join, not speed: on the `ds4_engine`
+path subtasks are interleaved on one Metal queue, not parallel
+(`docs/SHARED-ENGINE-DESIGN.md` §2), so the concurrency bound is 1 until
+issue #28's `Ds4Session` split and cooperative GPU-thread scheduler land.
+Batch the fingerprint churn with M8/M10 so it happens once.
+
+## run_code (M10) — a tools-prompt change, fp1 churn
+
+The `run_code` tool is a deliberate deviation from the C reference: the C agent
+has no such tool, so advertising it changes the system prompt, which changes
+`fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot. Gated behind
+`tools.runCode` (default **on** since 3.4.0; set it to `false` to remove the
+schema), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+The minimal viable version executes a script of named operations
+(read/glob/edit/bash), one per line, each routed through the existing
+`tools::dispatch` so the consent and sandbox checks apply — a binding that
+shortcuts them would be a hole straight through every guard those files
+implement. The guest-language design (a small interpreted language compiled to
+the WASM host, `src/wasmhost.rs`) is a follow-up. Batch the fingerprint churn
+with M8/M9 so it happens once.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`
@@ -1150,13 +1255,31 @@ test` and review the diff before committing.
   rebind) produces no RST and no FIN, and once the request is fully sent plank
   is purely *receiving* — so there is no unacked data for TCP to retransmit and
   therefore no kernel timeout can ever fire. The socket sits established and
-  black-holed, and a blocking read on it parks forever. Every agent needs
-  explicit `timeout_connect` / `timeout_recv_response`; the streaming ones need
-  more than that, because `timeout_recv_body` bounds the *total* body duration
-  and so cannot tell a dead socket from a long healthy generation. The body
-  therefore gets an **idle** timeout instead (`remote::STREAM_IDLE_TIMEOUT`),
-  which is only sound because both providers keepalive their SSE streams
-  (Anthropic `event: ping`, OpenAI comment frames).
+  black-holed, and a blocking read on it parks forever. Every agent needs an
+  explicit `timeout_connect`; the streaming ones can bound *nothing else* with a
+  ureq deadline, because `timeout_recv_body` bounds the *total* body duration and
+  so cannot tell a dead socket from a long healthy generation. The body gets an
+  **idle** timeout instead (`remote::STREAM_IDLE_TIMEOUT`), which is only sound
+  because both providers keepalive their SSE streams (Anthropic `event: ping`,
+  OpenAI comment frames).
+
+- **`timeout_recv_response` silently caps the whole body, not just the header
+  wait.** The obvious reading — "it bounds waiting for the response, the body is
+  separate" — is wrong in ureq 3.x. `timings::Timeout::preceeding` lists
+  `RecvResponse` as a *preceding* timeout of `RecvBody`, and `next_timeout` takes
+  the **min** across a phase and all its predecessors. `RecvResponse` is recorded
+  when the headers arrive (`run.rs`), so with `recv_body` unset the body's only
+  finite deadline becomes `headers_arrival + recv_response`. A 2-minute
+  `timeout_recv_response` therefore killed any turn whose prefill+generation ran
+  past 2 minutes of wall-clock — exactly the large-context case (523k input
+  tokens), surfacing as `provider stream read: timeout: receive response` (ureq's
+  own error, *not* plank's "stalled: no data" idle message). The fix is to set
+  **no** `recv_response` at all and run the whole connect+send+retry phase on the
+  reader thread (`remote::spawn_sse_stream`), so `pump_sse`'s idle timeout +
+  interrupt polling cover connect, prefill and streaming uniformly — the one
+  bound that can distinguish silence from a slow-but-live stream. Bonus: a
+  black-holed *connect* is now interruptible (it parks the reader thread, not the
+  turn), which the old synchronous send was not.
 
 - **Never poll a cancellation flag from a data-driven callback.** The provider
   and ds4 clients used to check `interrupt()` inside the `read_sse` callback,
@@ -1528,3 +1651,48 @@ test` and review the diff before committing.
   paying the propose; and llama.cpp's `p_min` defaults to 0 — never decline —
   which is only rational because its verify is cheap. Nothing here is
   actionable in plank: plank's side of the DSpark path is already correct.
+- **`/install-claude-plugin`: `${CLAUDE_PLUGIN_ROOT}` gets rewritten on disk,
+  not injected at exec time.** Claude Code hooks and MCP server commands
+  reference `${CLAUDE_PLUGIN_ROOT}` expecting the environment to supply it, but
+  plank's hook runner (`src/hooks.rs`) execs `/bin/sh` with no injected
+  environment at all, and `plugins.rs` flattens every source's hooks into one
+  list with no per-hook provenance to thread a root through. So
+  `claudeplugin::rewrite_plugin_root` substitutes the literal path into
+  `hooks/hooks.json` and `.mcp.json` at install time instead — the tradeoff
+  being that the installed tree stops matching upstream and breaks if the
+  directory is ever moved, which the install output says out loud.
+- **`plugins::find_plugin_root` is plank-only, hence `claudeplugin`'s own
+  `resolve_in_tree`.** `find_plugin_root` requires `.plank-plugin/plugin.json`
+  at the root — it has no notion of a Claude Code manifest, and no notion of a
+  marketplace repository holding several plugins. Rather than teach it a
+  second manifest spelling and a marketplace-resolution step it has no other
+  caller for, `claudeplugin::resolve_in_tree` is its own small function that
+  understands both `.claude-plugin/plugin.json` and
+  `.claude-plugin/marketplace.json`.
+- **`plugins::copy_tree` always follows symlinks — so `plugins::reject_escaping_symlinks`
+  must always scan the *source* tree, never the copy, or it will find
+  nothing.** `copy_tree`'s file branch is `std::fs::copy`, which reads through
+  a symlink and writes the target's bytes out as a plain file at the
+  destination. Once that copy has happened, the symlink is simply gone — there
+  is no longer anything at the destination for a symlink check to see, so a
+  check run *after* the copy always passes, no matter what the source
+  contained. The fix is checking the source before the copy ever runs, at
+  every copy site: `plugins::install`'s local-directory source,
+  `plugins::fetch_archive`'s downloaded archive, and `claudeplugin.rs`'s three
+  (the staged tree in `install_staged`, the local-directory fallback in
+  `fetch`, and the git-clone and archive branches of `fetch`/`clone`). This
+  exact inversion — scanning the destination instead of the source — was
+  introduced and caught twice during this work, both while
+  `reject_unsafe_symlinks` (now `plugins::reject_escaping_symlinks`, moved and
+  renamed when its containment rule became the one policy shared by
+  `/plugins install` and `/install-claude-plugin`) still lived in
+  `claudeplugin.rs`. A third, separate gap was pre-existing rather than an
+  inversion: `plugins::install` had *no* symlink scan at all on its
+  `<directory>` argument. A reviewer's reproduction of that one (a plugin
+  directory holding a symlink to `~/.ssh/id_rsa`) landed the private key's
+  contents, as a plain file, inside `~/.plank/plugins/dev/`. If you are about to move a
+  `reject_escaping_symlinks` call, or write a similar check anywhere
+  `copy_tree` is involved, put it before the copy and write a test that plants
+  a symlink to a secret and asserts the secret's *contents* never appear
+  anywhere under the destination — asserting the symlink itself is absent is
+  not enough, because by then it never existed there to begin with.
