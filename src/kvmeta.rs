@@ -47,6 +47,8 @@ pub enum KvRole {
     Project,
     /// Tier 4: one conversation's KV payload.
     Session,
+    /// One rung of a session's snapshot ladder.
+    Rung,
 }
 
 impl KvRole {
@@ -57,6 +59,7 @@ impl KvRole {
             Self::System => "system",
             Self::Project => "project",
             Self::Session => "session",
+            Self::Rung => "rung",
         }
     }
 }
@@ -96,6 +99,24 @@ pub enum KvLabel {
     },
     /// No detail recorded — a synthesized or partially written sidecar.
     Unknown,
+    /// Ladder rung detail: which session the blob belongs to and how much of
+    /// it the blob covers.
+    ///
+    /// The rung's `KvMeta::parent` is deliberately `None`, so `/kvcache` lists
+    /// it as a root rather than nesting it under its session. Naming the
+    /// session payload as parent would be worse than cosmetic: the GC spares
+    /// any node with a surviving child, so a rung would keep its session's
+    /// payload — and, transitively, the tier checkpoints above it — alive under
+    /// the byte budget, which is precisely backwards for the most disposable
+    /// blob in the cache. The session id below is what attributes the row.
+    Rung {
+        /// Session id this rung belongs to.
+        session: String,
+        /// Transcript spans the blob covers.
+        spans: usize,
+        /// Tokens the blob covers.
+        tokens: i32,
+    },
 }
 
 /// Advisory metadata for one persisted KV blob.

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use crate::ds4tokens::{self, SectionKey, SpanRole, TokenTranscript};
 use crate::engine::{
     Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats, PrefillProgress,
-    ThinkMode,
+    ThinkMode, kv_debug,
 };
 use crate::ffi;
 use crate::host::{HostSession, ModelHandle};
@@ -266,7 +266,14 @@ impl Ds4Model {
         let ctx_size = ctx_size.clamp(1, self.ctx_size.max(1));
         let mut session: *mut ffi::Ds4Session = std::ptr::null_mut();
         // SAFETY: engine valid; session is a valid out-ptr.
-        let rc = unsafe { ffi::ds4_session_create(&raw mut session, self.engine, ctx_size) };
+        //
+        // Wrapped because the C announces its DSpark capture configuration on
+        // stderr on every session creation — startup, `/clear`, each aside and
+        // sub-agent — which lands in the middle of the user's screen. Only that
+        // line is dropped; anything else the call prints still comes through.
+        let rc = crate::stderrline::without_ds4_chatter(|| unsafe {
+            ffi::ds4_session_create(&raw mut session, self.engine, ctx_size)
+        });
         if rc != 0 || session.is_null() {
             return Err(EngineError::new("failed to create session"));
         }
@@ -1643,11 +1650,26 @@ impl Engine for Ds4Session {
         // drop; we copy the payload out for the caller to persist. The token
         // transcript rides in the value so a restore reconstructs the exact
         // token buffer the KV was captured with.
+        let t0 = std::time::Instant::now();
         let snap = SessionSnapshot::capture(self.session).ok()?;
-        Some(crate::kvcache::KVCache::new(
-            snap.as_bytes().to_vec(),
-            self.transcript.clone(),
-        ))
+        let captured = t0.elapsed();
+        let bytes = snap.as_bytes().len();
+        let t1 = std::time::Instant::now();
+        let out = crate::kvcache::KVCache::new(snap.as_bytes().to_vec(), self.transcript.clone());
+        let copied = t1.elapsed();
+        // Capture is a full copy of the KV prefix out of the backend, so its
+        // cost scales with the conversation, not with the turn. Anything that
+        // wants to snapshot more often than once a turn has to justify itself
+        // against these two numbers.
+        kv_debug(|| {
+            format!(
+                "get_kv: {:.1} MB captured in {:.0} ms (+{:.0} ms to copy out)",
+                crate::session::to_mb(bytes as u64),
+                captured.as_secs_f64() * 1e3,
+                copied.as_secs_f64() * 1e3,
+            )
+        });
+        Some(out)
     }
 
     fn set_kv(&mut self, cache: &crate::kvcache::KVCache) -> Result<(), EngineError> {
@@ -1655,7 +1677,17 @@ impl Engine for Ds4Session {
         // Persisted bytes go through the non-owning restore path: the engine
         // copies from a transient struct and never frees it (snapshot.rs,
         // FINDINGS.md).
+        let t0 = std::time::Instant::now();
         SessionSnapshot::restore_bytes(session, cache.kv())?;
+        // The other half of the trade: restoring here is what a forced rebuild
+        // would otherwise pay as a prefill from token zero.
+        kv_debug(|| {
+            format!(
+                "set_kv: {:.1} MB restored in {:.0} ms",
+                crate::session::to_mb(cache.kv().len() as u64),
+                t0.elapsed().as_secs_f64() * 1e3,
+            )
+        });
         self.transcript = cache.transcript().clone();
         Ok(())
     }
@@ -2126,27 +2158,6 @@ fn strip_legacy(bytes: &[u8]) -> &[u8] {
         // Malformed legacy header: fall back to treating the whole payload as
         // raw KV (best effort; a load failure just forces a cold prefill).
         None => bytes,
-    }
-}
-
-/// Appends a line to the file named by `PLANK_KV_DEBUG`, if set.
-///
-/// KV prefix reuse is the one part of the engine whose failures are silent and
-/// expensive: a mismatch costs a full re-prefill and looks exactly like "the
-/// model is slow today". The closure is only called when the variable is set,
-/// so this costs an env lookup per turn otherwise. Diagnostic only — nothing
-/// reads these files back.
-fn kv_debug(f: impl FnOnce() -> String) {
-    use std::io::Write as _;
-    let Ok(path) = std::env::var("PLANK_KV_DEBUG") else {
-        return;
-    };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{}", f());
     }
 }
 

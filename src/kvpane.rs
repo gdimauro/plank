@@ -493,6 +493,7 @@ fn detail_of(m: &KvMeta) -> String {
             }
         }
         KvLabel::Unknown => String::new(),
+        KvLabel::Rung { session, spans, .. } => format!("{session} · {spans} spans"),
     }
 }
 
@@ -628,6 +629,7 @@ mod tests {
             crate::kvgc::SweepPolicy {
                 ttl_session_secs: 14 * DAY,
                 ttl_tier_secs: 30 * DAY,
+                ttl_rung_secs: 14 * DAY,
                 max_bytes: 0,
             },
             Vec::new(),
@@ -738,6 +740,7 @@ mod tests {
             crate::kvgc::SweepPolicy {
                 ttl_session_secs: 14 * DAY,
                 ttl_tier_secs: 30 * DAY,
+                ttl_rung_secs: 14 * DAY,
                 max_bytes: 0,
             },
             Vec::new(),
@@ -757,6 +760,7 @@ mod tests {
             crate::kvgc::SweepPolicy {
                 ttl_session_secs: 14 * DAY,
                 ttl_tier_secs: 30 * DAY,
+                ttl_rung_secs: 14 * DAY,
                 max_bytes: 0,
             },
             Vec::new(),
@@ -822,6 +826,7 @@ mod tests {
             crate::kvgc::SweepPolicy {
                 ttl_session_secs: 14 * DAY,
                 ttl_tier_secs: 30 * DAY,
+                ttl_rung_secs: 14 * DAY,
                 max_bytes: 0,
             },
             Vec::new(),
@@ -842,6 +847,7 @@ mod tests {
             crate::kvgc::SweepPolicy {
                 ttl_session_secs: 14 * DAY,
                 ttl_tier_secs: 30 * DAY,
+                ttl_rung_secs: 14 * DAY,
                 max_bytes: 0,
             },
             Vec::new(),
@@ -862,6 +868,7 @@ mod tests {
         crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * DAY,
             ttl_tier_secs: 30 * DAY,
+            ttl_rung_secs: 14 * DAY,
             max_bytes,
         }
     }
@@ -932,6 +939,7 @@ mod tests {
             crate::kvgc::SweepPolicy {
                 ttl_session_secs: 14 * DAY,
                 ttl_tier_secs: 30 * DAY,
+                ttl_rung_secs: 14 * DAY,
                 max_bytes: 1024,
             },
             Vec::new(),

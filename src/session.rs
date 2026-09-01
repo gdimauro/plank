@@ -409,6 +409,20 @@ pub enum KvKey {
     /// prompt, and rendered transcript. Keying on the id alone would make a
     /// payload captured under a different model or system prompt a hit.
     Session { id: String, fp: String },
+    /// One rung of a session's KV snapshot ladder. `<id>.rung-<n>.kv_raw`.
+    ///
+    /// Same trust rule as [`KvKey::Session`]: named by session id and slot so
+    /// it can be found and replaced, but only used when its stored signature
+    /// equals `fp`. A rung captured under a different model, system prompt, or
+    /// transcript prefix reads back as a miss and is rebuilt.
+    Rung {
+        /// Session this rung belongs to.
+        id: String,
+        /// Slot number within the ladder.
+        index: usize,
+        /// Payload fingerprint the blob must carry to be trusted.
+        fp: String,
+    },
 }
 
 impl KvKey {
@@ -417,7 +431,10 @@ impl KvKey {
     #[must_use]
     pub fn signature(&self) -> &str {
         match self {
-            Self::System { fp } | Self::Project { fp, .. } | Self::Session { fp, .. } => fp,
+            Self::System { fp }
+            | Self::Project { fp, .. }
+            | Self::Session { fp, .. }
+            | Self::Rung { fp, .. } => fp,
         }
     }
 }
@@ -467,6 +484,49 @@ impl SessionStore {
     #[must_use]
     pub fn payload_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}{PAYLOAD_EXT}"))
+    }
+
+    /// Path of one ladder rung's blob. Named by session id and slot so a
+    /// refresh overwrites in place rather than accumulating files.
+    #[must_use]
+    pub fn rung_path(&self, id: &str, index: usize) -> PathBuf {
+        self.dir.join(format!("{id}.rung-{index}.kv_raw"))
+    }
+
+    /// Deletes every ladder rung blob and sidecar for `id`, returning how many
+    /// blobs were removed. Rungs are a live-session accelerator, not history:
+    /// the saved payload is what a later `/resume` restores from.
+    ///
+    /// Enumerates the store directory rather than probing `0..LADDER_MAX_RUNGS`:
+    /// [`crate::kvladder::KvLadder::push`] names slots from a MONOTONIC
+    /// counter, so a session's fourth capture is `rung-3` and a long session's
+    /// three live rungs all have indices past the ladder's width. A fixed-range
+    /// probe found none of them and left gigabytes on disk.
+    ///
+    /// The prefix is `{id}.rung-`, which the session's own payload (`{id}.kv_raw`)
+    /// cannot match, and the suffix pins the blob extension so a sibling session
+    /// id that merely starts with `{id}` is excluded too (`{id}-two.rung-3.kv_raw`
+    /// does not begin with `{id}.rung-`). Best-effort throughout: a failed
+    /// delete must never fail an exit or a `/strip`.
+    #[must_use]
+    pub fn remove_rungs(&self, id: &str) -> usize {
+        let prefix = format!("{id}.rung-");
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(crate::kvmeta::BLOB_EXT))
+            })
+            .filter(|e| {
+                let path = e.path();
+                let _ = fs::remove_file(crate::kvmeta::sidecar_path(&path));
+                fs::remove_file(&path).is_ok()
+            })
+            .count()
     }
 
     /// Size in bytes of a session's KV payload sidecar; 0 when absent.
@@ -529,6 +589,17 @@ impl SessionStore {
                 crate::kvmeta::KvRole::System
             } else if name.starts_with(&format!("{PROJECT_STEM}-")) {
                 crate::kvmeta::KvRole::Project
+            } else if name.contains(".rung-") {
+                // A rung is `{id}.rung-{N}.kv_raw`; the session payload
+                // `{id}.kv_raw` never contains `.rung-`, so this cannot
+                // misclassify a plain session body. A missing or stale
+                // sidecar is exactly the crash-orphan case the rung
+                // backstop TTL and first-to-evict ordering exist for
+                // (see `RUNG_BACKSTOP_SECS`); falling through to
+                // `Session` here would give an orphaned rung the 14-day
+                // session TTL and sort it last under the byte budget
+                // instead of first.
+                crate::kvmeta::KvRole::Rung
             } else {
                 crate::kvmeta::KvRole::Session
             };
@@ -751,6 +822,7 @@ impl SessionStore {
             KvKey::System { fp } => self.dir.join(sysprompt_checkpoint_name(fp)),
             KvKey::Project { dir, fp } => self.project_checkpoint_path(dir, fp),
             KvKey::Session { id, .. } => self.payload_path(id),
+            KvKey::Rung { id, index, .. } => self.rung_path(id, *index),
         }
     }
 
@@ -934,6 +1006,7 @@ impl SessionStore {
             fs::remove_file(&payload)?;
             let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
         }
+        let _ = self.remove_rungs(&id);
         Ok((id, had_payload))
     }
 
@@ -1432,6 +1505,7 @@ pub fn kv_role(key: &KvKey) -> crate::kvmeta::KvRole {
         KvKey::System { .. } => crate::kvmeta::KvRole::System,
         KvKey::Project { .. } => crate::kvmeta::KvRole::Project,
         KvKey::Session { .. } => crate::kvmeta::KvRole::Session,
+        KvKey::Rung { .. } => crate::kvmeta::KvRole::Rung,
     }
 }
 
@@ -2517,6 +2591,56 @@ mod tests {
     }
 
     #[test]
+    fn a_rung_with_no_sidecar_still_classifies_as_rung() {
+        // The crash-orphan case: a process killed mid-session leaves a
+        // `.rung-N.kv_raw` body with no sidecar (or a stale one from an
+        // older `META_VERSION`). `kv_node_at` must still recognise it as
+        // `KvRole::Rung` from its file name alone, so it gets the 1-day
+        // rung backstop TTL and evicts before a session payload rather
+        // than inheriting the 14-day session TTL and sorting last.
+        let dir = temp_dir("rung-no-sidecar");
+        let store = SessionStore::open(&dir).unwrap();
+        std::fs::write(store.rung_path("zany-turing", 3), vec![0u8; 300]).unwrap();
+        // No sidecar written for the rung: this is the exact scenario a
+        // crash or a `META_VERSION` bump leaves behind.
+
+        let nodes = store.kv_nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].role,
+            crate::kvmeta::KvRole::Rung,
+            "a sidecar-less rung must classify as Rung, not fall through to Session"
+        );
+
+        // It must also win the TTL and eviction-order consequences that
+        // follow from that role: rung TTL, not session TTL, and
+        // evict_rank first, not last, under the byte budget.
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 14 * 86_400,
+            ttl_rung_secs: 86_400,
+            max_bytes: 300, // exactly the session payload's size: evicting the rung alone must satisfy it
+        };
+        let mut older_session = crate::kvmeta::KvMeta::synthesized(
+            crate::kvmeta::KvRole::Session,
+            "cheeky-bell",
+            300,
+            0,
+        );
+        older_session.last_used = 0;
+        let mut rung_node = nodes[0].clone();
+        rung_node.last_used = 1_000; // more recently touched than the session payload
+        let plan = crate::kvgc::plan_sweep(&[older_session, rung_node], &[], &policy, 2_000);
+        assert_eq!(
+            plan.doomed,
+            vec![1],
+            "the rung must be evicted ahead of the older session payload, not after it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn migration_wipes_old_blobs_and_keeps_every_transcript() {
         let dir = std::env::temp_dir().join(format!("plank-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2877,6 +3001,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            ttl_rung_secs: 14 * 86_400,
             max_bytes: 0,
         };
         // `now` an hour and a bit on: everything written just now reads as past
@@ -2961,6 +3086,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            ttl_rung_secs: 14 * 86_400,
             max_bytes: 0,
         };
         // Two Tier 1 fingerprints are live, not one: a session can hold two
@@ -3042,6 +3168,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            ttl_rung_secs: 14 * 86_400,
             max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -3092,6 +3219,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            ttl_rung_secs: 14 * 86_400,
             max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -3119,6 +3247,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 0,
             ttl_tier_secs: 0,
+            ttl_rung_secs: 0,
             max_bytes: 0,
         };
         assert_eq!(store.sweep(&[], &policy, crate::kvmeta::now_secs()), 5);
@@ -3226,6 +3355,7 @@ hello\n";
                 let policy = crate::kvgc::SweepPolicy {
                     ttl_session_secs: 0,
                     ttl_tier_secs: 0,
+                    ttl_rung_secs: 0,
                     max_bytes: 0,
                 };
                 let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -3265,6 +3395,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 0,
             ttl_tier_secs: 0,
+            ttl_rung_secs: 0,
             max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -4158,6 +4289,66 @@ hello\n";
     }
 
     #[test]
+    fn a_rung_is_named_by_session_and_slot_and_signed_by_fingerprint() {
+        let dir = temp_dir("rung");
+        let store = SessionStore::open(&dir).unwrap();
+        let key = KvKey::Rung {
+            id: "zany-turing".to_owned(),
+            index: 2,
+            fp: "deadbeef".to_owned(),
+        };
+        assert_eq!(key.signature(), "deadbeef");
+        assert_eq!(store.kv_path(&key), store.rung_path("zany-turing", 2));
+        assert!(
+            store
+                .kv_path(&key)
+                .to_string_lossy()
+                .ends_with("zany-turing.rung-2.kv_raw")
+        );
+        assert_eq!(kv_role(&key), crate::kvmeta::KvRole::Rung);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_rungs_clears_every_slot_and_its_sidecar() {
+        let dir = temp_dir("remove-rungs");
+        let store = SessionStore::open(&dir).unwrap();
+        // Slot numbers come from `KvLadder`'s MONOTONIC counter, not from
+        // `0..LADDER_MAX_RUNGS`: a session's fourth capture is `rung-3`, its
+        // fifth `rung-4`. In the long sessions this feature targets every live
+        // rung has an index well past the ladder's width, so the sweep must
+        // enumerate the directory rather than probe a fixed range.
+        let indices = [3usize, 7, 12];
+        for i in indices {
+            std::fs::write(store.rung_path("zany-turing", i), b"blob").unwrap();
+            std::fs::write(
+                store.rung_path("zany-turing", i).with_extension("json"),
+                b"{}",
+            )
+            .unwrap();
+        }
+        // Neither another session's rungs nor this session's own payload may be
+        // caught by the prefix match.
+        std::fs::write(store.rung_path("zany-turing-two", 3), b"other").unwrap();
+        std::fs::write(store.payload_path("zany-turing"), b"payload").unwrap();
+
+        assert_eq!(store.remove_rungs("zany-turing"), indices.len());
+        for i in indices {
+            assert!(!store.rung_path("zany-turing", i).exists());
+            assert!(
+                !store
+                    .rung_path("zany-turing", i)
+                    .with_extension("json")
+                    .exists()
+            );
+        }
+        assert!(store.rung_path("zany-turing-two", 3).exists());
+        assert!(store.payload_path("zany-turing").exists());
+        // A second sweep finds nothing left.
+        assert_eq!(store.remove_rungs("zany-turing"), 0);
+    }
+
+    #[test]
     fn kv_role_maps_each_key_variant() {
         use crate::kvmeta::KvRole;
         assert_eq!(kv_role(&KvKey::System { fp: "a".into() }), KvRole::System);
@@ -4174,6 +4365,14 @@ hello\n";
                 fp: "c".into()
             }),
             KvRole::Session
+        );
+        assert_eq!(
+            kv_role(&KvKey::Rung {
+                id: "i".into(),
+                index: 0,
+                fp: "d".into()
+            }),
+            KvRole::Rung
         );
     }
 }

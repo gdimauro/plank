@@ -1181,7 +1181,7 @@ checksum = "de654785b3d88c9d41972491d8bc7379d1d0e32ecd3e0ecc1baa106910477acf"
 dependencies = [
  "crossterm",
  "image",
- "logo-art",
+ "logo-art 0.2.1",
 ]
 
 [[package]]
@@ -2934,6 +2934,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "logo-art"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded0f0a7ac58f2ad7ae44edabbce6969c28963cc00cdc71adf59e17342d12e9e"
+dependencies = [
+ "image",
+]
+
+[[package]]
 name = "loop9"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3787,7 +3796,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plank"
-version = "3.5.1"
+version = "3.5.5"
 dependencies = [
  "blake2",
  "crt-off",
@@ -3797,7 +3806,7 @@ dependencies = [
  "image",
  "libc",
  "liteparse",
- "logo-art",
+ "logo-art 0.3.0",
  "notify-rust",
  "nucleo-matcher",
  "obscura",
@@ -5843,7 +5852,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "trace-stream"
-version = "0.1.0"
+version = "0.1.2"
 
 [[package]]
 name = "tracing"

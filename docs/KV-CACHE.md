@@ -312,6 +312,122 @@ Two configuration requirements, both silent when missed:
   another: a disagreement between the key and the tokens, which no fingerprint
   can catch.
 
+## Layer 7: the snapshot ladder
+
+Micro-compaction rewrites old tool-result bodies to a stub *in place*
+(`compact::microcompact`). That is exactly the case Layer 1 rules out reuse
+for: the engine can only extend its live end, never roll back behind it, so a
+rewrite anywhere in the transcript forces a full re-prefill from token zero —
+even though everything before the rewrite is still correct. A snapshot taken
+*before* the rewrite point is a legitimate restore target: restoring it makes
+the engine's live end equal to the snapshot's, and the next sync genuinely
+extends forward from there.
+
+`kvladder.rs` keeps a small, depth-indexed ladder of such snapshots ("rungs")
+per live session, in memory (`Agent::ladder`) plus one blob per rung on disk.
+
+**Not yet proven in production.** The accepting path — a pass that actually
+fires and a rung that is actually restored — has only ever been exercised by
+unit tests with a synthetic small `ctx_size`. It needs the window around 42%
+full before the pressure-dependent floor relaxes far enough, and no benchmark
+run to date has come close to filling a 1M-token window (measured sessions
+reach 2-3%). What *has* been measured live is the refusing path; see
+`FINDINGS.md`.
+
+- **Naming and location.** A rung's blob is `<id>.rung-<n>.kv_raw`, next to the
+  session's own `<id>.kv_raw` payload and `<id>.kv` transcript, where `<n>` is
+  a *monotonically increasing* slot index minted by `KvLadder::push` — not a
+  vector position. A session's fourth rung is `rung-3`, its fifth `rung-4`,
+  and so on for the life of the process; nothing ever reuses a lower index.
+- **Trust rule.** Identical to every other KV blob in this system: a rung is
+  read back through `SessionStore::kv_load`, which trusts only the signature
+  embedded in the body, never the filename or its sidecar. The signature is
+  `payload_fingerprint` computed over the transcript *as it stood at capture
+  time* — i.e. truncated to the rung's own `spans` — because that is what
+  `render_transcript` produced when the blob was written, and
+  `render_transcript` has no length-dependent formatting, so replaying that
+  same truncation later reproduces the byte-identical render to fingerprint
+  against.
+- **Placement.** A rung is captured as an *anchor*, immediately before a tool
+  result larger than `MICROCOMPACT_MIN_BYTES` is appended to the transcript
+  (`Agent::anchor_rung_before_tool_result`). At that instant
+  `transcript.len()` is exactly the index that result will occupy, which is
+  exactly the index `microcompact_first_index` later reports as the edit point,
+  so `select`'s `spans <= edit` holds with equality. Capturing at *turn ends*
+  instead — the original design — can never work: micro-compaction clears
+  oldest-first, so the edit sits near the start of the transcript, while within
+  a single turn the transcript jumps from 1 span to 6 and no turn boundary
+  exists at a usable depth. A measured 18-turn session captured 11 turn-end
+  rungs and used none of them.
+- **Spacing.** `KvLadder::wants_anchor` suppresses a capture when the ladder
+  already holds a rung shallow enough to cover this index (the same test
+  `select` applies), unless the new anchor is at least
+  `LADDER_ANCHOR_MIN_SPACING_TOKENS` (8192) tokens deeper. Since
+  `microcompact_first_index` is monotone non-decreasing, only a handful of
+  anchors per session are ever useful.
+- **Eviction.** At most `LADDER_MAX_RUNGS` (3) rungs are held per session.
+  Pushing a fourth evicts whichever interior rung's removal least widens the
+  largest remaining gap — never the shallowest rung (the only one that can
+  cover an edit near the start of the transcript) and never the newest.
+- **Selection.** `KvLadder::select(edit, already_reused)` returns the deepest
+  rung with `spans <= edit` that covers more tokens than the engine would
+  reuse unaided — so a restore is only performed when it is a genuine
+  improvement, never a regression.
+- **Lifecycle.** Rungs are a live-session accelerator, not history: they are
+  deleted outright when the session they belong to is replaced or rewritten
+  (`/new`, `/clear`, `/switch`, `/resume`, a full compaction, or a clean exit —
+  `Agent::discard_ladder`, `SessionStore::remove_rungs`), and swept as a
+  backstop by GC (below) for the case where none of those exit paths ran — a
+  crash, a `SIGKILL`, or a machine losing power mid-session.
+- **GC treatment.** A rung gets its own role, `KvRole::Rung`, with a dedicated
+  one-day TTL (`RUNG_BACKSTOP_SECS`) independent of `kvcache.ttlSessionDays` —
+  a rung is worthless the instant its process is gone, unlike a saved session
+  payload, so there is no reason to let a crash-orphaned one survive as long
+  as one. Phase 2's budget pass also always evicts rungs first
+  (`evict_rank(KvRole::Rung) == 0`, everything else `1`), since a rung is the
+  cheapest thing in the cache to recreate and the one role that is *never*
+  history a later run would miss. And a rung is never parented to its
+  session in the metadata graph: `plan_sweep`'s "has a surviving child" rule
+  (Phase 1, item 3) would otherwise make the single most disposable blob in
+  the cache the thing keeping the session payload — and the tier checkpoint
+  above it — alive.
+
+- **The gate, and why it depends on context pressure.** An opportunistic pass
+  is only taken when `compact::microcompact_is_worth_it(reclaimable,
+  reprefill_tokens, ctx_size, ctx_used)` agrees, where `reprefill_tokens` is
+  the rendered transcript's token count minus whatever the selected rung
+  covers. The comparison is bytes reclaimed per token re-prefilled against a
+  floor, and that floor is **not fixed**: it is
+  `MICROCOMPACT_BYTES_PER_TOKEN_FLOOR` (2.0) while used context sits at or
+  below half of `compact::compaction_trigger_used(ctx_size)`, then relaxes
+  linearly to a small epsilon (`MICROCOMPACT_FLOOR_EPSILON`, 0.05) at that
+  trigger — the exact point `should_compact` starts firing, so the cheap
+  decision and the expensive one are anchored to the same threshold and cannot
+  contradict each other (`compact::microcompact_floor`). The floor bottoms out
+  at an epsilon rather than at zero because zero means "accept any pass at
+  all", and the opportunistic pass runs at the end of a turn while
+  `should_compact` is consulted at the start of the next: a pass barely
+  clearing the minimum could spend a `set_kv` and a rewrite immediately before
+  a full compaction discarded the ladder and rebuilt anyway.
+  The reason is that the value of reclaiming context is not constant. A
+  measured run offered 12,344 bytes for 10,674 re-prefilled tokens — a ratio of
+  1.16 — in a window 2% full, where the right answer is no: ~3,300 tokens of
+  context are not worth ~98 s of prefill when nothing is short. The same trade
+  at 60-80% of the window is clearly worth taking, because there the
+  alternative is a full compaction: a model round-trip *plus* a total KV
+  rebuild. At or past the trigger the floor is zero and the opportunistic pass
+  can never be the blocker — full compaction is imminent and will rebuild the
+  KV regardless, so refusing a cheap pass there is strictly worse. The
+  decision is monotone in each input: more bytes reclaimed or more pressure
+  makes it more willing, more tokens re-prefilled less. The
+  `microcompact gate refused:` debug line reports `ctx_used`, `ctx_size` and
+  the effective `floor` alongside the bytes and tokens.
+
+A rung restore is a performance mechanism only: on a miss (stale fingerprint,
+missing blob, or no rung shallow enough) the code path is identical to having
+no ladder at all — the transcript rewrite proceeds and the next turn simply
+re-prefills, exactly as it always did.
+
 ## Garbage collection
 
 Checkpoints run to hundreds of megabytes, and a plank upgrade, an MCP server
@@ -360,6 +476,10 @@ Settings, read from `settings.json`:
 | `kvcache.ttlSessionDays` | 14 | idle days a session payload survives |
 | `kvcache.ttlTierDays` | 30 | idle days a system or project checkpoint survives |
 | `kvcache.maxBytes` | 21474836480 (20 GB) | ceiling for the budget pass; `0` disables it |
+
+There is no separate user-facing setting for the rung TTL: it is derived as
+`min(ttlSessionDays, 1 day)` (`RUNG_BACKSTOP_SECS`), so a stricter session TTL
+can only tighten it, never loosen it.
 
 `maxBytes = 0` means **unbounded**, never "evict everything". The inverse
 reading would wipe the cache on every launch for anyone who never set the key.

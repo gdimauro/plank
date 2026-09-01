@@ -665,6 +665,233 @@ pub fn collect_metas(
 }
 
 // ---------------------------------------------------------------------------
+// Differential reporting
+// ---------------------------------------------------------------------------
+
+/// Schema version of [`ReportState`]. A mismatch makes the previous run
+/// invisible — the next report is a full one — rather than misread.
+pub const STATE_VERSION: u32 = 1;
+
+/// New or updated sessions that force the prose to be written again.
+///
+/// Ten, or a tenth of the history, whichever comes first: the model's answers
+/// describe habits, and a habit does not change because two more sessions
+/// exist. The fraction is what keeps a small history responsive, where ten
+/// sessions might be everything the user has.
+const REFRESH_MIN_SESSIONS: usize = 10;
+/// See [`REFRESH_MIN_SESSIONS`].
+const REFRESH_MIN_FRACTION: f64 = 0.10;
+
+/// The deterministic half of a previous report, kept so the next one can say
+/// what has changed since.
+///
+/// Deliberately a handful of scalars rather than the whole [`Aggregated`]:
+/// this file is read by a later version of plank than wrote it, and a small
+/// struct of plain counters survives that where a large one full of derived
+/// vectors would need migrating.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// Sessions substantive enough to count.
+    #[serde(default)]
+    pub sessions_counted: usize,
+    /// Human turns across them.
+    #[serde(default)]
+    pub human_messages: u32,
+    /// Lines added by edits and writes.
+    #[serde(default)]
+    pub lines_added: u32,
+    /// Lines removed by edits.
+    #[serde(default)]
+    pub lines_removed: u32,
+    /// Distinct files touched.
+    #[serde(default)]
+    pub files_touched: usize,
+    /// `git commit` invocations.
+    #[serde(default)]
+    pub commits: u32,
+    /// Error categories seen, so the next report can name the new ones.
+    #[serde(default)]
+    pub errors: Vec<String>,
+    /// Tools used, for the same reason.
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+impl Snapshot {
+    /// The parts of an aggregate worth remembering between reports.
+    #[must_use]
+    pub fn of(agg: &Aggregated) -> Self {
+        Self {
+            sessions_counted: agg.sessions_counted,
+            human_messages: agg.human_messages,
+            lines_added: agg.lines_added,
+            lines_removed: agg.lines_removed,
+            files_touched: agg.files_touched,
+            commits: agg.commits,
+            errors: agg.errors.iter().map(|(k, _)| k.clone()).collect(),
+            tools: agg.tools.iter().map(|(k, _)| k.clone()).collect(),
+        }
+    }
+}
+
+/// What the last report knew, written beside it.
+///
+/// Two jobs: it lets a run tell how much is genuinely new (so the prose is
+/// only rewritten when the picture could have changed), and it gives the new
+/// report something to subtract from for its "since last time" line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReportState {
+    /// [`STATE_VERSION`] when written.
+    #[serde(default)]
+    pub version: u32,
+    /// When that report was generated, unix seconds.
+    #[serde(default)]
+    pub at: u64,
+    /// Its statistics.
+    #[serde(default)]
+    pub snapshot: Snapshot,
+    /// Its model-written sections, reused verbatim while little changes.
+    #[serde(default)]
+    pub narrative: Narrative,
+    /// Session id to source mtime, so "new or updated" is counted exactly
+    /// rather than inferred from a total that an edited session leaves alone.
+    #[serde(default)]
+    pub seen: BTreeMap<String, u64>,
+}
+
+/// Path of the state file, beside the reports it describes.
+fn state_path(root: &Path) -> PathBuf {
+    root.join("last-report.json")
+}
+
+/// Reads the previous run's state. `None` on a first run, an unreadable file,
+/// or a version this build does not understand — in every case the caller
+/// simply produces a full report.
+#[must_use]
+pub fn load_state(root: &Path) -> Option<ReportState> {
+    let text = std::fs::read_to_string(state_path(root)).ok()?;
+    let state: ReportState = serde_json::from_str(&text).ok()?;
+    (state.version == STATE_VERSION).then_some(state)
+}
+
+/// Writes the state for the next run to diff against.
+///
+/// # Errors
+///
+/// Returns the io error's text if the file cannot be written.
+pub fn save_state(root: &Path, state: &ReportState) -> Result<(), String> {
+    let body = serde_json::to_string(state).map_err(|e| e.to_string())?;
+    write_private(&state_path(root), &body).map_err(|e| e.to_string())
+}
+
+/// Session id to source mtime for a completed scan.
+#[must_use]
+pub fn seen_map(metas: &[SessionMeta]) -> BTreeMap<String, u64> {
+    metas.iter().map(|m| (m.id.clone(), m.src_mtime)).collect()
+}
+
+/// How many sessions are new or have been written to since `state`.
+///
+/// Counted per session rather than from the totals: a session that grew by
+/// twenty turns changes the picture as much as a new one does, and leaves the
+/// session count untouched.
+#[must_use]
+pub fn changed_since(state: &ReportState, metas: &[SessionMeta]) -> usize {
+    metas
+        .iter()
+        .filter(|m| state.seen.get(&m.id) != Some(&m.src_mtime))
+        .count()
+}
+
+/// Whether `changed` sessions out of `counted` are enough to make the model
+/// write the prose again. See [`REFRESH_MIN_SESSIONS`].
+#[must_use]
+pub fn should_rewrite(changed: usize, counted: usize) -> bool {
+    #[allow(clippy::cast_precision_loss)]
+    let fraction = counted as f64 * REFRESH_MIN_FRACTION;
+    #[allow(clippy::cast_precision_loss)]
+    let changed_f = changed as f64;
+    changed >= REFRESH_MIN_SESSIONS || (counted > 0 && changed_f >= fraction && changed > 0)
+}
+
+/// What has happened since the previous report: the strip under the header.
+///
+/// Every field is a difference between two runs of the same deterministic
+/// aggregate, so this costs nothing and cannot be wrong in the way a model's
+/// summary of the same thing could be.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Delta {
+    /// When the previous report was generated, unix seconds.
+    pub since: u64,
+    /// Sessions new or updated since then.
+    pub sessions_changed: usize,
+    /// Growth in counted sessions.
+    pub sessions: i64,
+    /// Growth in human turns.
+    pub prompts: i64,
+    /// Lines added since.
+    pub lines_added: i64,
+    /// Lines removed since.
+    pub lines_removed: i64,
+    /// Files touched since.
+    pub files: i64,
+    /// Commits since.
+    pub commits: i64,
+    /// Error categories that were not in the previous report.
+    pub new_errors: Vec<String>,
+    /// Tools that were not in the previous report.
+    pub new_tools: Vec<String>,
+}
+
+impl Delta {
+    /// Whether anything moved. A report generated twice in a minute has an
+    /// empty delta and shows no strip: "since the last report: nothing" is a
+    /// line that earns nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sessions_changed == 0
+            && self.prompts == 0
+            && self.lines_added == 0
+            && self.lines_removed == 0
+            && self.commits == 0
+            && self.new_errors.is_empty()
+            && self.new_tools.is_empty()
+    }
+}
+
+/// Subtracts a previous report's [`Snapshot`] from the current aggregate.
+#[must_use]
+pub fn delta(state: &ReportState, agg: &Aggregated, sessions_changed: usize) -> Delta {
+    let prev = &state.snapshot;
+    let new_names = |now: &[(String, u32)], before: &[String]| -> Vec<String> {
+        now.iter()
+            .map(|(k, _)| k)
+            .filter(|k| !before.contains(k))
+            .take(3)
+            .cloned()
+            .collect()
+    };
+    let diff = |now: u64, before: u64| -> i64 {
+        i64::try_from(now).unwrap_or(i64::MAX) - i64::try_from(before).unwrap_or(0)
+    };
+    Delta {
+        since: state.at,
+        sessions_changed,
+        sessions: diff(agg.sessions_counted as u64, prev.sessions_counted as u64),
+        prompts: diff(
+            u64::from(agg.human_messages),
+            u64::from(prev.human_messages),
+        ),
+        lines_added: diff(u64::from(agg.lines_added), u64::from(prev.lines_added)),
+        lines_removed: diff(u64::from(agg.lines_removed), u64::from(prev.lines_removed)),
+        files: diff(agg.files_touched as u64, prev.files_touched as u64),
+        commits: diff(u64::from(agg.commits), u64::from(prev.commits)),
+        new_errors: new_names(&agg.errors, &prev.errors),
+        new_tools: new_names(&agg.tools, &prev.tools),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Aggregation
 // ---------------------------------------------------------------------------
 
@@ -767,6 +994,12 @@ pub struct Aggregated {
     /// Worst-rated turns: `(session id, note)` for negative ratings, newest
     /// first. The note is the user's own words; no transcript text is quoted.
     pub worst_turns: Vec<(String, String)>,
+
+    /// What has changed since the previous report, when there was one. Filled
+    /// in by the caller from the state file, like [`Aggregated::extensions`],
+    /// because it describes two runs rather than one scan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<Delta>,
 }
 
 impl Aggregated {
@@ -1071,6 +1304,10 @@ pub struct SectionSpec {
     pub heading: &'static str,
     /// Instructions appended to the shared data context.
     pub prompt: &'static str,
+    /// Tokens this section may spend, covering the reasoning and the answer
+    /// together. [`SECTION_TOKENS`] unless the section asks for something
+    /// long enough that the default would cut it off mid-object.
+    pub budget: i32,
 }
 
 /// System prompt for the narrative calls.
@@ -1126,6 +1363,22 @@ pub const FEATURE_CATALOGUE: &str = feature_catalogue!();
 /// around it — because the reply is parsed by pulling the first `{...}` out
 /// of the text. Failure of any one section costs that section and nothing
 /// else.
+/// Tokens a section may spend by default.
+///
+/// A section is a paragraph or a short list, and this is what stops one
+/// wandering reply from making the whole report take minutes. The session's
+/// own generation limit is meant for a coding turn and is far too generous.
+pub const SECTION_TOKENS: i32 = 3000;
+
+/// Tokens for a section that must *write* something the reader will paste —
+/// prompts, an AGENTS.md line, a ready-to-run snippet.
+///
+/// The two authoring sections were silently absent from every report ever
+/// generated: they reason about what to write, then write it, and the default
+/// budget ran out before they closed the JSON object, so `extract_json` found
+/// nothing and the section was dropped. Twice the budget covers both halves.
+pub const AUTHORING_SECTION_TOKENS: i32 = 6000;
+
 pub const SECTIONS: &[SectionSpec] = &[
     SectionSpec {
         key: "how_you_work",
@@ -1136,6 +1389,7 @@ about their habits. Two short paragraphs, second person, concrete. Do not \
 quote numbers back at them and do not use the raw snake_case names.\n\
 RESPOND WITH ONLY A VALID JSON OBJECT: {\"paragraphs\": [\"...\", \"...\"], \
 \"key_pattern\": \"one sentence naming their single most characteristic habit\"}",
+        budget: SECTION_TOKENS,
     },
     SectionSpec {
         key: "what_works",
@@ -1145,6 +1399,7 @@ session summaries and the tool and outcome mix. Be specific about the \
 behaviour, not generic praise.\n\
 RESPOND WITH ONLY A VALID JSON OBJECT: {\"items\": [{\"title\": \"short title\", \
 \"detail\": \"two sentences\"}]}",
+        budget: SECTION_TOKENS,
     },
     SectionSpec {
         key: "friction",
@@ -1154,6 +1409,7 @@ categories, failure rates, and interruptions. For each, say what is going \
 wrong and what would reduce it.\n\
 RESPOND WITH ONLY A VALID JSON OBJECT: {\"items\": [{\"title\": \"short title\", \
 \"detail\": \"what is going wrong\", \"fix\": \"what to change\"}]}",
+        budget: SECTION_TOKENS,
     },
     SectionSpec {
         key: "suggestions",
@@ -1164,6 +1420,7 @@ down in AGENTS.md once. `prompts` should hold ready-to-paste prompts that fit \
 work they actually do.\n\
 RESPOND WITH ONLY A VALID JSON OBJECT: {\"agents_md\": [\"instruction\"], \
 \"prompts\": [{\"title\": \"short title\", \"prompt\": \"the prompt to paste\"}]}",
+        budget: AUTHORING_SECTION_TOKENS,
     },
     SectionSpec {
         key: "features",
@@ -1182,6 +1439,7 @@ RESPOND WITH ONLY A VALID JSON OBJECT: {\"features\": [{\"name\": \"feature name
 \"one_liner\": \"what it is, one sentence\", \"why\": \"why it fits this person\", \
 \"snippet\": \"the command or file body to set it up\"}]}",
         ),
+        budget: AUTHORING_SECTION_TOKENS,
     },
     SectionSpec {
         key: "at_a_glance",
@@ -1192,6 +1450,7 @@ snake_case names.\n\
 RESPOND WITH ONLY A VALID JSON OBJECT: {\"working\": \"what is going well\", \
 \"hindering\": \"what is holding them back\", \"quick_win\": \"the one change \
 worth making this week\"}",
+        budget: SECTION_TOKENS,
     },
 ];
 
@@ -1378,6 +1637,76 @@ impl ThinkTicker {
     }
 }
 
+/// Watches a section's stream for the model falling into a repetition loop.
+///
+/// The recommendation sections ask for a list of objects, and a small model
+/// that runs out of things to say sometimes keeps emitting the same clause or
+/// the same list entry until the token budget runs out. That is minutes of
+/// visible nonsense per section on a real engine, so the stream is watched and
+/// the pass stopped as soon as the tail is provably cyclic. A false positive
+/// costs one section of prose; the statistics and every other section are
+/// untouched.
+#[derive(Debug, Default)]
+pub struct RepeatGuard {
+    tail: String,
+    since_check: usize,
+}
+
+/// Bytes of trailing output examined for a cycle.
+const REPEAT_WINDOW: usize = 1024;
+/// Shortest cycle treated as a loop. Below this, ordinary prose repeats
+/// itself legitimately — "the the", a run of list punctuation.
+const REPEAT_MIN_PERIOD: usize = 12;
+/// Consecutive identical blocks needed before the pass is stopped.
+const REPEAT_CYCLES: usize = 4;
+/// Bytes generated between checks. Scanning every chunk would be wasted work;
+/// a loop is not urgent enough to catch within one token.
+const REPEAT_CHECK_EVERY: usize = 64;
+
+impl RepeatGuard {
+    /// A guard positioned at the start of a reply.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one streamed chunk. Returns true once the output has been
+    /// repeating itself for [`REPEAT_CYCLES`] cycles.
+    pub fn feed(&mut self, chunk: &str) -> bool {
+        self.tail.push_str(chunk);
+        if self.tail.len() > REPEAT_WINDOW {
+            // Trim from the front to a char boundary: the window is a byte
+            // budget, and slicing mid-character would panic.
+            let mut cut = self.tail.len() - REPEAT_WINDOW;
+            while cut < self.tail.len() && !self.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail.drain(..cut);
+        }
+        self.since_check += chunk.len();
+        if self.since_check < REPEAT_CHECK_EVERY {
+            return false;
+        }
+        self.since_check = 0;
+        self.is_cyclic()
+    }
+
+    /// Whether the tail ends in the same block repeated back to back.
+    fn is_cyclic(&self) -> bool {
+        let bytes = self.tail.as_bytes();
+        let len = bytes.len();
+        for period in REPEAT_MIN_PERIOD..=len / REPEAT_CYCLES {
+            let block = &bytes[len - period..];
+            if (1..REPEAT_CYCLES)
+                .all(|back| &bytes[len - period * (back + 1)..len - period * back] == block)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Pulls the answer object out of a model reply.
 ///
 /// A reply that never yields valid JSON is a dropped section rather than an
@@ -1500,7 +1829,8 @@ pub(crate) fn date_str(ts: u64, offset: i64) -> String {
 }
 
 /// A `YYYY-MM-DD HH:MM` local wall-clock stamp for a unix second.
-fn datetime_str(ts: u64, offset: i64) -> String {
+#[must_use]
+pub fn datetime_str(ts: u64, offset: i64) -> String {
     let secs = (ts.cast_signed() + offset).rem_euclid(86_400);
     format!(
         "{} {:02}:{:02}",
@@ -1694,6 +2024,34 @@ fn section(out: &mut String, id: &str, heading: &str, body: &str) {
     );
 }
 
+/// Writes one copyable block: the text itself, a Copy button, and — when
+/// `pick` — a checkbox the section's "Copy all checked" button collects.
+///
+/// The report is a file, not a terminal, so a suggestion is only as useful as
+/// it is easy to act on: everything the model proposes is something you paste
+/// back into plank, and a paste starts with a copy. `tag` is the element the
+/// text lives in (`pre` for a snippet, `p` for a sentence of prose).
+fn copy_row(out: &mut String, tag: &str, class: &str, text: &str, pick: bool) {
+    out.push_str("<div class=\"copyrow\">");
+    if pick {
+        out.push_str("<input type=\"checkbox\" class=\"pick\" checked>");
+    }
+    let _ = write!(
+        out,
+        "<{tag} class=\"{class}\" data-copy>{}</{tag}>\
+<button type=\"button\" class=\"copy\">Copy</button></div>",
+        html_escape(text)
+    );
+}
+
+/// The "Copy all checked" control for a section of picked suggestions.
+fn copy_all_row(out: &mut String) {
+    out.push_str(
+        "<div class=\"copyall\"><button type=\"button\" class=\"copy-all\">\
+Copy all checked</button></div>",
+    );
+}
+
 /// Renders the narrative sections that came back, in [`SECTIONS`] order and
 /// skipping `at_a_glance` (which the header already shows).
 fn narrative_html(narrative: &Narrative) -> String {
@@ -1761,17 +2119,24 @@ fn narrative_html(narrative: &Narrative) -> String {
                     );
                 }
                 if let Some(s) = snippet {
-                    let _ = write!(body, "<pre>{}</pre>", html_escape(s));
+                    copy_row(&mut body, "pre", "snippet", s, false);
                 }
                 body.push_str("</div>");
             }
         }
         if let Some(lines) = value.get("agents_md").and_then(serde_json::Value::as_array) {
-            body.push_str("<h3>Worth putting in AGENTS.md</h3><ul>");
+            // A checklist rather than a bullet list: these are instructions
+            // meant to end up in a file, so the report hands them over ready
+            // to paste — untick the ones you disagree with, copy the rest.
+            body.push_str(
+                "<h3>Worth putting in AGENTS.md</h3>\
+<p class=\"note\">Untick anything you disagree with, then paste the rest into \
+plank and ask it to add them to AGENTS.md.</p>",
+            );
+            copy_all_row(&mut body);
             for l in lines.iter().filter_map(serde_json::Value::as_str) {
-                let _ = write!(body, "<li>{}</li>", html_escape(l));
+                copy_row(&mut body, "p", "instruction", l, true);
             }
-            body.push_str("</ul>");
         }
         if let Some(prompts) = value.get("prompts").and_then(serde_json::Value::as_array) {
             body.push_str("<h3>Prompts to try</h3><div class=\"cards\">");
@@ -1783,7 +2148,7 @@ fn narrative_html(narrative: &Narrative) -> String {
                     let _ = write!(body, "<h3>{}</h3>", html_escape(t));
                 }
                 if let Some(t) = text {
-                    let _ = write!(body, "<pre>{}</pre>", html_escape(t));
+                    copy_row(&mut body, "pre", "snippet", t, false);
                 }
                 body.push_str("</div>");
             }
@@ -1830,8 +2195,106 @@ border-radius:.4rem;padding:.7rem;font:13px/1.5 ui-monospace,SFMono-Regular,Menl
 ul{margin:0;padding-left:1.2rem}li{margin:0 0 .4rem}\
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(18rem,1fr));gap:2rem}\
 .note{color:var(--dim);font-size:.85rem}\
+.delta{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--accent);\
+border-radius:.6rem;padding:.7rem 1rem;margin:0 0 2rem;font-size:.9rem}\
+.delta b{color:var(--accent);font-weight:650}\
+.copyrow{display:flex;align-items:flex-start;gap:.55rem;margin:0 0 .55rem}\
+.copyrow>[data-copy]{flex:1;margin:0}\
+.copyrow p[data-copy]{background:var(--card);border:1px solid var(--line);border-radius:.4rem;padding:.55rem .7rem}\
+.copyrow input.pick{margin:.75rem 0 0;accent-color:var(--accent)}\
+.copy,.copy-all{flex:none;background:var(--card);color:var(--fg);border:1px solid var(--line);\
+border-radius:.4rem;padding:.35rem .7rem;font:inherit;font-size:.8rem;cursor:pointer}\
+.copy:hover,.copy-all:hover{border-color:var(--accent);color:var(--accent)}\
+.copy.ok,.copy-all.ok{border-color:var(--accent);color:var(--accent)}\
+.copyall{margin:0 0 .75rem}\
 footer{color:var(--dim);font-size:.8rem;border-top:1px solid var(--line);padding-top:1rem}\
 ";
+
+/// Clipboard behaviour for the copy controls, inlined for the same reason the
+/// stylesheet is: the report is a private local file and must work with no
+/// network and no assets beside it.
+///
+/// `navigator.clipboard` is unavailable on `file://` in most browsers (not a
+/// secure context), which is exactly where this report is opened, so the
+/// hidden-textarea `execCommand` path is the one that usually runs — it is the
+/// fallback in name only.
+const REPORT_JS: &str = "\
+(function(){\
+function flash(b){var t=b.textContent;b.textContent='Copied';b.classList.add('ok');\
+setTimeout(function(){b.textContent=t;b.classList.remove('ok');},1200);}\
+function legacy(text,b){var ta=document.createElement('textarea');ta.value=text;\
+ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';\
+document.body.appendChild(ta);ta.select();\
+try{if(document.execCommand('copy')){flash(b);}}catch(e){}\
+document.body.removeChild(ta);}\
+function copy(text,b){\
+if(navigator.clipboard&&navigator.clipboard.writeText){\
+navigator.clipboard.writeText(text).then(function(){flash(b);},function(){legacy(text,b);});}\
+else{legacy(text,b);}}\
+function textOf(el){return el?el.innerText:'';}\
+document.addEventListener('click',function(ev){\
+var b=ev.target.closest&&ev.target.closest('button.copy');\
+if(b){var row=b.closest('.copyrow');copy(textOf(row&&row.querySelector('[data-copy]')),b);return;}\
+b=ev.target.closest&&ev.target.closest('button.copy-all');\
+if(!b){return;}\
+var parts=[];\
+b.closest('section').querySelectorAll('.copyrow').forEach(function(r){\
+var pick=r.querySelector('input.pick');\
+if(!pick||pick.checked){parts.push(textOf(r.querySelector('[data-copy]')));}});\
+copy(parts.join('\\n\\n'),b);});\
+})();\
+";
+
+/// The "since the last report" strip: one line of differences, computed not
+/// written.
+///
+/// Only the parts that moved are shown. A run that added sessions but touched
+/// no files should say so by omitting the line counts, not by printing zeros —
+/// the strip is meant to be read at a glance, and a zero reads as a number.
+fn delta_html(d: &Delta, tz_offset: i64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if d.sessions_changed > 0 {
+        parts.push(format!(
+            "{} {}",
+            commas(d.sessions_changed as u64),
+            if d.sessions_changed == 1 {
+                "session new or updated"
+            } else {
+                "sessions new or updated"
+            }
+        ));
+    }
+    if d.prompts > 0 {
+        parts.push(format!("{} prompts", commas(d.prompts.unsigned_abs())));
+    }
+    if d.lines_added > 0 || d.lines_removed > 0 {
+        parts.push(format!(
+            "+{} / −{} lines",
+            commas(d.lines_added.max(0).unsigned_abs()),
+            commas(d.lines_removed.max(0).unsigned_abs())
+        ));
+    }
+    if d.files > 0 {
+        parts.push(format!("{} files", commas(d.files.unsigned_abs())));
+    }
+    if d.commits > 0 {
+        parts.push(format!("{} commits", commas(d.commits.unsigned_abs())));
+    }
+    if !d.new_tools.is_empty() {
+        parts.push(format!("new tools: {}", d.new_tools.join(", ")));
+    }
+    if !d.new_errors.is_empty() {
+        parts.push(format!("new friction: {}", d.new_errors.join(", ")));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<p class=\"delta\"><b>Since {}</b> · {}</p>",
+        html_escape(&datetime_str(d.since, tz_offset)),
+        html_escape(&parts.join(" · "))
+    )
+}
 
 /// Renders the full HTML report.
 #[must_use]
@@ -1879,6 +2342,10 @@ pub fn render_html_cancellable(
         date_str(agg.last_session, tz_offset),
         agg.days_active
     );
+
+    if let Some(d) = agg.delta.as_ref().filter(|d| !d.is_empty()) {
+        let _ = write!(out, "{}", delta_html(d, tz_offset));
+    }
 
     if let Some(glance) = narrative.get("at_a_glance") {
         let mut body = String::new();
@@ -2083,7 +2550,9 @@ prompts.</p><ul>",
         "<footer>Generated locally by plank on {}. Nothing here left this machine.</footer>",
         datetime_str(generated_at, tz_offset)
     );
-    out.push_str("\n</main>\n</body>\n</html>\n");
+    out.push_str("\n</main>\n<script>");
+    out.push_str(REPORT_JS);
+    out.push_str("</script>\n</body>\n</html>\n");
     Some(out)
 }
 
@@ -2429,6 +2898,46 @@ Tool result 3 (read):\nfine\n</tool_result>",
     }
 
     #[test]
+    fn the_repeat_guard_stops_a_repeating_reply_but_not_ordinary_prose() {
+        // The observed failure: a recommendation section that keeps emitting
+        // the same list entry until the token budget runs out.
+        let mut guard = RepeatGuard::new();
+        let mut tripped = false;
+        for _ in 0..20 {
+            if guard.feed("{\"name\": \"Skills\", \"why\": \"you repeat steps\"}, ") {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(tripped, "a repeating list entry must stop the pass");
+
+        // A run of blank lines is the other shape the same failure takes.
+        let mut guard = RepeatGuard::new();
+        assert!(
+            (0..40).any(|_| guard.feed("\n\n\n\n\n\n\n\n")),
+            "a newline run must stop the pass"
+        );
+
+        // Ordinary varied prose, well past the window, must not trip it.
+        let mut guard = RepeatGuard::new();
+        for i in 0..200 {
+            assert!(
+                !guard.feed(&format!(
+                    "sentence {i} says something different about how they work, at length. "
+                )),
+                "varied prose tripped the guard at chunk {i}"
+            );
+        }
+
+        // Neither must a reply full of multi-byte characters: the window is a
+        // byte budget and trimming it must land on a char boundary.
+        let mut guard = RepeatGuard::new();
+        for i in 0..200 {
+            let _ = guard.feed(&format!("\u{2014} r\u{e9}sum\u{e9} {i} \u{2014} "));
+        }
+    }
+
+    #[test]
     fn extract_json_survives_surrounding_prose() {
         let v = extract_json("sure! here you go:\n```json\n{\"a\": {\"b\": \"}\"}}\n```\ndone")
             .expect("nested object with a brace in a string");
@@ -2598,11 +3107,204 @@ Tool result 3 (read):\nfine\n</tool_result>",
             serde_json::json!({"working": "<script>alert(1)</script>"}),
         );
         let html = render_html(&agg, &narrative, 0, 0);
-        assert!(!html.contains("<script>"), "narrative must be escaped");
+        // The report carries exactly one script — its own copy-button
+        // handler — and narrative text can never become a second one.
+        assert!(!html.contains("<script>alert"), "narrative must be escaped");
+        assert_eq!(html.matches("<script>").count(), 1, "only the report's own");
         assert!(html.contains("&lt;script&gt;"));
         // Self-contained: no network references of any kind.
         assert!(!html.contains("http://") && !html.contains("https://"));
         assert!(html.contains("2023-11-14"));
+    }
+
+    /// The scan is already incremental; the model calls were not, and they are
+    /// what takes minutes. A run whose history has barely moved reuses the
+    /// prose it already paid for.
+    #[test]
+    fn the_prose_is_rewritten_only_once_enough_is_new() {
+        // Ten new sessions is enough on any history.
+        assert!(should_rewrite(10, 500));
+        assert!(!should_rewrite(9, 500));
+        // On a small history a tenth of it is enough, so a new user's report
+        // does not freeze on its first night's answers.
+        assert!(should_rewrite(2, 20));
+        assert!(!should_rewrite(1, 20));
+        // Nothing new is never a rewrite, whatever the history's size.
+        assert!(!should_rewrite(0, 0));
+        assert!(!should_rewrite(0, 500));
+    }
+
+    #[test]
+    fn a_session_that_grew_counts_as_changed() {
+        let meta = |id: &str, mtime: u64| SessionMeta {
+            id: id.to_owned(),
+            src_mtime: mtime,
+            ..SessionMeta::default()
+        };
+        let metas = vec![meta("a", 100), meta("b", 200), meta("c", 300)];
+        let state = ReportState {
+            version: STATE_VERSION,
+            seen: seen_map(&metas),
+            ..ReportState::default()
+        };
+        assert_eq!(changed_since(&state, &metas), 0);
+
+        // A session appended to since the last report counts, even though the
+        // session *count* has not moved — which is why this is per session and
+        // not a subtraction of totals.
+        let grown = vec![meta("a", 100), meta("b", 999), meta("c", 300)];
+        assert_eq!(changed_since(&state, &grown), 1);
+        // And so does a session that did not exist before.
+        let added = vec![meta("a", 100), meta("b", 200), meta("c", 300), meta("d", 1)];
+        assert_eq!(changed_since(&state, &added), 1);
+    }
+
+    #[test]
+    fn the_delta_strip_reports_only_what_moved() {
+        let before = Aggregated {
+            sessions_counted: 10,
+            human_messages: 100,
+            lines_added: 500,
+            lines_removed: 50,
+            files_touched: 20,
+            commits: 4,
+            errors: vec![("Command failed".to_owned(), 3)],
+            tools: vec![("bash".to_owned(), 30)],
+            ..Aggregated::default()
+        };
+        let state = ReportState {
+            version: STATE_VERSION,
+            at: 1_700_000_000,
+            snapshot: Snapshot::of(&before),
+            ..ReportState::default()
+        };
+        let now = Aggregated {
+            sessions_counted: 14,
+            human_messages: 160,
+            lines_added: 900,
+            lines_removed: 50,
+            commits: 4,
+            errors: vec![
+                ("Command failed".to_owned(), 5),
+                ("MCP unavailable".to_owned(), 2),
+            ],
+            tools: vec![("bash".to_owned(), 40), ("web".to_owned(), 3)],
+            ..before.clone()
+        };
+        let d = delta(&state, &now, 4);
+        assert_eq!((d.sessions, d.prompts, d.lines_added), (4, 60, 400));
+        assert_eq!(d.new_errors, vec!["MCP unavailable".to_owned()]);
+        assert_eq!(d.new_tools, vec!["web".to_owned()]);
+        assert!(!d.is_empty());
+
+        let html = delta_html(&d, 0);
+        assert!(html.contains("4 sessions new or updated"), "{html}");
+        assert!(
+            html.contains("60 prompts") && html.contains("+400"),
+            "{html}"
+        );
+        // Deletions and commits did not move, so they are not printed as
+        // zeros: the strip is read at a glance and a zero reads as a number.
+        assert!(!html.contains("commits"), "{html}");
+        assert!(html.contains("new friction: MCP unavailable"), "{html}");
+
+        // A report regenerated with nothing new shows no strip at all.
+        let same = delta(&state, &before, 0);
+        assert!(same.is_empty());
+        assert!(delta_html(&same, 0).is_empty());
+    }
+
+    #[test]
+    fn the_state_file_round_trips_and_a_foreign_version_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("plank-insights-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(load_state(&dir).is_none(), "nothing written yet");
+
+        let mut narrative = Narrative::new();
+        narrative.insert("what_works".to_owned(), serde_json::json!({"items": []}));
+        let state = ReportState {
+            version: STATE_VERSION,
+            at: 1_700_000_000,
+            snapshot: Snapshot {
+                sessions_counted: 7,
+                ..Snapshot::default()
+            },
+            narrative,
+            seen: [("a".to_owned(), 12_u64)].into_iter().collect(),
+        };
+        save_state(&dir, &state).expect("write");
+        let back = load_state(&dir).expect("read back");
+        assert_eq!(back.at, 1_700_000_000);
+        assert_eq!(back.snapshot.sessions_counted, 7);
+        assert!(back.narrative.contains_key("what_works"));
+        assert_eq!(back.seen.get("a"), Some(&12));
+
+        // A state file from a build that structured it differently is not
+        // guessed at: the next report is simply a full one.
+        save_state(
+            &dir,
+            &ReportState {
+                version: STATE_VERSION + 1,
+                ..state
+            },
+        )
+        .expect("write");
+        assert!(load_state(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_authoring_sections_get_room_to_write() {
+        // Every report ever generated was missing "Try this next" and
+        // "Features to try": both reason about what to write and then write
+        // it, and the shared budget ran out before the JSON object closed.
+        for spec in SECTIONS {
+            assert!(spec.budget > 0, "{} has no budget", spec.key);
+            let authoring = matches!(spec.key, "suggestions" | "features");
+            assert_eq!(
+                spec.budget > SECTION_TOKENS,
+                authoring,
+                "{} has the wrong budget tier",
+                spec.key
+            );
+        }
+    }
+
+    #[test]
+    fn agents_md_suggestions_are_a_copyable_checklist() {
+        let agg = aggregate(
+            &[SessionMeta {
+                id: "a".to_owned(),
+                human_messages: 4,
+                tools: [("bash".to_owned(), 3)].into_iter().collect(),
+                ..SessionMeta::default()
+            }],
+            0,
+        );
+        let mut narrative = Narrative::new();
+        narrative.insert(
+            "suggestions".to_owned(),
+            serde_json::json!({
+                "agents_md": ["Always run cargo fmt & clippy before committing."],
+                "prompts": [{"title": "Release", "prompt": "cut a beta release"}],
+            }),
+        );
+        let html = render_html(&agg, &narrative, 0, 0);
+        // Each instruction is picked by default, copyable on its own, and
+        // collected by the section's copy-all control.
+        assert!(html.contains("class=\"pick\" checked"), "{html}");
+        assert!(html.contains("class=\"copy-all\""), "{html}");
+        assert_eq!(html.matches("class=\"copyrow\"").count(), 2, "{html}");
+        // Ampersands in an instruction are escaped, not markup.
+        assert!(html.contains("cargo fmt &amp; clippy"), "{html}");
+        // The handler that makes the buttons work ships with the file, and
+        // nothing it needs is fetched.
+        assert!(
+            html.contains("execCommand"),
+            "clipboard fallback is inlined"
+        );
+        assert!(!html.contains("http://") && !html.contains("https://"));
     }
 
     #[test]
@@ -2632,7 +3334,8 @@ Tool result 3 (read):\nfine\n</tool_result>",
         assert!(html.contains("Why for you."));
         // Snippets are code, not markup: braces and quotes survive escaped.
         assert!(html.contains("&quot;PostToolUse&quot;"));
-        assert!(!html.contains("<script>"));
+        // And it is copyable with one click, like every other suggestion.
+        assert!(html.contains("class=\"copy\""), "{html}");
     }
 
     #[test]

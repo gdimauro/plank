@@ -682,6 +682,9 @@ struct FanoutSlot {
     pending_calls: Vec<ToolCall>,
     done: bool,
     error: Option<String>,
+    /// This slot's console window. Opened on the main thread so ordinals
+    /// follow block order, then borrowed by the slot's generation thread.
+    mirror: crate::debugmirror::SubagentMirror,
 }
 
 /// Parses a `/btw <question>` line, returning the question. Accepts a
@@ -925,11 +928,20 @@ fn generate_fanout_round(
                 let collected = sink.clone();
                 // `edit_preflight` is not `Clone`, so build one per slot.
                 let preflight = edit_preflight_cwd(cwd);
-                let engine = slot.engine.as_mut();
+                // Split the slot's two borrows apart explicitly: `engine` is
+                // taken mutably while `mirror` is only read, and destructuring
+                // is what lets the borrow checker see they are disjoint fields.
+                let FanoutSlot { engine, mirror, .. } = slot;
+                let engine = engine.as_mut();
                 handles.push((
                     i,
                     collected,
                     scope.spawn(move || {
+                        // First statement in the thread: everything this slot
+                        // generates goes to its own window. The guard's life is
+                        // exactly the thread's, and the thread is exactly one
+                        // slot.
+                        let _active = mirror.activate();
                         generate_pass(
                             engine,
                             prompt,
@@ -1215,6 +1227,15 @@ struct Agent<'a> {
     /// is empty, which would wipe the restored token transcript and rewind the
     /// KV to the session-context boundary, re-prefilling the conversation.
     payload_restored: bool,
+    /// Set by any turn that moved the transcript; cleared by a payload save.
+    payload_dirty: bool,
+    /// Depth-indexed KV snapshots for this session, newest turn last.
+    ladder: crate::kvladder::KvLadder,
+    /// Set when a `/btw` aside answered on the *live* engine has pushed the
+    /// engine's end past the transcript an anchor would be signed against, and
+    /// consumed by the next anchor point. See
+    /// [`Agent::anchor_rung_before_tool_result`].
+    btw_diverged_engine: bool,
     /// Byte length of `system`'s trusted control-text prefix, handed to the
     /// engine so it tokenizes that span as rendered chat, and folded into the
     /// Tier 1 KV key so a checkpoint written under a different split is never
@@ -1590,12 +1611,6 @@ impl Drop for TitleRestore {
     }
 }
 
-/// Token budget for one `/insights` narrative section, covering the model's
-/// reasoning and the JSON answer that follows it.
-///
-/// Generous enough to think and then answer, bounded so one wandering reply
-/// costs that section rather than the user's afternoon.
-const INSIGHTS_SECTION_TOKENS: i32 = 3000;
 /// Maximum user turns `/history` accepts.
 const HISTORY_MAX_TURNS: usize = 200;
 /// Name of the auto-checkpoint saved before a `/rollback`, so a rollback is
@@ -1676,6 +1691,7 @@ impl Agent<'_> {
         // remote client attached to this session renders off it.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(sink);
+        stream.set_freeze_on_error(true);
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
@@ -1775,6 +1791,7 @@ impl Agent<'_> {
                             prefill_done: p.done,
                             prefill_total: p.total,
                             prefill_label: verb,
+                            thinking: stream.in_think(),
                             prefill_tps: p.tps,
                             elapsed_secs: turn_start.elapsed().as_secs_f64(),
                             ctx_used: prompt_tokens,
@@ -2096,7 +2113,15 @@ impl Agent<'_> {
             }
             SubSinkTarget::Null | SubSinkTarget::Stdout => None,
         };
-        let result = self.run_subagent_rounds();
+        // Its own console window, on the same restore-on-every-exit-path
+        // discipline as the status sink above. The guard is scoped to the
+        // rounds, so nesting works for free: guards stack LIFO, matching
+        // `fork_kv`.
+        let mirror = crate::debugmirror::open_subagent();
+        let result = {
+            let _active = mirror.activate();
+            self.run_subagent_rounds()
+        };
         self.tool_ctx.status_sink = parent_sink;
         result
     }
@@ -2246,11 +2271,16 @@ fn generate_pass(
     // this reports the engine actually generating rather than the session's.
     let _local = engine.is_local().then(crate::status::LocalPass::begin);
     let mut stream = StreamRenderer::new(sink);
+    stream.set_freeze_on_error(true);
     stream.set_preflight(preflight);
     stream.set_thinking_tool_calls(ctx.thinking_tool_calls);
     stream.set_tool_names(ctx.tool_names.clone());
     if !ctx.think_off && !engine.wants_structured() {
         stream.begin_in_think();
+        // Same guard as the parent paths: the local chat template pre-opens
+        // `<think>` without emitting the tag, and the console only ever sees
+        // bytes, so it needs the tag injected to reach the same state.
+        crate::debugmirror::begin_in_think();
     }
     let mut assistant_text = String::new();
     let preflight_stop = AtomicBool::new(false);
@@ -2278,6 +2308,10 @@ fn generate_pass(
                 if let EngineEvent::Text(t) = ev {
                     assistant_text.push_str(&t);
                     stream.push(&t);
+                    // Tee to whichever console window this thread is routed to
+                    // — a sub-agent's when a `SubagentMirror` guard is active,
+                    // the parent's otherwise.
+                    crate::debugmirror::push(&t);
                     greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
                     if stream.preflight_error().is_some() {
                         preflight_stop.store(true, Ordering::Relaxed);
@@ -2287,6 +2321,7 @@ fn generate_pass(
         )
         .map_err(|e| e.to_string())?;
     stream.finish();
+    crate::debugmirror::flush();
     let preflight_error = stream.preflight_error().map(str::to_owned);
     if stats.interrupted && preflight_error.is_none() {
         crate::interrupt::clear();
@@ -2383,6 +2418,7 @@ impl Agent<'_> {
                 finished.ended_in_think && turn_continues,
             );
             self.session.push(Message::assistant(assistant_text));
+            self.payload_dirty = true;
             let st = Status {
                 state: if stats.interrupted {
                     WorkerState::Stopped
@@ -2412,6 +2448,7 @@ impl Agent<'_> {
                     print_footer(&st, self.color);
                 }
                 self.last_turn_interrupted = true;
+                self.save_payload_if_dirty();
                 if crate::notify::should_notify_complete(
                     turn_start.elapsed(),
                     crate::settings::active().ui.notify_after_secs,
@@ -2455,6 +2492,10 @@ impl Agent<'_> {
                     };
                     println!("{line}");
                 }
+                // The KV snapshot that makes micro-compaction cheap: taken
+                // here, the rung sits at exactly the index this result will
+                // occupy, which is the index microcompact will later rewrite.
+                self.anchor_rung_before_tool_result(observations.len());
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
@@ -2504,6 +2545,7 @@ impl Agent<'_> {
                     ))
                 );
             }
+            self.flush_kv_end_of_turn();
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
             self.fire_turn_end(stats.generated, turn_start.elapsed());
@@ -2525,6 +2567,7 @@ impl Agent<'_> {
         let (stream, text, stats) = self.stream_generation(&prompt_text, Instant::now())?;
         let finished = stream.finished();
         self.session.push(Message::assistant(text.clone()));
+        self.payload_dirty = true;
         // The flag handling here is exactly `run_turn`'s for a cut-off turn:
         // record it on `last_turn_interrupted` and clear the
         // process-wide SIGINT flag here. Leaving that flag raised would return
@@ -2618,9 +2661,19 @@ impl Agent<'_> {
             // cost the user another whole iteration — and read as `Cap` rather
             // than `Interrupted` if that was the last one.
             if self.last_turn_interrupted || crate::interrupt::pending() {
+                // The adjudication prompt+reply just pushed onto `self.session`
+                // is the last thing this exit reaches: `drive_goal_loop`
+                // returns straight to `run_goal_loop`, with no later
+                // `run_turn` call to save it. Persist it here, at the one
+                // point where the transcript and the engine's live KV agree.
+                self.save_payload_if_dirty();
                 return Ok((crate::goal::Outcome::Interrupted, iter, String::new()));
             }
             if let Some(o) = crate::goal::Outcome::from_verdict(adj.verdict) {
+                // Same reasoning as above: a settled verdict ends the loop
+                // right after the adjudication exchange, with no further
+                // `run_turn` to catch the dirty payload.
+                self.save_payload_if_dirty();
                 return Ok((o, iter, adj.reason));
             }
             if self
@@ -2629,6 +2682,7 @@ impl Agent<'_> {
                 .expect("goal is live inside its own loop")
                 .at_cap()
             {
+                self.save_payload_if_dirty();
                 return Ok((crate::goal::Outcome::Cap, iter, adj.reason));
             }
         }
@@ -2940,6 +2994,12 @@ impl Agent<'_> {
     /// context to skip full compaction, `None` when full compaction is still
     /// needed (any clearing done is kept — it only helps the summary pass).
     fn try_microcompact(&mut self) -> Option<usize> {
+        if !crate::settings::active().context.microcompact {
+            return None;
+        }
+        if let Some(edit) = compact::microcompact_first_index(&self.session.transcript) {
+            self.restore_rung_below(edit);
+        }
         let (cleared, _) = compact::microcompact(&mut self.session.transcript);
         if cleared == 0 {
             return None;
@@ -2969,9 +3029,43 @@ impl Agent<'_> {
     /// eager pass that reclaims little costs more than it saves — only fire
     /// when the cleared results are worth the prefix rebuild.
     fn try_microcompact_opportunistic(&mut self) -> Option<usize> {
+        if !crate::settings::active().context.microcompact {
+            return None;
+        }
         let reclaimable = compact::microcompact_reclaimable(&self.session.transcript);
         if reclaimable < compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES {
             return None;
+        }
+        let edit = compact::microcompact_first_index(&self.session.transcript)?;
+        let rendered = render_transcript(&self.session, &self.system);
+        let total = self.engine.count_tokens(&rendered);
+        // Decide BEFORE touching the engine. `restore_rung_below` calls
+        // `set_kv`, which replaces the engine's KV rows *and* its token span
+        // buffer with the rung's shorter prefix — so restoring and then
+        // refusing throws away a cache covering the whole live transcript for
+        // a rewrite that never happens, and the next turn re-prefills exactly
+        // the tail the gate just declined to spend. Ask the ladder what a
+        // restore would cover, gate on that, and only then restore.
+        let covered = self.ladder.select(edit, 0).map_or(0, |r| r.tokens);
+        // Whatever the rung does not cover is re-prefilled next turn.
+        let ctx_size = self.engine.ctx_size();
+        if !compact::microcompact_is_worth_it(reclaimable, total - covered, ctx_size, total) {
+            crate::engine::kv_debug(|| {
+                format!(
+                    "microcompact gate refused: reclaimable={reclaimable}B total={total} rung_covers={covered} reprefill={} ctx_used={total} ctx_size={ctx_size} floor={:.2}",
+                    total - covered,
+                    compact::microcompact_floor(ctx_size, total)
+                )
+            });
+            return None;
+        }
+        let restored = self.restore_rung_below(edit);
+        if restored.is_none() && covered > 0 {
+            crate::engine::kv_debug(|| {
+                format!(
+                    "microcompact rung restore MISSED: expected rung to cover {covered} tokens at edit span {edit}, restore did not happen"
+                )
+            });
         }
         let (cleared, _) = compact::microcompact(&mut self.session.transcript);
         self.last_ctx_used = 0;
@@ -3022,6 +3116,15 @@ impl Agent<'_> {
             self.session.push(Message::user(block));
         }
         self.last_ctx_used = 0;
+        // Every rung snapshots a prefix of the transcript just replaced, so all
+        // of them died with it. Left in place they would freeze the ladder for
+        // the rest of the session: post-compaction token counts are by
+        // construction far below the pre-compaction deepest rung, so
+        // `wants_anchor` would refuse every new capture, and `select` would keep
+        // returning rungs whose truncated render can no longer be fingerprinted
+        // — the ladder would be permanently dead from the first full compaction
+        // onward, the moment it is most needed.
+        self.discard_ladder();
     }
 
     /// The `trigger` value compaction hooks receive: `manual` for a user-driven
@@ -3646,6 +3749,7 @@ impl Agent<'_> {
             }
             "/quit" | "/exit" => return Ok(false),
             "/new" | "/clear" => {
+                self.discard_ladder();
                 self.session = Session::new();
                 // A new session, a new name — minted here for the same reason
                 // `new_agent` mints one at launch (see `SessionStore::mint_id`).
@@ -3754,6 +3858,7 @@ impl Agent<'_> {
                     if let Some(note) = self.load_session_payload(&s) {
                         println!("{}", self.debug_line(&note));
                     }
+                    self.discard_ladder();
                     self.session = s;
                     crate::debugmirror::set_session_id(&self.session.id);
                     self.broadcast_session_reset(Some(
@@ -3791,6 +3896,7 @@ impl Agent<'_> {
                     if let Some(note) = self.load_session_payload(&s) {
                         println!("{}", self.debug_line(&note));
                     }
+                    self.discard_ladder();
                     self.session = s;
                     crate::debugmirror::set_session_id(&self.session.id);
                     self.broadcast_session_reset(Some(
@@ -4109,7 +4215,7 @@ impl Agent<'_> {
                         self.last_edited = Some(path);
                     }
                     Ok(Insights::Cancelled) => println!("insights cancelled"),
-                    Err(e) => println!("insights failed: {e}\nusage: /insights [fast]"),
+                    Err(e) => println!("insights failed: {e}\nusage: /insights [fast|fresh]"),
                 }
             }
             "/repro" => match self.write_repro(arg) {
@@ -4285,6 +4391,7 @@ impl Agent<'_> {
         // avoids that. Best-effort — a stale or absent one just falls back to
         // prefill, which is the behavior this path had unconditionally.
         let note = self.load_session_payload(&session);
+        self.discard_ladder();
         self.session = session;
         crate::debugmirror::set_session_id(&self.session.id);
         self.last_ctx_used = 0;
@@ -4520,6 +4627,29 @@ the original is frozen and listed in /tree"
         }
         // No KV support (echo stub) or nothing prefilled yet: nothing to save.
         let cache = self.engine.get_kv()?;
+        self.store_payload(&cache)
+    }
+
+    /// Writes an already-captured KV as the session payload. Split out of
+    /// [`Agent::save_session_payload`] so a caller that already holds a `get_kv`
+    /// can store it without paying for a second capture of the same bytes. (It
+    /// was originally split so the end-of-turn flush could serve both the
+    /// payload and a ladder rung from one capture; turn-end rung capture is
+    /// gone — rungs are anchored before a tool result instead — but the
+    /// already-captured entry point stays useful.)
+    fn store_payload(&mut self, cache: &crate::kvcache::KVCache) -> Option<String> {
+        if self.session.id.is_empty() {
+            return None;
+        }
+        // Same ordering note as `push_rung`, on the payload side: on a turn
+        // where the opportunistic microcompact fired, `cache` here is the
+        // engine's KV for the RESTORED rung's shorter prefix, but the
+        // fingerprint below is computed from `self.session`, i.e. the
+        // POST-rewrite transcript. So the blob's bytes and its signature
+        // describe two different token spans. Safe on read-back for the same
+        // reason: `set_kv` restores the blob's own span buffer, and
+        // `ds4_session_common_prefix` decides reuse by real token comparison,
+        // not by trusting the fingerprint's span. Recorded, not restructured.
         let key = crate::session::KvKey::Session {
             id: self.session.id.clone(),
             fp: self.payload_fingerprint_for(&self.session),
@@ -4545,7 +4675,7 @@ the original is frozen and listed in /tree"
         };
         match self
             .store
-            .kv_store_labeled(&key, &cache, parent, &self.engine.model_name(), &label)
+            .kv_store_labeled(&key, cache, parent, &self.engine.model_name(), &label)
         {
             Ok(()) => Some(format!(
                 "saved KV payload ({:.2} MB)",
@@ -4553,6 +4683,219 @@ the original is frozen and listed in /tree"
             )),
             Err(e) => Some(format!("KV payload save failed: {e}")),
         }
+    }
+
+    /// Persists the session KV payload when the transcript has moved since the
+    /// last save. Called at end of turn and after an interrupt, so a crash or
+    /// kill leaves a resumable payload rather than a transcript alone.
+    ///
+    /// Capture measured at ~0.4s for 400 MB, against turns that spend minutes
+    /// in prefill. The flag clears regardless of outcome: a backend with no KV
+    /// must not retry every turn.
+    fn save_payload_if_dirty(&mut self) -> Option<String> {
+        if !self.payload_dirty {
+            return None;
+        }
+        self.payload_dirty = false;
+        self.save_session_payload()
+    }
+
+    /// End-of-turn KV persistence: the session payload, when the transcript
+    /// has moved.
+    ///
+    /// This used to also push a ladder rung, sharing the one `get_kv`. It no
+    /// longer does. A turn-end rung lands at `spans == transcript.len()` after
+    /// a whole turn of tool traffic, and `microcompact` clears OLDEST-first, so
+    /// the edit index it must predate sits *near the start* of the transcript —
+    /// in the measured 18-turn run the shallowest turn-end rung was at spans=6
+    /// against an edit at index 5, missing by one span, and the ladder was
+    /// never used once. Turn ends are simply the wrong instant: within one turn
+    /// the transcript jumps from 1 span to 6, so no turn boundary exists at a
+    /// usable depth. Rungs now come from [`Agent::anchor_rung_before_tool_result`],
+    /// which captures at exactly the index a large tool result will occupy.
+    /// Keeping both would also have turn-end rungs competing for the three
+    /// [`crate::kvladder::LADDER_MAX_RUNGS`] slots and evicting anchors that
+    /// can actually be selected.
+    ///
+    /// Best-effort as before: the dirty flag clears regardless of outcome, so a
+    /// backend with no KV does not retry every turn.
+    fn flush_kv_end_of_turn(&mut self) {
+        self.save_payload_if_dirty();
+    }
+
+    /// Forgets the live session's ladder and deletes its blobs.
+    ///
+    /// Every rung is a snapshot of *this* session's KV prefix, so anything that
+    /// replaces or rewrites the transcript — `/new`, `/clear`, `/switch`,
+    /// `/resume`, a full compaction, exit — invalidates all of them at once.
+    /// Leaving the ladder in place is worse than useless: `wants_anchor` keeps
+    /// comparing against a stale rung's token count, so a smaller fresh
+    /// transcript looks already covered and no capture ever happens again,
+    /// while `select` hands back rungs whose prefix no longer exists.
+    /// Best-effort: a failed delete must never fail a turn or an exit.
+    fn discard_ladder(&mut self) {
+        if !self.session.id.is_empty() {
+            let _ = self.store.remove_rungs(&self.session.id);
+        }
+        self.ladder = crate::kvladder::KvLadder::new();
+    }
+
+    /// Captures an *anchor* rung immediately before a tool result of
+    /// `body_len` bytes is appended to the transcript.
+    ///
+    /// This is the rung placement that makes the ladder usable at all. At this
+    /// instant `session.transcript.len()` is exactly the index that result will
+    /// occupy, which is exactly the index [`compact::microcompact_first_index`]
+    /// will later report as the edit point when that body is cleared — so
+    /// [`crate::kvladder::KvLadder::select`]'s `spans <= edit` holds with
+    /// equality, the best a rung can do. Only bodies over
+    /// [`compact::MICROCOMPACT_MIN_BYTES`] can ever enter the clear set, so
+    /// nothing smaller is worth anchoring.
+    ///
+    /// The KV/transcript invariant holds here: the caller has already pushed
+    /// the assistant message carrying the tool call
+    /// (`session.push(Message::assistant(...))` runs before the dispatch), and
+    /// the engine's KV covers the prompt it was given plus the tokens it just
+    /// generated — i.e. the transcript exactly as it now stands. The rung is
+    /// signed with `payload_fingerprint_for(&self.session)` over that same
+    /// state, and [`Agent::restore_rung_below`] reproduces it by truncating to
+    /// `rung.spans`, which is a no-op here since `spans == transcript.len()`.
+    ///
+    /// Cost control, in order: an unnamed session has nowhere to store a rung;
+    /// with `context.microcompact` off nothing will ever rewrite the transcript
+    /// so there is nothing to anchor for; and
+    /// [`crate::kvladder::KvLadder::wants_anchor`] suppresses an anchor the
+    /// ladder already covers or that buys too little depth. `count_tokens` is
+    /// cheap and runs before `get_kv`, so a suppressed anchor pays no capture.
+    ///
+    /// Best-effort throughout: no failure here may fail a turn.
+    fn anchor_rung_before_tool_result(&mut self, body_len: usize) {
+        // A `/btw` answered on the live engine since the last main generation
+        // left the engine's end beyond this transcript; a rung signed here would
+        // be a false claim of coverage (see `drain_btw_inner`). Consume the mark
+        // rather than only reading it: the next main generation re-syncs the
+        // engine to the transcript, so exactly one anchor point is unsafe.
+        if std::mem::take(&mut self.btw_diverged_engine) {
+            crate::engine::kv_debug(|| {
+                "ladder capture: skipped — a /btw aside ran on the live engine".to_owned()
+            });
+            return;
+        }
+        if body_len <= compact::MICROCOMPACT_MIN_BYTES || self.session.id.is_empty() {
+            return;
+        }
+        if !crate::settings::active().context.microcompact {
+            return;
+        }
+        let spans = self.session.transcript.len();
+        let rendered = render_transcript(&self.session, &self.system);
+        let tokens = self.engine.count_tokens(&rendered);
+        if !self.ladder.wants_anchor(spans, tokens) {
+            return;
+        }
+        let Some(cache) = self.engine.get_kv() else {
+            return;
+        };
+        self.push_rung(&cache, tokens);
+    }
+
+    /// Records a rung for an already-captured KV, writing its blob and
+    /// deleting whatever it displaced. Best-effort throughout.
+    ///
+    /// Note on the signature: a rung captured on a turn where the
+    /// opportunistic microcompact fired is signed with the POST-rewrite
+    /// transcript's fingerprint while the engine's spans are still the
+    /// PRE-rewrite ones. That is not a correctness problem — reuse is decided
+    /// by a real token comparison in `ds4_session_common_prefix`, and `set_kv`
+    /// restores the blob's own span buffer — but it does mean `rung.tokens` can
+    /// overstate what the blob covers, and that number feeds
+    /// `KvLadder::select`. Recorded rather than restructured: the overstatement
+    /// is bounded by one pass's rewrite and only ever makes the ladder look
+    /// slightly better than it is.
+    fn push_rung(
+        &mut self,
+        cache: &crate::kvcache::KVCache,
+        tokens: i32,
+    ) -> Option<crate::kvladder::Rung> {
+        if self.session.id.is_empty() {
+            return None;
+        }
+        let spans = self.session.transcript.len();
+        let (rung, evicted) = self.ladder.push(spans, tokens);
+        let key = crate::session::KvKey::Rung {
+            id: self.session.id.clone(),
+            index: rung.index,
+            fp: self.payload_fingerprint_for(&self.session),
+        };
+        let label = crate::kvmeta::KvLabel::Rung {
+            session: self.session.id.clone(),
+            spans,
+            tokens,
+        };
+        let _ = self
+            .store
+            .kv_store_labeled(&key, cache, None, &self.engine.model_name(), &label);
+        if let Some(old) = evicted {
+            let _ = std::fs::remove_file(self.store.rung_path(&self.session.id, old.index));
+            let _ = std::fs::remove_file(
+                self.store
+                    .rung_path(&self.session.id, old.index)
+                    .with_extension("json"),
+            );
+        }
+        crate::engine::kv_debug(|| {
+            format!(
+                "ladder capture: anchor rung {} at spans={spans} tokens={tokens}{}",
+                rung.index,
+                evicted.map_or_else(String::new, |e| format!(" (evicted rung {})", e.index))
+            )
+        });
+        Some(rung)
+    }
+
+    /// Before an edit at transcript index `edit_index`, restores the deepest
+    /// ladder rung that predates it. Returns the tokens the restored rung
+    /// covers, or `None` when no rung is usable.
+    ///
+    /// Rewriting a message in place makes every token from `edit_index` on
+    /// diverge from the live KV, and `ds4_session_sync` reuses the live KV only
+    /// when the prompt extends its live end — so without this the next
+    /// generation rebuilds from token zero, discarding a still-valid prefix. A
+    /// rung that predates the edit is a legitimate restore point: the engine
+    /// extends forward from it and prefills only the genuine remainder.
+    ///
+    /// The lookup fingerprint is computed over the transcript *truncated to
+    /// the rung's own `spans`*, not the full current transcript: a rung is
+    /// stored under the fingerprint of its prefix as it stood at capture time
+    /// (`refresh_ladder`, where `spans == session.transcript.len()` at that
+    /// moment). By restore time the transcript has grown further, so
+    /// fingerprinting it in full would never match what the rung was signed
+    /// with, and `kv_load` would silently miss on every call. Truncating a
+    /// cloned session's transcript to `rung.spans` before fingerprinting
+    /// reproduces the capture-time render exactly, because `render_transcript`
+    /// is a plain forward concatenation with no length-dependent formatting.
+    fn restore_rung_below(&mut self, edit_index: usize) -> Option<i32> {
+        if self.session.id.is_empty() {
+            return None;
+        }
+        let rung = *self.ladder.select(edit_index, 0)?;
+        let mut prefix = self.session.clone();
+        prefix.transcript.truncate(rung.spans);
+        let key = crate::session::KvKey::Rung {
+            id: self.session.id.clone(),
+            index: rung.index,
+            fp: self.payload_fingerprint_for(&prefix),
+        };
+        // A stale or unloadable rung just means the rebuild happens anyway.
+        let cache = self.store.kv_load(&key)?;
+        self.engine.set_kv(&cache).ok()?;
+        crate::engine::kv_debug(|| {
+            format!(
+                "ladder restore: rung {} (spans={} tokens={}) for edit at span {edit_index}",
+                rung.index, rung.spans, rung.tokens
+            )
+        });
+        Some(rung.tokens)
     }
 
     /// On `/switch` / `/resume`, tries to restore the session's KV payload so
@@ -4699,6 +5042,7 @@ the original is frozen and listed in /tree"
     /// picker), so the three cannot drift on what "replace the session" clears.
     fn adopt_session(&mut self, s: Session, log: &mut OutputLog, sub: &mut tui::SubPane) {
         let note = self.load_session_payload(&s);
+        self.discard_ladder();
         self.session = s;
         crate::debugmirror::set_session_id(&self.session.id);
         self.broadcast_session_reset(Some(
@@ -5091,6 +5435,10 @@ the original is frozen and listed in /tree"
         use crate::insights;
 
         let fast = matches!(arg.trim(), "fast" | "--fast" | "quick");
+        // `fresh` overrides the reuse below: the prose is written again even
+        // when nothing much has changed, for when the last answer was wrong
+        // rather than stale.
+        let fresh = matches!(arg.trim(), "fresh" | "--fresh" | "full");
         let root = insights::usage_dir();
         let tz = insights::local_utc_offset();
 
@@ -5145,7 +5493,40 @@ the original is frozen and listed in /tree"
         // was never invoked or a hook that never fired.
         agg.extensions = self.extension_inventory();
 
+        // What the last report knew. Two uses: how much is genuinely new
+        // (below), and what the report subtracts from for its "since" strip.
+        let previous = insights::load_state(&root);
+        let changed = previous
+            .as_ref()
+            .map_or(metas.len(), |st| insights::changed_since(st, &metas));
+        if let Some(st) = previous.as_ref() {
+            let d = insights::delta(st, &agg, changed);
+            if !d.is_empty() {
+                agg.delta = Some(d);
+            }
+        }
+
         let mut narrative = insights::Narrative::new();
+        // Reuse the prose while the picture behind it has barely moved. The
+        // sections describe habits, and habits do not change because two more
+        // sessions exist — but writing them costs minutes, every run. A
+        // section the previous run *dropped* is absent from what is reused and
+        // so is written now, which is how a report recovers from a bad night.
+        let reusing = !fast
+            && !fresh
+            && previous.as_ref().is_some_and(|st| {
+                // Both sides count session *files*: the numerator is any
+                // session written to since, so the denominator is all of
+                // them, not the subset substantive enough to report on.
+                !st.narrative.is_empty() && !insights::should_rewrite(changed, metas.len())
+            });
+        if reusing && let Some(st) = previous.as_ref() {
+            narrative.clone_from(&st.narrative);
+            note(format!(
+                "[reusing the written sections from {} · {changed} sessions new or updated]",
+                crate::insights::datetime_str(st.at, tz)
+            ));
+        }
         if agg.sessions_counted == 0 {
             note("[no sessions substantial enough to report on]".to_owned());
         } else if fast {
@@ -5158,6 +5539,10 @@ the original is frozen and listed in /tree"
         } else {
             let context = insights::narrative_context(&agg);
             for spec in insights::SECTIONS {
+                // Already reused from the previous report.
+                if narrative.contains_key(spec.key) {
+                    continue;
+                }
                 if crate::interrupt::pending() {
                     note("[interrupted; writing what is ready]".to_owned());
                     break;
@@ -5175,62 +5560,111 @@ the original is frozen and listed in /tree"
                     insights::ANALYST_SYSTEM,
                     insights::section_prompt(spec, &context)
                 );
-                let mut reply = String::new();
-                // Stream the reasoning as it arrives, the way an ordinary
-                // turn does, so the wait is legible rather than blank.
-                let mut ticker = insights::ThinkTicker::new();
-                // A section is a paragraph or a short list, and the section
-                // budget is what stops one wandering reply from making the
-                // whole report take minutes. The session's own generation
-                // limit is meant for a coding turn and is far too generous
-                // here.
-                let opts = crate::engine::GenerationOptions {
-                    n_predict: INSIGHTS_SECTION_TOKENS,
-                    // Thinking stays on so there is something to show while
-                    // the section is written: a couple of silent minutes per
-                    // section reads as a hang. The budget below covers the
-                    // reasoning and the answer together, and `extract_json`
-                    // takes the answer from after the think block.
-                    think_mode: crate::engine::ThinkMode::Medium,
-                    ..self.cfg.generation.clone()
-                };
-                let stop = AtomicBool::new(false);
-                let generated = self.generate_aside_best(
-                    &prompt,
-                    &opts,
-                    &|| stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
-                    &mut |ev| {
-                        if let crate::engine::EngineEvent::Text(t) = ev {
-                            reply.push_str(&t);
-                            for line in ticker.feed(&t) {
-                                tick(line);
+                // Two attempts. The first thinks, because a couple of silent
+                // minutes per section reads as a hang and the streamed
+                // reasoning is what fills the wait. If it yields no JSON —
+                // the budget went on reasoning, or the reply went in circles
+                // — the retry turns thinking off and spends the whole budget
+                // on the answer. That retry is what the two authoring
+                // sections needed: they were absent from every report ever
+                // generated, and nothing said so but a dim line that
+                // scrolled past.
+                let mut value = None;
+                let mut failure = String::new();
+                let mut stopped = false;
+                for think_mode in [
+                    crate::engine::ThinkMode::Medium,
+                    crate::engine::ThinkMode::Off,
+                ] {
+                    let mut reply = String::new();
+                    // Stream the reasoning as it arrives, the way an ordinary
+                    // turn does, so the wait is legible rather than blank.
+                    let mut ticker = insights::ThinkTicker::new();
+                    // A degenerate reply repeats one clause until the budget
+                    // runs out; stopping it early is the difference between a
+                    // dropped section and minutes of visible nonsense.
+                    let mut guard = insights::RepeatGuard::new();
+                    let mut looped = false;
+                    let opts = crate::engine::GenerationOptions {
+                        // Per section: the two that must *write* something to
+                        // paste get more, because they reason about what to
+                        // write and then write it.
+                        n_predict: spec.budget,
+                        think_mode,
+                        ..self.cfg.generation.clone()
+                    };
+                    let stop = AtomicBool::new(false);
+                    let generated = self.generate_aside_best(
+                        &prompt,
+                        &opts,
+                        &|| stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+                        &mut |ev| {
+                            if let crate::engine::EngineEvent::Text(t) = ev {
+                                reply.push_str(&t);
+                                for line in ticker.feed(&t) {
+                                    tick(line);
+                                }
+                                if guard.feed(&t) {
+                                    looped = true;
+                                    stop.store(true, Ordering::Relaxed);
+                                }
+                                // `tick` is where the TUI reads the keyboard,
+                                // so polling here is what turns an Esc pressed
+                                // mid-sentence into a stopped generation rather
+                                // than one noticed at the next section
+                                // boundary.
+                                if crate::interrupt::pending() {
+                                    stop.store(true, Ordering::Relaxed);
+                                }
                             }
-                            // `tick` is where the TUI reads the keyboard, so
-                            // polling here is what turns an Esc pressed
-                            // mid-sentence into a stopped generation rather
-                            // than one noticed at the next section boundary.
-                            if crate::interrupt::pending() {
-                                stop.store(true, Ordering::Relaxed);
-                            }
+                        },
+                    );
+                    // A section the user stopped is not a section that failed:
+                    // say nothing about it and leave, rather than reporting it
+                    // "unavailable" and trying the next one. The model's own
+                    // loop raises the same flag, so it is ruled out first.
+                    if !looped && generated.as_ref().is_ok_and(|s| s.interrupted) {
+                        stopped = true;
+                        break;
+                    }
+                    match generated.map_err(|e| e.to_string()).and_then(|_| {
+                        if looped {
+                            return Err("the model looped".to_owned());
                         }
-                    },
-                );
-                // A section the user stopped is not a section that failed:
-                // say nothing about it and leave the loop, rather than
-                // reporting it "unavailable" and trying the next one.
-                if generated.as_ref().is_ok_and(|s| s.interrupted) {
+                        insights::extract_json(&reply).ok_or_else(|| "no JSON in reply".to_owned())
+                    }) {
+                        Ok(v) => {
+                            value = Some(v);
+                            break;
+                        }
+                        Err(e) => failure = e,
+                    }
+                    if crate::interrupt::pending() {
+                        stopped = true;
+                        break;
+                    }
+                    note(format!(
+                        "[“{}” came back unusable ({failure}); retrying without thinking]",
+                        spec.heading
+                    ));
+                }
+                if stopped {
                     note("[stopped; writing the report as it stands]".to_owned());
                     break;
                 }
-                match generated.map_err(|e| e.to_string()).and_then(|_| {
-                    insights::extract_json(&reply).ok_or_else(|| "no JSON in reply".to_owned())
-                }) {
-                    Ok(value) => {
-                        narrative.insert(spec.key.to_owned(), value);
-                    }
+                if let Some(value) = value {
+                    narrative.insert(spec.key.to_owned(), value);
+                } else {
                     // A section that fails is a section the report goes
-                    // without; it never costs the statistics.
-                    Err(e) => note(format!("[“{}” unavailable: {e}]", spec.heading)),
+                    // without; it never costs the statistics. It is written to
+                    // the error log as well, because a dropped section leaves
+                    // no trace in the finished report — which is how two of
+                    // them stayed missing for as long as they did.
+                    crate::errlog::log_error(
+                        "insights",
+                        &format!("section \"{}\" dropped: {failure}", spec.key),
+                    );
+                    note(format!("[“{}” unavailable: {failure}]", spec.heading));
                 }
             }
             crate::interrupt::clear();
@@ -5254,6 +5688,26 @@ the original is frozen and listed in /tree"
             return Ok(Insights::Cancelled);
         };
         let path = insights::write_report(&root, &html, tz, at)?;
+        // Only after the report is on disk: a state file describing a report
+        // that was never written would make the next run reuse prose the user
+        // has never seen, and skip the sessions it claims to have covered.
+        // A failure here costs the next run its shortcut, nothing more.
+        //
+        // Never from a `fast` run: it has no prose to remember, and recording
+        // its scan as "covered" would leave the next full run comparing
+        // against a report that never had sections to reuse.
+        if !fast {
+            let _ = insights::save_state(
+                &root,
+                &insights::ReportState {
+                    version: insights::STATE_VERSION,
+                    at,
+                    snapshot: insights::Snapshot::of(&agg),
+                    narrative: narrative.clone(),
+                    seen: insights::seen_map(&metas),
+                },
+            );
+        }
         Ok(Insights::Done {
             path,
             summary: insights::render_summary(&agg, &narrative, tz, at),
@@ -5327,6 +5781,10 @@ the original is frozen and listed in /tree"
         // every transcript push, task update, and tag, and cleared on save and
         // load.
         if !self.session.dirty {
+            // Rungs are process-scoped and hundreds of MB each, so they must go
+            // even when there is no transcript worth rewriting — a clean exit
+            // used to return here and leave the whole ladder on disk.
+            self.discard_ladder();
             return None;
         }
         let id = self.save_session().ok()?;
@@ -5336,6 +5794,9 @@ the original is frozen and listed in /tree"
         // at local prefill speeds. `/save` has always captured the payload; the
         // exit path is where sessions actually get saved.
         let _ = self.save_session_payload();
+        // The exit payload supersedes the ladder; leaving rungs behind would
+        // hold hundreds of MB per session against the cache byte budget.
+        self.discard_ladder();
         let path = self
             .store
             .find(&id)
@@ -5708,6 +6169,7 @@ the original is frozen and listed in /tree"
                         pending_calls: Vec::new(),
                         done: false,
                         error: None,
+                        mirror: crate::debugmirror::open_subagent(),
                     });
                 }
                 Ok((key, engine)) => {
@@ -7117,7 +7579,7 @@ impl Agent<'_> {
             crate::logo::version_label(),
             status::format_ctx_size(self.engine.ctx_size())
         );
-        let art = tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH * 3 / 4));
+        let art = tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH));
         for line in Self::masthead(art, version) {
             log.push_spans(line.spans);
         }
@@ -8871,6 +9333,14 @@ impl Agent<'_> {
                     };
                     if let Some((outcome, reason)) = settled {
                         self.goal = None;
+                        // Mirrors the plain path's save at each
+                        // `drive_goal_loop` exit: the adjudication exchange
+                        // just pushed into `self.session` (or, on the
+                        // interrupted branch, the last turn's) is the last
+                        // thing to land before this loop stops running turns,
+                        // and no later `run_turn`/`tui_turn_inner` save site
+                        // is reached from here.
+                        self.save_payload_if_dirty();
                         log.push_dim(crate::goal::closing(outcome, iters, &reason));
                     } else {
                         let (iter, max) = {
@@ -8910,6 +9380,7 @@ impl Agent<'_> {
                         "microcompacted: cleared {cleared} old tool result(s)"
                     ));
                 }
+                self.flush_kv_end_of_turn();
                 crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
                 // Mirrored from the plain path: a component must not observe a
@@ -9254,10 +9725,12 @@ impl Agent<'_> {
             let turn_continues = !out.interrupted && (!out.calls.is_empty() || out.error.is_some());
             close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
             self.session.push(Message::assistant(assistant_text));
+            self.payload_dirty = true;
             let _ = tx.send(UiEvent::EndLine);
             if out.interrupted {
                 crate::interrupt::clear();
                 self.last_turn_interrupted = true;
+                self.save_payload_if_dirty();
                 let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
                 // Drain point 3 (BTW-DESIGN §4.4): the user asked mid-turn;
                 // answer even though the main turn was interrupted.
@@ -9292,6 +9765,9 @@ impl Agent<'_> {
                 for warning in self.tool_ctx.hook_warnings.drain(..) {
                     let _ = tx.send(UiEvent::Dim(warning));
                 }
+                // Mirror of the plain-stdout path: anchor the rung at the
+                // index this result will occupy, before it is appended.
+                self.anchor_rung_before_tool_result(observations.len());
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
@@ -9350,6 +9826,7 @@ impl Agent<'_> {
         let out = self.worker_generate(tx, shared, &prompt, Instant::now(), false)?;
         self.session
             .push(Message::assistant(out.assistant_text.clone()));
+        self.payload_dirty = true;
         // Work instead of a verdict, or a cut-off pass: neither settles a goal.
         if out.interrupted || !out.calls.is_empty() {
             return Ok(crate::goal::Adjudication::keep_going());
@@ -9421,6 +9898,20 @@ impl Agent<'_> {
                 }
                 let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
             }
+            // This generation runs on the live engine, so from here the
+            // engine's end is `transcript + question + answer`: strictly beyond
+            // the transcript an anchor rung would be fingerprinted against. A
+            // rung captured in that state claims coverage it does not have and,
+            // once restored, hands the next prompt a KV it cannot extend —
+            // `engine::reusable_prefix` then takes the reset branch and
+            // re-prefills from zero, the exact pathology the ladder exists to
+            // avoid. Mark it; the next anchor point consumes the mark and skips.
+            //
+            // Set for the aside path too, which *is* documented to snapshot and
+            // restore around itself (`Engine::generate_aside`): a restore that
+            // silently no-ops leaves the same divergence, and the only cost of
+            // being wrong here is one skipped anchor.
+            self.btw_diverged_engine = true;
             match self.worker_generate_kind(tx, shared, &prompt, Instant::now(), false, aside) {
                 Ok(out) => {
                     let _ = tx.send(UiEvent::EndLine);
@@ -9521,6 +10012,7 @@ impl Agent<'_> {
         // every `/subagent` sidechain) actually runs through.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
+        stream.set_freeze_on_error(true);
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
@@ -9593,6 +10085,7 @@ impl Agent<'_> {
                         state: WorkerState::Generating,
                         generated: gen_count,
                         prefill_label: verb,
+                        thinking: stream.in_think(),
                         gen_tps: crate::engine::rate_since(gen_mark, gen_count),
                         elapsed_secs: turn_start.elapsed().as_secs_f64(),
                         ctx_used: prompt_tokens + gen_count,
@@ -9617,6 +10110,7 @@ impl Agent<'_> {
                         prefill_done: p.done,
                         prefill_total: p.total,
                         prefill_label: verb,
+                        thinking: stream.in_think(),
                         prefill_tps: p.tps,
                         elapsed_secs: turn_start.elapsed().as_secs_f64(),
                         ctx_used: prompt_tokens,
@@ -9671,6 +10165,7 @@ impl Agent<'_> {
             // from its answer the way any other generation's is. Tool calls are
             // denied for an aside, so it needs none of the dispatch machinery.
             let mut aside_renderer = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
+            aside_renderer.set_freeze_on_error(true);
             aside_renderer.set_show_thinking(crate::settings::active().ui.show_thinking);
             if !matches!(self.think, crate::engine::ThinkMode::Off) {
                 aside_renderer.begin_in_think();
@@ -10074,6 +10569,7 @@ impl Agent<'_> {
                 }
             }
             "/new" | "/clear" => {
+                self.discard_ladder();
                 self.session = Session::new();
                 // A new session, a new name — minted here for the same reason
                 // `new_agent` mints one at launch (see `SessionStore::mint_id`).
@@ -10506,7 +11002,7 @@ impl Agent<'_> {
                     Ok(Insights::Cancelled) => log.push_dim("insights cancelled".to_owned()),
                     Err(e) => {
                         log.push_plain(format!("insights failed: {e}"));
-                        log.push_dim("usage: /insights [fast]".to_owned());
+                        log.push_dim("usage: /insights [fast|fresh]".to_owned());
                     }
                 }
             }
@@ -11045,6 +11541,10 @@ const FORCE_QUIT_GRACE: Duration = Duration::from_secs(2);
 /// reached in the network-drop case that motivated it.
 fn force_quit() -> ! {
     ratatui::restore();
+    // No destructor here can run (see above), so the mirror gets its farewell
+    // explicitly or not at all — and this is the exit where a console left
+    // hanging mid-stream most needs to be told what happened.
+    crate::debugmirror::disconnect(crate::debugmirror::REASON_FORCE_QUIT);
     eprintln!("plank: force quit — the turn was abandoned and not saved.");
     std::process::exit(130);
 }
@@ -11940,6 +12440,9 @@ fn new_agent(
         reminder: SystemPromptReminder::new(),
         power_percent: 0,
         payload_restored: false,
+        payload_dirty: false,
+        ladder: crate::kvladder::KvLadder::new(),
+        btw_diverged_engine: false,
         trusted_system_len,
         think: cfg.generation.think_mode,
         trace,
@@ -12023,6 +12526,9 @@ pub fn run_interactive(
     // Whatever happened, fire SessionEnd, save the session, and tell the user
     // how to resume it.
     agent.fire_session_end("exit", &mut |w| println!("{w}"));
+    // Say goodbye in the debug console before the socket goes: a window left
+    // on screen should say why its stream stopped.
+    crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     agent.report_session_on_exit();
     agent.report_run_stats();
     result
@@ -12289,6 +12795,7 @@ pub fn run_non_interactive(
         agent.session.push(Message::user(prompt));
         let r = agent.run_turn();
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
+        crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
         return r;
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
@@ -12308,6 +12815,7 @@ pub fn run_non_interactive(
         agent.run_turn()?;
     }
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
+    crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     Ok(())
 }
 
@@ -13504,6 +14012,9 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -13532,6 +14043,20 @@ mod tests {
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
+        }
+    }
+
+    impl Agent<'_> {
+        /// Drives the real anchor capture and returns the rung it produced.
+        /// The empty ladder always wants its first anchor, so this is a genuine
+        /// capture through the production path.
+        fn capture_first_rung(&mut self) -> crate::kvladder::Rung {
+            self.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES + 1);
+            *self
+                .ladder
+                .rungs()
+                .last()
+                .expect("the empty ladder always wants its first rung")
         }
     }
 
@@ -13572,6 +14097,808 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-ui-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `ScriptedEngine::default()` leaves `kv_events` unset, so `get_kv`
+    /// returns `None` — the same "no KV backend" behaviour as the echo stub.
+    /// With nothing to snapshot, every ladder path must be inert rather than
+    /// recording a phantom rung.
+    #[test]
+    fn the_scripted_engine_default_never_grows_a_ladder() {
+        let dir = scratch_dir("ladder-no-kv");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.store.save(&mut agent.session).unwrap();
+        agent.payload_dirty = true;
+        agent.flush_kv_end_of_turn();
+        agent.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES + 1);
+        assert!(agent.ladder.rungs().is_empty());
+    }
+
+    /// A rung whose `spans` already reaches the edit index contains the span
+    /// about to be rewritten, so it cannot be a restore point.
+    #[test]
+    fn no_usable_rung_means_no_restore_attempt() {
+        let dir = scratch_dir("ladder-restore-none");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        agent.store.save(&mut agent.session).unwrap();
+        agent.ladder.push(5, 14_000);
+        assert_eq!(agent.restore_rung_below(2), None);
+    }
+
+    /// This is the whole point of the correction over the brief: a rung is
+    /// stored under the fingerprint of the transcript *as it stood at capture
+    /// time* (`spans == transcript.len()` then), not the fingerprint of the
+    /// full transcript at restore time, which by then has grown further.
+    ///
+    /// This drives a REAL `refresh_ladder()` (with a `ScriptedEngine` that
+    /// actually supplies KV, so a genuine rung blob lands on disk under a
+    /// genuine fingerprint), grows the transcript past it, and then proves
+    /// `restore_rung_below` finds that exact blob: a real `Some(tokens)` hit,
+    /// plus the scripted engine's own `restore:<tag>` event log showing the
+    /// tag `refresh_ladder`'s `get_kv` capture produced. The naive
+    /// "fingerprint the whole current transcript" approach the brief
+    /// originally proposed would compute a different value and miss the
+    /// lookup entirely — this test is proven below to fail under that naive
+    /// spelling and pass under the correct one.
+    #[test]
+    fn restore_finds_the_rung_stored_under_its_own_prefix_fingerprint() {
+        let dir = scratch_dir("ladder-restore-fingerprint");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        agent.session.push(Message::user("turn one"));
+        agent.session.push(Message::assistant("reply one"));
+        // `refresh_ladder` and `restore_rung_below` both short-circuit on an
+        // empty session id, so a real id must exist before either runs.
+        agent.store.save(&mut agent.session).unwrap();
+
+        // A real capture: the empty ladder always wants its first rung, the
+        // scripted engine's `get_kv` hands back a real (if tiny) payload, and
+        // `refresh_ladder` writes a real blob keyed by the fingerprint of the
+        // transcript exactly as it stands right now.
+        let rung = agent.capture_first_rung();
+        assert_eq!(rung.spans, agent.session.transcript.len());
+        assert!(
+            events.lock().unwrap().iter().any(|e| e == "capture"),
+            "refresh_ladder must snapshot the KV: {:?}",
+            events.lock().unwrap()
+        );
+
+        // Grow the transcript well past the rung before restoring, exactly as
+        // an edit later in the conversation would find it.
+        agent.session.push(Message::user("turn two"));
+        agent.session.push(Message::assistant("reply two"));
+        agent.session.push(Message::user("turn three"));
+        let edit_index = agent.session.transcript.len();
+        assert!(
+            edit_index > rung.spans,
+            "transcript must grow past the rung"
+        );
+
+        // The real call: this must be a genuine hit, not a `None` that both a
+        // correct and a broken implementation would equally produce.
+        let restored = agent.restore_rung_below(edit_index);
+        assert_eq!(
+            restored,
+            Some(rung.tokens),
+            "restore_rung_below must find the rung this test just captured"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "a real hit must run the restore, not just select the rung: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// THE defect this whole feature turned on: rungs were captured at TURN
+    /// ENDS, and `microcompact` clears OLDEST-first, so the edit index sits
+    /// near the start of the transcript where no turn boundary exists. An
+    /// anchor is captured at the instant `transcript.len()` equals the index
+    /// the tool result is about to occupy — the exact index
+    /// `microcompact_first_index` later reports.
+    #[test]
+    fn an_anchor_rung_lands_at_the_index_the_tool_result_will_occupy() {
+        let dir = scratch_dir("ladder-anchor-index");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        // Without a real id every capture/restore path short-circuits.
+        agent.store.save(&mut agent.session).unwrap();
+
+        let will_occupy = agent.session.transcript.len();
+        agent.anchor_rung_before_tool_result(20_000);
+        let rung = *agent
+            .ladder
+            .rungs()
+            .last()
+            .expect("a large tool result must be anchored");
+        assert_eq!(
+            rung.spans, will_occupy,
+            "the anchor must sit at the index the result will occupy"
+        );
+        assert!(
+            events.lock().unwrap().iter().any(|e| e == "capture"),
+            "the anchor must really snapshot the KV: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// A `/btw` aside answered on the LIVE engine pushes the engine's end past
+    /// the transcript a rung is fingerprinted against, so a rung captured after
+    /// it claims coverage it does not have and, once restored, hands the next
+    /// prompt a KV it cannot extend — `reusable_prefix` then re-prefills from
+    /// token zero, which is the pathology the ladder exists to prevent. No
+    /// anchor may be captured on such a pass.
+    #[test]
+    fn no_anchor_is_captured_on_a_pass_that_answered_a_btw() {
+        let dir = scratch_dir("ladder-anchor-btw");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["It is 42.\n".to_string()],
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        // The aside: answered on `self.engine`, with no fork snapshot and no
+        // restore afterwards (unlike the plain-REPL path's
+        // `begin_subagent_fork`/`restore_fork_kv`).
+        let shared = TurnShared::default();
+        shared.push_btw("what was the answer?".to_owned());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.drain_btw(&tx, &shared);
+
+        agent.anchor_rung_before_tool_result(20_000);
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "a /btw answered on the live engine must suppress the anchor: {:?}",
+            agent.ladder.rungs()
+        );
+        assert!(
+            !events.lock().unwrap().iter().any(|e| e == "capture"),
+            "the suppressed anchor must not even pay a get_kv: {:?}",
+            events.lock().unwrap()
+        );
+
+        // And only that one anchor point: the next main generation re-syncs the
+        // engine to the transcript, so the following anchor is captured again.
+        agent.anchor_rung_before_tool_result(20_000);
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            1,
+            "the suppression must be consumed, not sticky"
+        );
+    }
+
+    /// The end-to-end assertion the feature exists for: after an anchor, a
+    /// real `restore_rung_below` at the real `microcompact_first_index` is a
+    /// genuine hit, through the real fingerprint lookup and a real `set_kv`.
+    /// With turn-end capture only, the shallowest rung sat one span PAST the
+    /// edit and this returned `None` on every session.
+    #[test]
+    fn an_anchor_makes_the_restore_at_the_real_edit_index_hit() {
+        let dir = scratch_dir("ladder-anchor-restore");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        let big = "a".repeat(20_000);
+        agent.anchor_rung_before_tool_result(big.len());
+        let rung = *agent.ladder.rungs().last().expect("anchored");
+        agent
+            .session
+            .push(Message::user(format!("<tool_result>{big}</tool_result>")));
+        // Three newer results, so the anchored one falls outside the
+        // newest-`MICROCOMPACT_KEEP_RESULTS` keep window and becomes the
+        // clearing candidate.
+        for _ in 0..3 {
+            agent.session.push(Message::assistant("more"));
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "b".repeat(1_000)
+            )));
+        }
+        let edit = compact::microcompact_first_index(&agent.session.transcript)
+            .expect("the anchored result must be the clearing candidate");
+        assert_eq!(edit, rung.spans, "the anchor must sit exactly at the edit");
+
+        events.lock().unwrap().clear();
+        assert_eq!(
+            agent.restore_rung_below(edit),
+            Some(rung.tokens),
+            "the anchored rung must be found and restored for its own edit"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "a real hit runs set_kv, not just select: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// Small enough that the synthetic transcript below sits under real
+    /// context pressure without needing a huge one.
+    const E2E_CTX_SIZE: i32 = 20_000;
+
+    /// THE end-to-end test the whole feature lacked: nothing anywhere proved a
+    /// rung is ever actually USED in the real path. This drives
+    /// `try_microcompact_opportunistic` itself — the gate, the ladder select,
+    /// the fingerprint lookup and `set_kv` — on an agent whose engine supplies
+    /// KV, with a small `ctx_size` (via `ScriptedEngine::ctx_override`) so the
+    /// synthetic context pressure is high. The measured trade (~1.2 bytes per
+    /// token) is below the strict floor, so before the pressure term this pass
+    /// was refused at every pressure and the restore never ran.
+    #[test]
+    fn under_pressure_the_opportunistic_pass_fires_and_restores_a_rung() {
+        let dir = scratch_dir("ladder-pressure-e2e");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ctx_override: Some(E2E_CTX_SIZE),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        // Without a real id every capture/restore path short-circuits and the
+        // test would prove nothing.
+        agent.store.save(&mut agent.session).unwrap();
+
+        let big = "a".repeat(12_000);
+        agent.anchor_rung_before_tool_result(big.len());
+        let rung = *agent.ladder.rungs().last().expect("anchored");
+        agent
+            .session
+            .push(Message::user(format!("<tool_result>{big}</tool_result>")));
+        for _ in 0..3 {
+            agent.session.push(Message::assistant("more"));
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "b".repeat(6_000)
+            )));
+        }
+
+        let rendered = render_transcript(&agent.session, &agent.system);
+        let total = agent.engine.count_tokens(&rendered);
+        let reclaimable = compact::microcompact_reclaimable(&agent.session.transcript);
+        let reprefill = total - rung.tokens;
+        // The trade must be one the STRICT floor refuses, or the test would
+        // pass without the pressure term at all.
+        assert!(
+            !compact::microcompact_is_worth_it(reclaimable, reprefill, 1_000_000, total),
+            "the trade must be strictly refusable at low pressure"
+        );
+        // ... and the window must be under pressure but NOT yet at the
+        // full-compaction trigger: this is the pre-emption window.
+        assert!(
+            !compact::should_compact(E2E_CTX_SIZE, total),
+            "full compaction must not already be due"
+        );
+
+        events.lock().unwrap().clear();
+        let cleared = agent
+            .try_microcompact_opportunistic()
+            .expect("the pass must fire under pressure");
+        assert!(cleared > 0, "the pass must clear a tool result");
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "the pass must actually restore the rung via set_kv: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// Only bodies over `MICROCOMPACT_MIN_BYTES` can ever enter the clear set,
+    /// so a small result has nothing to anchor for and must not pay ~0.3s and
+    /// hundreds of MB for a rung.
+    #[test]
+    fn a_small_tool_result_is_never_anchored() {
+        let dir = scratch_dir("ladder-anchor-small");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES);
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "a body that can never be cleared must not be anchored"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "and it must not even reach get_kv: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// Cost control: a tool-heavy turn fires several large results back to
+    /// back. Once a rung predates them all, another capture buys only depth,
+    /// and depth under `LADDER_ANCHOR_MIN_SPACING_TOKENS` is not worth the
+    /// write. The guard runs before `get_kv`, so a suppressed anchor is free.
+    #[test]
+    fn a_redundant_anchor_is_suppressed_until_it_buys_real_depth() {
+        let dir = scratch_dir("ladder-anchor-spacing");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.anchor_rung_before_tool_result(20_000);
+        assert_eq!(agent.ladder.rungs().len(), 1);
+
+        // A second large result a few hundred bytes later: the first rung
+        // already predates it, and the extra depth is far under the spacing
+        // floor.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "a".repeat(600)
+        )));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        events.lock().unwrap().clear();
+        agent.anchor_rung_before_tool_result(20_000);
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            1,
+            "a redundant anchor must be suppressed"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "and suppression must happen before get_kv: {:?}",
+            events.lock().unwrap()
+        );
+
+        // Now a genuinely deeper point: the default `count_tokens` is ~4 bytes
+        // per token, so this pushes well past the spacing floor and the anchor
+        // is worth taking.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "c".repeat(4 * crate::kvladder::LADDER_ANCHOR_MIN_SPACING_TOKENS as usize)
+        )));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.anchor_rung_before_tool_result(20_000);
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            2,
+            "an anchor that buys real depth must still be taken"
+        );
+    }
+
+    /// A REFUSED opportunistic microcompact must leave the engine's KV alone.
+    ///
+    /// The pass used to restore a rung *before* consulting the gate, so on the
+    /// refusal path the transcript was never rewritten and nothing needed
+    /// rewinding — yet `set_kv` had already replaced the engine's rows and its
+    /// token span buffer with the rung's shorter prefix, throwing away a cache
+    /// that covered the whole live transcript. The gate then refused the very
+    /// prefill it had just made inevitable, and refused again every turn.
+    #[test]
+    fn a_refused_opportunistic_microcompact_does_not_rewind_the_engine() {
+        let dir = scratch_dir("ladder-refuse-no-rewind");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        agent.session.push(Message::user("turn one"));
+        agent.session.push(Message::assistant("reply one"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        // A real rung at spans == 2, so a restore would genuinely fire.
+        let rung = agent.capture_first_rung();
+        assert_eq!(rung.spans, 2);
+
+        // Four tool results: only the first is a clearing candidate (the newest
+        // three are kept), and the kept three are bulky enough that the bytes
+        // the pass would reclaim are far below the floor per re-prefilled
+        // token, so the gate must refuse.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "a".repeat(5_000)
+        )));
+        for _ in 0..3 {
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "b".repeat(20_000)
+            )));
+        }
+        let reclaimable = compact::microcompact_reclaimable(&agent.session.transcript);
+        assert!(reclaimable >= compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES);
+        let edit = compact::microcompact_first_index(&agent.session.transcript).unwrap();
+        assert!(edit >= rung.spans, "the rung must predate the edit");
+
+        events.lock().unwrap().clear();
+        let before = agent.session.transcript.clone();
+        assert_eq!(
+            agent.try_microcompact_opportunistic(),
+            None,
+            "the gate must refuse: too few bytes per re-prefilled token"
+        );
+        assert_eq!(
+            agent.session.transcript, before,
+            "a refused pass rewrites nothing"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "a refused pass must not rewind the engine's KV: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// With `context.microcompact` off, `try_microcompact` must decline
+    /// without touching the transcript at all — not merely return a count
+    /// that happens to be zero, but genuinely never rewrite anything, so the
+    /// caller (`maybe_compact`) falls through to full compaction instead.
+    #[test]
+    fn microcompact_off_leaves_try_microcompact_untouched() {
+        let dir = scratch_dir("microcompact-off-cheap");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        // Four old-enough tool results: with microcompact on, the oldest
+        // (outside the newest-3 keep window) is a genuine clearing candidate.
+        for _ in 0..4 {
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "a".repeat(1_000)
+            )));
+        }
+
+        // Control: with the setting at its default (on), this exact transcript
+        // really would be rewritten — proving the test below is not simply
+        // vacuous (e.g. a `None` any implementation would produce).
+        let mut control = agent.session.transcript.clone();
+        assert_eq!(
+            compact::microcompact(&mut control).0,
+            1,
+            "sanity: the setup does have a clearing candidate"
+        );
+
+        let mut off = crate::settings::Settings::default();
+        off.context.microcompact = false;
+        crate::settings::install_for_test(off);
+
+        let before = agent.session.transcript.clone();
+        assert_eq!(
+            agent.try_microcompact(),
+            None,
+            "declines rather than reporting a full clear"
+        );
+        assert_eq!(
+            agent.session.transcript, before,
+            "transcript must be byte-identical: no in-place rewrite at all"
+        );
+
+        crate::settings::install_for_test(crate::settings::Settings::default());
+    }
+
+    /// With `context.microcompact` off, the opportunistic end-of-turn pass
+    /// must decline without touching the transcript or the engine's KV — the
+    /// same setup that a default-on setting would genuinely clear and restore
+    /// a rung for (proving the guard, not a vacuous `None`).
+    #[test]
+    fn microcompact_off_leaves_opportunistic_pass_untouched() {
+        let dir = scratch_dir("microcompact-off-opportunistic");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        agent.session.push(Message::user("turn one"));
+        agent.session.push(Message::assistant("reply one"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        // A real rung at spans == 2, so an unguarded pass really would restore.
+        let rung = agent.capture_first_rung();
+        assert_eq!(rung.spans, 2);
+
+        // One old, big tool result (well past the opportunistic byte floor)
+        // and nothing else added after the rung, so the reprefill cost is
+        // negligible and an unguarded pass would find it worth clearing.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "a".repeat(10_000)
+        )));
+        // Three more candidates (>256 bytes) so the big one falls outside the
+        // newest-3 keep window instead of being kept alive by it.
+        for _ in 0..3 {
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "b".repeat(300)
+            )));
+        }
+        let reclaimable = compact::microcompact_reclaimable(&agent.session.transcript);
+        assert!(reclaimable >= compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES);
+
+        let mut off = crate::settings::Settings::default();
+        off.context.microcompact = false;
+        crate::settings::install_for_test(off);
+
+        events.lock().unwrap().clear();
+        let before = agent.session.transcript.clone();
+        assert_eq!(
+            agent.try_microcompact_opportunistic(),
+            None,
+            "declines outright with the setting off"
+        );
+        assert_eq!(
+            agent.session.transcript, before,
+            "a declined pass rewrites nothing"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "a declined pass must not touch the engine's KV: {:?}",
+            events.lock().unwrap()
+        );
+
+        crate::settings::install_for_test(crate::settings::Settings::default());
+    }
+
+    /// Replacing the session must clear the ladder and take its blobs with it.
+    ///
+    /// `/new`, `/clear`, `/switch`, both `/resume` paths and `resume_by_id`
+    /// reset `checkpoints`, `usage` and `last_ctx_used` but used to leave
+    /// `self.ladder` alone. That orphaned the old session's blobs on disk and,
+    /// worse, left `wants_anchor` comparing a fresh, smaller transcript against
+    /// the old deepest rung's token count — a negative delta, so no capture
+    /// ever happened again and the feature silently stopped working.
+    #[test]
+    fn replacing_the_session_discards_the_ladder_and_its_blobs() {
+        let dir = scratch_dir("ladder-session-swap");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("turn one"));
+        agent.store.save(&mut agent.session).unwrap();
+        let old_id = agent.session.id.clone();
+
+        let rung = agent.capture_first_rung();
+        assert!(agent.store.rung_path(&old_id, rung.index).exists());
+
+        // A real replacement path, not the helper: `/clear` is the site the
+        // bug lived at.
+        assert!(agent.slash("/clear").unwrap());
+        assert!(agent.ladder.rungs().is_empty(), "the ladder must be reset");
+        assert!(
+            !agent.store.rung_path(&old_id, rung.index).exists(),
+            "the old session's blob must go with it"
+        );
+        // The reset is what lets a smaller fresh transcript capture again.
+        assert!(agent.ladder.wants_anchor(0, 10));
+    }
+
+    /// A full compaction replaces the transcript, so every rung's prefix ceases
+    /// to exist. Leaving them behind freezes the ladder for the rest of the
+    /// session (`wants_anchor` refuses, `select` misses) exactly when the feature
+    /// matters most, so `rebuild_after_compact` must clear it.
+    #[test]
+    fn a_full_compaction_clears_the_ladder() {
+        let dir = scratch_dir("ladder-after-compact");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("turn one"));
+        agent.session.push(Message::assistant("reply one"));
+        agent.store.save(&mut agent.session).unwrap();
+        let id = agent.session.id.clone();
+
+        let rung = agent.capture_first_rung();
+        assert!(agent.store.rung_path(&id, rung.index).exists());
+
+        agent.rebuild_after_compact("<summary>everything so far</summary>");
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "the rebuilt transcript invalidates every rung"
+        );
+        assert!(
+            !agent.store.rung_path(&id, rung.index).exists(),
+            "the blobs must go too"
+        );
+    }
+
+    /// A save is only worth doing when the transcript has moved since the
+    /// last one; the flag clears regardless of outcome (best-effort), so a
+    /// KV-less backend does not retry every turn.
+    #[test]
+    fn a_payload_save_is_skipped_when_the_transcript_has_not_moved() {
+        let dir = scratch_dir("payload-dirty-flag");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.payload_dirty = false;
+        assert_eq!(agent.save_payload_if_dirty(), None);
+
+        // A turn that changed the transcript arms the next save.
+        agent.payload_dirty = true;
+        // ScriptedEngine::default() has no KV, so the save itself is inert,
+        // but the flag clears so a failed capture does not retry forever.
+        assert_eq!(agent.save_payload_if_dirty(), None);
+        assert!(!agent.payload_dirty);
+    }
+
+    /// `adjudicate_plain` pushes both the adjudication prompt and the verdict
+    /// reply straight into `self.session`, bypassing every other
+    /// transcript-moving call site that sets `payload_dirty`. Pins the fix for
+    /// the Important finding on commit 23d1a15: before it, this assertion
+    /// fails because nothing in `adjudicate_plain` touches the flag.
+    #[test]
+    fn adjudicate_plain_marks_the_payload_dirty() {
+        let dir = scratch_dir("adjudicate-plain-dirty");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("do the thing"));
+        agent.session.push(Message::assistant("done"));
+        // A real session id: a save against an empty id short-circuits before
+        // it ever looks at the flag, which would pass this test for the wrong
+        // reason.
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.payload_dirty = false;
+        agent
+            .adjudicate_plain()
+            .expect("scripted engine always replies");
+        assert!(
+            agent.payload_dirty,
+            "adjudicate_plain pushes a user+assistant exchange into the \
+             transcript and must mark the payload dirty like every other \
+             transcript-moving call site"
+        );
+    }
+
+    /// The TUI analogue of the test above: `adjudicate_worker` pushes the same
+    /// two messages on a worker thread and must set the flag identically.
+    #[test]
+    fn adjudicate_worker_marks_the_payload_dirty() {
+        let dir = scratch_dir("adjudicate-worker-dirty");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("do the thing"));
+        agent.session.push(Message::assistant("done"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let shared = TurnShared::default();
+        agent.payload_dirty = false;
+        agent
+            .adjudicate_worker(&tx, &shared)
+            .expect("scripted engine always replies");
+        assert!(
+            agent.payload_dirty,
+            "adjudicate_worker must mark the payload dirty, mirroring \
+             adjudicate_plain"
+        );
+    }
+
+    /// Pins the second half of the finding: even once `adjudicate_plain` marks
+    /// the flag, `drive_goal_loop` must actually reach a save before it
+    /// returns — on every exit, not just the ordinary `run_turn` path. Drives
+    /// a full goal loop to a settled verdict (`ATTAINED`) and asserts the
+    /// payload was saved, using `kv_events` as the real, only-if-actually-
+    /// captured witness that `save_session_payload` ran (a session with an
+    /// empty id would let a broken save silently no-op and pass anyway, which
+    /// is why `store.save` runs first below).
+    #[test]
+    fn drive_goal_loop_saves_the_payload_on_a_settled_verdict() {
+        let dir = scratch_dir("goal-loop-saves-on-verdict");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // Turn one: the model's tool-free reply. Turn two: the
+            // adjudication verdict that settles the goal.
+            replies: vec![
+                "all done\n".to_string(),
+                "GOAL_VERDICT: ATTAINED\n".to_string(),
+            ],
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("start the goal"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.goal = Some(crate::goal::GoalLoop::new("finish the thing", 5));
+        agent.session.goal = Some(crate::goal::GoalState {
+            objective: "finish the thing".to_owned(),
+            max_iters: 5,
+            iter: 0,
+            status: crate::goal::GoalStatus::Active,
+        });
+
+        let (outcome, _iters, _reason) = agent
+            .drive_goal_loop()
+            .expect("scripted engine always replies, so the loop settles");
+        assert_eq!(outcome, crate::goal::Outcome::Attained);
+        // `run_turn`'s own end-of-turn handling produces ONE capture for the
+        // main pass's tool-free reply: `flush_kv_end_of_turn` serves both the
+        // ladder rung and the payload write from a single `get_kv`. So the
+        // discriminating check is a SECOND capture, produced only by a save
+        // covering the adjudication exchange that `adjudicate_plain` pushes.
+        // Asserting merely "any capture happened" would pass even without the
+        // fix, since `run_turn` alone already supplies exactly one.
+        let captures = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "capture")
+            .count();
+        assert_eq!(
+            captures,
+            2,
+            "drive_goal_loop must save the payload a SECOND time before returning on a settled verdict; the first capture is run_turn's own end-of-turn flush for the main pass, and the second must cover the adjudication exchange or it is transcript-only forever: events were {:?}",
+            events.lock().unwrap()
+        );
     }
 
     /// `remote_on` installs a live bridge on an already-running agent and
@@ -15575,6 +16902,9 @@ mod tests {
     // "Compaction interrupted; keeping the previous conversation state.").
     #[test]
     fn interrupted_compaction_keeps_the_previous_transcript() {
+        let _title_lock = crate::title::TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch_dir("compact-interrupt");
         let engine = ScriptedEngine {
             replies: vec!["a partial summ".to_string()],
@@ -15622,6 +16952,9 @@ mod tests {
     // swallowing normal compaction.
     #[test]
     fn uninterrupted_compaction_still_rebuilds() {
+        let _title_lock = crate::title::TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch_dir("compact-ok");
         let engine = ScriptedEngine {
             replies: vec!["durable state: the user asked about X".to_string()],
@@ -15661,6 +16994,9 @@ mod tests {
     // Both orchestrators must dispatch both events.
     #[test]
     fn compaction_hooks_fire_on_the_tui_path() {
+        let _title_lock = crate::title::TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch_dir("compact-hooks-tui");
         let engine = ScriptedEngine {
             replies: vec!["<summary>durable state</summary>".to_string()],
@@ -15705,6 +17041,9 @@ mod tests {
     // a failure that leaves the conversation alone.
     #[test]
     fn a_compaction_with_no_usable_summary_keeps_the_transcript() {
+        let _title_lock = crate::title::TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch_dir("compact-empty");
         // A reply that is *only* a discarded <analysis> block extracts to
         // nothing — the realistic shape of this failure, not just an empty
@@ -15886,6 +17225,9 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -15989,6 +17331,9 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -16466,6 +17811,7 @@ mod tests {
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 1,
             ttl_tier_secs: 1,
+            ttl_rung_secs: 1,
             max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -16691,6 +18037,9 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -16874,6 +18223,9 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -16962,6 +18314,9 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -17037,6 +18392,9 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -17135,6 +18493,9 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -17648,6 +19009,35 @@ mod tests {
             "the cached engine served every dispatch"
         );
         unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// Fan-out ordinals are handed out on the main thread while slots are
+    /// built, so they follow block order deterministically rather than
+    /// whichever thread happens to start first.
+    #[test]
+    fn fanout_slots_take_distinct_ordinals_in_block_order() {
+        let a = crate::debugmirror::open_subagent();
+        let b = crate::debugmirror::open_subagent();
+        let c = crate::debugmirror::open_subagent();
+        let mut ids = vec![a.id(), b.id(), c.id()];
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "every slot needs its own window");
+    }
+
+    /// A serial sidechain must leave the thread routed back at the parent
+    /// window when it returns, however it returns — the parent's next turn
+    /// streams on this same thread.
+    #[test]
+    fn a_serial_sidechain_restores_the_parent_mirror_target() {
+        let sub = crate::debugmirror::open_subagent();
+        assert_ne!(sub.id(), crate::debugmirror::MirrorId::PARENT);
+        {
+            let _active = sub.activate();
+        }
+        assert_eq!(
+            crate::debugmirror::current_for_test(),
+            crate::debugmirror::MirrorId::PARENT
+        );
     }
 
     #[test]
@@ -18646,6 +20036,9 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18738,6 +20131,9 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18889,6 +20285,9 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18962,6 +20361,9 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),

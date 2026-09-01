@@ -686,6 +686,54 @@ and still fixtured. A real-engine measurement of the prefix-stability win
 (earlier suffix stop vs. per-pass prefix invalidation) is pending; the gate is
 the conservative default until then.
 
+### The gate is context-pressure-dependent, and had to become so
+
+Three successive gates, each fixing the previous one's blindness:
+
+1. Bytes only (`MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES`) — could not see the
+   token cost. A measured session took five passes, each reclaiming ~12 KB and
+   paying ~14,000 tokens of re-prefill: 72,769 wasted tokens, 26:38 of a 29:05
+   session in prefill.
+2. Bytes per token re-prefilled, floor 2.0 (`MICROCOMPACT_BYTES_PER_TOKEN_FLOOR`)
+   — killed the regression outright: **0 full rebuilds, session 29:05 -> 14:56
+   with 4:24 in prefill** (run 2). It refused *every* pass, so context was
+   never reclaimed on this path; the whole win is the refusal.
+3. Anchor rungs (`Agent::anchor_rung_before_tool_result`) on top of that gate.
+   Measured (run 3): still 0 rebuilds, all six gate refusals now report
+   `rung_covers=14284` instead of 0 — the rung really is found and really
+   would cover 57% of the re-prefill — but **0 restores happened**, because
+   the gate refuses at 1.16 bytes/token, and session time went 14:56 -> 16:31
+   with prefill 4:24 -> 6:16. Stated plainly: in the only session shape anyone
+   can currently benchmark, the anchor change **cost about 1.5 minutes and
+   delivered no realized benefit**, the cost being the anchor captures
+   themselves. It is kept because it is the precondition for (4) — without a
+   rung at the edit index there is nothing for an accepting gate to restore —
+   not because it has been measured to pay.
+4. The same ratio against a **pressure-dependent floor**
+   (`compact::microcompact_floor`): flat 2.0 up to half of
+   `compaction_trigger_used(ctx_size)`, then linear to a small epsilon (0.05,
+   `MICROCOMPACT_FLOOR_EPSILON`) at that trigger. The epsilon rather than 0.0
+   because 0.0 means "accept any pass at all", and the opportunistic pass runs
+   at the end of a turn while `should_compact` is consulted at the start of the
+   next: a marginal pass could spend a `set_kv` and a rewrite moments before a
+   full compaction discarded the ladder anyway.
+
+   The accepting branch of this gate has **never fired in a live session**. It
+   needs roughly 42% of the context window used (half of
+   `compaction_trigger_used`), and a benchmark of file-reading turns reaches
+   2-3% of a 1M-token window; the only evidence that a pass fires and a rung is
+   restored comes from unit tests with a synthetic small `ctx_size`.
+
+The insight behind (4) is that a byte of context is not worth a fixed number of
+prefill tokens — its worth depends on how close the window is to full. The
+logged trade `reclaimable=12344B ... reprefill=10674` (ratio 1.16) is a bad deal
+at 2% of a 1M window and a good one at 70%, because the alternative under
+pressure is a full compaction (model round-trip plus total KV rebuild) rather
+than nothing. The relaxation is anchored to the *same* threshold
+`should_compact` uses, deliberately: two independent notions of "under
+pressure" would eventually disagree, and the cheap pass would end up blocking
+right where the expensive one was about to fire anyway.
+
 ## Durable goal state (M7) — model-facing text, fixtures
 
 The goal statement is now durable session state (`Session.goal`), pinned
@@ -739,6 +787,86 @@ shortcuts them would be a hole straight through every guard those files
 implement. The guest-language design (a small interpreted language compiled to
 the WASM host, `src/wasmhost.rs`) is a follow-up. Batch the fingerprint churn
 with M8/M9 so it happens once.
+
+## The KV snapshot ladder (M11) — restoring a prefix that predates the edit
+
+Micro-compaction rewrites old tool-result bodies to a stub *in place*, and
+`ds4_session_sync` reuses the live KV only when the prompt **extends** its
+live end (see the tier-boundary finding above) — a rewrite behind that end
+forces a full re-prefill, even though most of the transcript is unchanged. A
+measured 18-turn session paid **72,769 still-valid tokens** re-prefilled this
+way across five full rebuilds (`docs/superpowers/specs/2026-08-31-kv-snapshot-ladder-design.md`).
+The fix keeps up to `LADDER_MAX_RUNGS` (3) KV snapshots ("rungs") at
+increasing transcript depths (`src/kvladder.rs`) and restores the deepest one
+that predates a known edit point, so the engine extends forward from it
+instead of rebuilding from zero. Several things about it were not obvious:
+
+- **A rung must be looked up under the fingerprint of the transcript
+  *truncated to its own `spans`*, not the full current transcript.** A rung is
+  stored under the fingerprint of its prefix *as it stood at capture time*
+  (`spans == session.transcript.len()` at that moment). By restore time the
+  transcript has grown further, so fingerprinting it whole would never match
+  what the rung was signed with — `kv_load` would miss on every call, silently,
+  while the feature looked implemented. This works only because
+  `render_transcript` reads *only* `session.transcript` plus the system
+  prompt and has no length-dependent formatting (pinned by
+  `render_transcript_never_injects_the_task_list_mid_transcript`), which is
+  what makes a truncated clone's render byte-identical to the capture-time
+  render.
+- **A fingerprint match does not imply the blob's spans match the current
+  transcript.** The fingerprint is computed *over* the truncated transcript, so
+  a match only ever tells you the truncated prefix is unchanged since capture
+  — it says nothing about what comes after `rung.spans`, which is exactly the
+  part that is about to be rewritten.
+- **The edit point is monotone non-decreasing across a session, and that is
+  load-bearing.** `microcompact` rewrites bodies in place — no insert or
+  remove, so transcript indices never shift — and a cleared body becomes a
+  stub below `MICROCOMPACT_MIN_BYTES`, so it never re-enters `clear_set`.
+  Every later rewrite therefore lands past any existing rung's span window,
+  which is what makes "restore the deepest rung `<= edit`" always correct
+  rather than merely usually correct.
+- **CRITICAL bug caught in review: restoring a rung *before* deciding whether
+  to compact rewinds the engine's KV for nothing on the refusal path.**
+  `set_kv` replaces the engine's live KV *and* its token span buffer with the
+  rung's shorter prefix. If the gate then refuses (not enough reclaimed to be
+  worth it), the transcript is never rewritten, but the engine has already
+  been rewound — so the very next turn re-prefills exactly the tail the gate
+  just declined to spend, and since the reclaimable total only grows, it
+  refuses **again** every subsequent turn. Strictly worse than not having the
+  feature. Fixed by asking `KvLadder::select` for the token count the restore
+  *would* cover, gating on that, and only calling `set_kv` after the decision
+  is made — never before.
+- **`KvLadder` names rung slots from a monotonic counter, not a vector
+  position**, so a session's fourth capture is `rung-3`, its fifth `rung-4`,
+  and so on — a long session's three *live* rungs all have indices past the
+  ladder's own width. Cleanup code that iterates `0..LADDER_MAX_RUNGS` finds
+  none of them and leaves gigabytes of blobs on disk; the fix is to match
+  rung files by name pattern (`{id}.rung-` prefix, `.kv_raw` suffix) at any
+  index, not by a bounded range.
+- **A rung must NOT be parented to its session in the GC.** `plan_sweep`
+  spares any node whose fingerprint appears in `parents`/`survivor_parents`,
+  so parenting a rung to its session would make the single most disposable
+  blob in the cache the thing protecting the session payload — and the tier
+  checkpoint above *that* — from ever being collected. Rungs are recorded
+  with `parent: None` and rely on `evict_rank` (first-to-evict under the
+  byte budget) and a dedicated one-day `RUNG_BACKSTOP_SECS` TTL instead.
+- **In-memory ladder state must be discarded whenever the session it
+  describes is discarded**, not just its on-disk blobs. `/new`, `/clear`,
+  `/switch`, `/resume` and a full compaction all replace or rewrite
+  `self.session`; leaving `Agent::ladder` pointed at the old session's rungs
+  means `wants_rung` keeps comparing fresh, smaller token counts against a
+  stale deepest rung (yielding a negative delta and no capture, ever, until
+  the new session outgrows the old one), and `select` hands back rungs whose
+  prefix no longer exists on the live transcript at all. `discard_ladder`
+  must run before every one of those reassignments, using the *old* session's
+  id to find and delete the blobs.
+- **A metadata sidecar that fails to load must not fall back to
+  `KvRole::Session`.** `kv_node_at` synthesizes a role from the file name when
+  the sidecar is missing, truncated, or written under an older
+  `META_VERSION` — exactly the crash-orphan case the rung backstop TTL exists
+  for. Falling through to `Session` there gives an orphaned rung the 14-day
+  session TTL and sorts it last under the byte budget instead of first; the
+  fallback needs its own `.rung-` branch.
 
 ## Part 2 — Environment & tooling
 
@@ -1696,3 +1824,20 @@ with M8/M9 so it happens once.
   a symlink to a secret and asserts the secret's *contents* never appear
   anywhere under the destination — asserting the symlink itself is absent is
   not enough, because by then it never existed there to begin with.
+- **The startup logo's pixel is the terminal cell, and a cell can hold more than
+  two pixels.** `logo-art` half-blocks encode 1x2 samples per cell, so 36
+  columns of banner cost 27 rows and there is no way to shrink it without
+  losing the picture. The other Unicode block-element families subdivide the
+  same two-color cell further — quadrants 2x2, sextants 2x3, octants 2x4 — and
+  because a cell is about twice as tall as it is wide, the octant grid is
+  square: `logo-art` 0.3's `Cell::Octant` at 18 columns is *the same sample
+  count* as half-blocks at 36, in a quarter of the screen area. That is why
+  `logo::DEFAULT_WIDTH` is 18 and the TUI masthead no longer scales it down.
+  Two traps. The dedicated Unicode ranges (`U+1FB00` sextants, `U+1CD00`
+  octants) deliberately omit every mask an older character already draws, so a
+  table indexed by coverage mask has to fall back to `▀▄▌▐` and friends at 26
+  of 256 octant slots — including `U+1FBE6`/`U+1FBE7` for the two middle-half
+  masks, which are easy to miss. And octants are Unicode 16 (2024): Kitty and
+  Ghostty rasterize the block ranges themselves and are exact, but a terminal
+  that defers to the font draws tofu, so `logo::cell()` only hands octants to
+  terminals known to draw them and takes `PLANK_LOGO_CELL` as an escape hatch.

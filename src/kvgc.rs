@@ -49,6 +49,20 @@ use crate::kvmeta::{KvMeta, KvRole};
 /// Seconds in a day, for turning the day-valued settings into TTLs.
 const SECS_PER_DAY: u64 = 86_400;
 
+/// Backstop TTL for [`KvRole::Rung`], independent of `ttl_session_secs`.
+///
+/// Deterministic cleanup (`SessionStore::remove_rungs`, called from
+/// `save_for_exit` and `/strip`) is what's supposed to delete rungs — this
+/// TTL only catches what that cannot: a crash, a `SIGKILL`, or a machine
+/// losing power mid-session, where the exit path never runs. A rung is a
+/// live-session accelerator, not history, so a crashed session's rungs are
+/// dead weight the moment the process is gone; there's no reason to let them
+/// survive as long as a saved session payload (`ttl_session_secs`, which
+/// defaults to 14 days) at hundreds of MB apiece. One day is generous
+/// headroom for a session merely idle overnight while still bounding
+/// crash-orphaned rungs to a single day's worth of dead sessions.
+const RUNG_BACKSTOP_SECS: u64 = SECS_PER_DAY;
+
 /// How long each role survives after its last use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SweepPolicy {
@@ -57,6 +71,9 @@ pub struct SweepPolicy {
     /// TTL for [`KvRole::System`] and [`KvRole::Project`] checkpoints, in
     /// seconds.
     pub ttl_tier_secs: u64,
+    /// TTL for [`KvRole::Rung`] blobs, in seconds. A backstop for crashes and
+    /// kills, not the primary cleanup path — see [`RUNG_BACKSTOP_SECS`].
+    pub ttl_rung_secs: u64,
     /// Hard ceiling on total cache bytes, enforced after the TTL pass. `0`
     /// disables the budget pass entirely — it means "unbounded", never
     /// "evict everything".
@@ -67,9 +84,11 @@ impl SweepPolicy {
     /// The policy the `kvcache` settings block describes.
     #[must_use]
     pub fn from_settings(s: &crate::settings::KvCacheSettings) -> Self {
+        let ttl_session_secs = s.ttl_session_days.saturating_mul(SECS_PER_DAY);
         Self {
-            ttl_session_secs: s.ttl_session_days.saturating_mul(SECS_PER_DAY),
+            ttl_session_secs,
             ttl_tier_secs: s.ttl_tier_days.saturating_mul(SECS_PER_DAY),
+            ttl_rung_secs: ttl_session_secs.min(RUNG_BACKSTOP_SECS),
             max_bytes: s.max_bytes,
         }
     }
@@ -78,8 +97,21 @@ impl SweepPolicy {
     fn ttl(&self, role: KvRole) -> u64 {
         match role {
             KvRole::Session => self.ttl_session_secs,
+            KvRole::Rung => self.ttl_rung_secs,
             KvRole::System | KvRole::Project => self.ttl_tier_secs,
         }
+    }
+}
+
+/// Phase-2 eviction priority: lower goes first.
+///
+/// Rungs are the one role that is cheap to recreate and dead the moment its
+/// session's process is gone, so they are always evicted before anything a
+/// later run would actually miss.
+fn evict_rank(role: KvRole) -> u8 {
+    match role {
+        KvRole::Rung => 0,
+        KvRole::System | KvRole::Project | KvRole::Session => 1,
     }
 }
 
@@ -173,12 +205,21 @@ pub fn plan_sweep(nodes: &[KvMeta], active: &[&str], policy: &SweepPolicy, now: 
         })
         .map(|(i, _)| i)
         .collect();
-    // Least-recently-used first, ties broken by fingerprint so the order is
-    // total and reproducible.
+    // Rungs first, then least-recently-used, ties broken by fingerprint so the
+    // order is total and reproducible.
+    //
+    // Role leads because `last_used` alone gets this exactly backwards: a rung
+    // is written at end of turn, so it sorts to the *end* of an LRU order and
+    // the sweep deletes older session payloads and other projects' tier
+    // checkpoints first, keeping up to `LADDER_MAX_RUNGS` blobs belonging to a
+    // session that may no longer exist. A rung is the most disposable blob in
+    // the cache: recapturable in ~0.4s and worthless once its process is gone,
+    // where a payload is a session's only resume point and a tier checkpoint is
+    // shared by every session of a project.
     candidates.sort_by(|&a, &b| {
-        nodes[a]
-            .last_used
-            .cmp(&nodes[b].last_used)
+        evict_rank(nodes[a].role)
+            .cmp(&evict_rank(nodes[b].role))
+            .then_with(|| nodes[a].last_used.cmp(&nodes[b].last_used))
             .then_with(|| nodes[a].fingerprint.cmp(&nodes[b].fingerprint))
     });
     for i in candidates {
@@ -220,6 +261,7 @@ mod tests {
         SweepPolicy {
             ttl_session_secs: 14 * DAY,
             ttl_tier_secs: 30 * DAY,
+            ttl_rung_secs: DAY,
             max_bytes: 0,
         }
     }
@@ -230,6 +272,7 @@ mod tests {
         SweepPolicy {
             ttl_session_secs: 9_999 * DAY,
             ttl_tier_secs: 9_999 * DAY,
+            ttl_rung_secs: 9_999 * DAY,
             max_bytes,
         }
     }
@@ -268,6 +311,29 @@ mod tests {
             node(KvRole::Project, "proj", None, 20),
         ];
         assert_eq!(doomed(&nodes, &[]), vec!["sess".to_owned()]);
+    }
+
+    #[test]
+    fn a_rung_expires_on_its_own_shorter_backstop_ttl() {
+        // 2 days idle: past the 1-day rung backstop, inside the 14-day
+        // session TTL a rung used to (wrongly) share.
+        let nodes = vec![
+            node(KvRole::Rung, "rung", None, 2),
+            node(KvRole::Session, "sess", None, 2),
+        ];
+        assert_eq!(doomed(&nodes, &[]), vec!["rung".to_owned()]);
+    }
+
+    #[test]
+    fn from_settings_bounds_the_rung_backstop_by_the_session_ttl() {
+        // A session TTL shorter than the one-day backstop must not widen the
+        // rung TTL past it: `min` keeps whichever policy is stricter.
+        let settings = crate::settings::KvCacheSettings {
+            ttl_session_days: 0,
+            ttl_tier_days: 30,
+            max_bytes: 0,
+        };
+        assert_eq!(SweepPolicy::from_settings(&settings).ttl_rung_secs, 0);
     }
 
     #[test]
@@ -349,6 +415,7 @@ mod tests {
         let p = SweepPolicy {
             ttl_session_secs: 0,
             ttl_tier_secs: 0,
+            ttl_rung_secs: 0,
             max_bytes: 0,
         };
         let mut pinned = node(KvRole::Session, "pin", None, 0);
@@ -434,6 +501,7 @@ mod tests {
         let p = SweepPolicy {
             ttl_session_secs: 14 * DAY,
             ttl_tier_secs: 30 * DAY,
+            ttl_rung_secs: 14 * DAY,
             max_bytes: 150,
         };
         let nodes = vec![
@@ -454,6 +522,7 @@ mod tests {
         let p = SweepPolicy {
             ttl_session_secs: 14 * DAY,
             ttl_tier_secs: 9_999 * DAY,
+            ttl_rung_secs: 14 * DAY,
             max_bytes: 1,
         };
         let nodes = vec![
@@ -463,6 +532,37 @@ mod tests {
         let plan = plan_sweep(&nodes, &[], &p, NOW);
         let gone = doomed_fps(&plan, &nodes);
         assert_eq!(gone, vec!["dead-child".to_owned(), "parent".to_owned()]);
+    }
+
+    /// Under a byte budget a rung goes before anything else, no matter how
+    /// recently it was written.
+    ///
+    /// `last_used` alone got this exactly backwards: a rung is captured at end
+    /// of turn, so it sorted to the end of the LRU order and the sweep deleted
+    /// older session payloads (a session's only resume point) and other
+    /// projects' tier checkpoints first, while keeping up to three rungs
+    /// belonging to a session that may no longer exist.
+    #[test]
+    fn a_rung_is_evicted_before_an_older_session_payload() {
+        // 200 bytes against a 100-byte budget: exactly one node goes.
+        let nodes = vec![
+            node(KvRole::Session, "old-payload", None, 50),
+            node(KvRole::Rung, "fresh-rung", None, 0),
+        ];
+        let plan = plan_sweep(&nodes, &[], &budget_only(100), NOW);
+        assert_eq!(doomed_fps(&plan, &nodes), vec!["fresh-rung".to_owned()]);
+    }
+
+    /// Within a role the order is still least-recently-used, so two rungs are
+    /// ranked against each other exactly as before.
+    #[test]
+    fn last_used_still_orders_rungs_against_each_other() {
+        let nodes = vec![
+            node(KvRole::Rung, "newer-rung", None, 0),
+            node(KvRole::Rung, "older-rung", None, 30),
+        ];
+        let plan = plan_sweep(&nodes, &[], &budget_only(100), NOW);
+        assert_eq!(doomed_fps(&plan, &nodes), vec!["older-rung".to_owned()]);
     }
 
     #[test]

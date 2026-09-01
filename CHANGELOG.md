@@ -6,7 +6,154 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.5.5] - 2026-08-31
+
 ### Added
+
+- **Quitting plank now signs off in the debug console.** A window whose stream
+  simply stopped was indistinguishable from a wedged plank, so every live
+  console connection — the session's own window and any sub-agent's — gets a
+  closing `_plank disconnected: session ended_` rule before the socket goes.
+  It is written as ordinary stream bytes rather than a protocol frame, matching
+  the console's existing `-- reconnected --` idiom, because the handshake is the
+  console's only control exchange and the window is meant to outlive the socket.
+  A force quit says so in the reason, since that is the exit where the in-flight
+  turn is lost; it is also the exit where no destructor runs, so the farewell is
+  sent explicitly there. Best-effort throughout, to the same standard as the
+  mirror itself: a console that already went away just fails the write, and
+  quitting is never delayed or made noisy by optional dev tooling.
+
+## [3.5.4] - 2026-08-31
+
+### Changed
+
+- **The status-bar spinner verb now follows the phase of the turn.** The single
+  flat list of 200 playful gerunds is five pools, and the footer draws from the
+  one that matches what the agent is doing at that instant: reasoning verbs
+  (`Pondering`, `Elucubrating`) inside a `<think>` block, producing verbs
+  (`Composing`, `Wordsmithing`) while it samples the answer, workshop verbs
+  (`Hammering`, `Chiseling`, `Prestidigitizing`) while a tool dispatch is
+  actually running, and taking-it-in verbs (`Absorbing`, `Perusing`, `Sifting`)
+  while the prompt is still prefilling. The verb index is fixed for the turn and
+  only the pool it indexes moves, so the word tracks the phase without churning.
+  The tool phase is read from the live dispatch rather than from the last status
+  the engine published — a dispatch outlives that status — and strictly, so the
+  4s label linger window keeps `🔧 bash` in the bar without holding the verb on
+  shop tools after the model has resumed. Roughly one turn in twenty ignores the
+  phase entirely and reports `Fishing 🐟`, `Napping 😴` or `Moonwalking 🌙`; the
+  roll is made once from the turn's own seed, so such a turn stays fun across
+  every phase instead of flipping back mid-stream.
+
+## [3.5.3] - 2026-08-31
+
+### Added
+
+- **A session's KV cache is saved at the end of every turn, and when you
+  interrupt one.** It used to be written only by `/save` and on a clean exit, so
+  a crash, a `kill`, or a closed terminal left the transcript behind with no KV
+  next to it and the next `/resume` re-prefilled the whole conversation — at
+  local prefill speeds, minutes of it. The capture costs about four tenths of a
+  second on a turn that spends far longer than that in prefill. The interrupt
+  save waits until the partial reply is in the transcript, so what lands on disk
+  always matches what the engine held; the goal loop's adjudication exchange,
+  which returned from four of its exits without ever reaching a save, is
+  included now.
+
+- **KV snapshot rungs.** plank keeps up to three KV snapshots per live session,
+  each recorded with the transcript depth it covers, so a pass that has to
+  rewrite an old message can restore a snapshot from *before* that point and
+  prefill only the remainder instead of rebuilding from token zero. A snapshot
+  is taken immediately before a large tool result is appended, which is the only
+  moment early enough to be useful — the rewrite always lands on the oldest
+  large result, and by any turn boundary the transcript has already moved past
+  it. Snapshots are trusted by their embedded signature alone, are the first
+  thing the cache GC evicts under its byte budget, and are deleted when the
+  session ends, is replaced, or is fully compacted. This is a mitigation whose
+  accepting path only engages under real context pressure; see below.
+
+- **`context.microcompact`**, default `true`. Set it to `false` (or
+  `/config context.microcompact false`) to switch micro-compaction off
+  altogether. Context is then reclaimed by full compaction alone, which is
+  slower but never rewrites transcript text in place — also the cleanest way to
+  measure what micro-compaction costs you.
+
+### Fixed
+
+- **Micro-compaction no longer throws away a valid KV cache to save a few
+  kilobytes.** Clearing an old tool result rewrites transcript text in place,
+  and the engine cannot rewrite behind the live end of its KV — it re-prefills
+  from token zero. The pass was gated on *bytes reclaimed* (4 KB), which cannot
+  see that cost: one measured pass reclaimed 12 KB of text and paid 14,047
+  tokens of prefill, and because it clears one result at a time it re-trips a
+  few turns later and pays again. Over an 18-turn session that was five full
+  rebuilds and 72,769 still-valid tokens re-prefilled, with prefill taking 26:38
+  of 29:05. The gate now weighs bytes reclaimed against the tokens actually
+  re-prefilled, and relaxes as the context window fills so cheap relief still
+  pre-empts a full compaction. The same session now does no full rebuilds at
+  all, with prefill down to 4:24 of 14:56.
+
+- **Softer colours for the working-tree counts.** The footer's `+`/`-` line
+  counts move off bright green and red onto a pale mint (256-colour 158) and
+  pale magenta (212), the nearest palette entries to `#c3f8e8` and `#ee88db` —
+  indexed like the rest of the bar rather than truecolor, and above 15 so the
+  user's theme cannot repaint them.
+
+- **A splash while output spills.** Spilling a large tool result to disk is
+  over in milliseconds, so it used to leave no trace in the footer at all. A
+  💦 now sits in the status line for three seconds after a spill, in its own
+  cell ahead of the running-tool label — the tip slot would have been hidden
+  behind that label for exactly as long as the splash needed to be visible.
+
+- **`/insights` is differential.** The scan has always been incremental; the
+  six model calls were not, and they are what takes minutes. plank now keeps
+  the last report beside it in `usage-data/last-report.json` — its sections,
+  its statistics and the mtime of every session it covered — and reuses the
+  written sections until ten sessions, or a tenth of the history (whichever is
+  smaller), are new or have been written to since. Counted per session rather
+  than by subtracting totals, so a session that grew by twenty turns counts as
+  changed even though the session count did not move. A section the previous
+  run dropped is never reused, so it is written on the next run instead of
+  staying missing; `/insights fresh` rewrites everything regardless, and
+  `fast` neither reads nor writes the state. When there is a previous report,
+  the new one opens with a computed **Since** strip: sessions new or updated,
+  prompts, lines, files, commits, and any tool or friction category that was
+  not there last time.
+
+### Fixed
+
+- **The engine's DSpark notice no longer lands in the middle of the screen.**
+  The C library announces `ds4: DSpark target-hidden capture enabled:
+  layers=...` on stderr every time a session is created — at startup, on
+  `/clear`, for every aside and sub-agent — and it reports a build and weights
+  decision nobody can act on. plank now captures stderr around session
+  creation and drops that one line, re-emitting everything else, so the
+  near-identical failure message on the same code path still gets through.
+  Sent upstream as well, gated behind `DS4_DSPARK_VERBOSE`.
+
+- **`/insights` writes the two sections it had always dropped.** "Try this
+  next" and "Features to try" were missing from every report ever generated:
+  both reason about what to write and then write it — prompts, an AGENTS.md
+  line, a ready-to-run snippet — and the shared per-section token budget ran
+  out before the JSON object closed, so the answer was never parseable and the
+  section was silently skipped. Those two now get twice the budget, any
+  section that comes back unusable is retried once with thinking off (the
+  whole budget then goes to the answer), and a section that is dropped after
+  both attempts is recorded in `~/.plank/errors.log` — a dropped section
+  leaves no trace in the finished report, which is how two of them stayed
+  missing for as long as they did.
+
+## [3.5.2] - 2026-08-31
+
+### Added
+
+- **`/insights` suggestions are one click from being used.** Every suggestion
+  the report makes now carries a Copy button, and the AGENTS.md instructions
+  come as a checklist: untick the ones you disagree with, hit "Copy all
+  checked", and paste the rest into plank. Feature snippets and suggested
+  prompts copy individually. The handler is inlined like the stylesheet — the
+  report is still one self-contained local file with no network references,
+  and it falls back to a hidden textarea because `navigator.clipboard` is
+  unavailable on `file://`, which is exactly where the report is opened.
 
 - **The status footer counts what you have changed.** Beside the directory and
   branch — on the TUI's location row, which answers "which tree am I in" —
@@ -18,6 +165,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cached for a second, because the footer repaints several times a second and
   walking the tree at that rate would cost more than the rest of the line put
   together.
+
+### Fixed
+
+- **A generation no longer opens with a blank line.** The model separates its
+  answer from the thinking it just closed with a newline; on the plain path
+  that is invisible, but the TUI committed it as an empty row above every
+  answer. A visible segment's leading newlines are now dropped.
+- **`/insights` stops a section that falls into a repetition loop.** A model
+  that runs out of things to say sometimes repeats one clause until the token
+  budget runs out — minutes of visible nonsense per section. The stream is
+  watched for a cyclic tail and the pass stopped; that section is dropped and
+  the rest of the report is written as normal.
 
 ## [3.5.0] - 2026-08-30
 
